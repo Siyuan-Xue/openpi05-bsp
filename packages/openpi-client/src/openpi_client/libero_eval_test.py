@@ -208,7 +208,7 @@ class LiberoEvaluationTest(unittest.TestCase):
     def test_manifest_preserves_all_audit_identities_and_bsp_parameters(self):
         manifest = libero_eval.EvaluationManifest(
             code_sha="abc",
-            dataset_revision="v2.1",
+            dataset_revision="v2.0",
             config_name="pi05_libero_bsp_h16",
             checkpoint_step=10000,
             bsp_cache_hash="a" * 64,
@@ -243,7 +243,7 @@ class LiberoEvaluationTest(unittest.TestCase):
     def test_manifest_requires_cache_sha_and_fingerprint_together_only_for_bsp(self):
         shared = dict(
             code_sha="abc",
-            dataset_revision="v2.1",
+            dataset_revision="v2.0",
             norm_hash="b" * 64,
             checkpoint="checkpoint/10000",
             checkpoint_step=10000,

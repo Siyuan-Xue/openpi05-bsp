@@ -78,6 +78,10 @@ def _actions(horizon=16):
     return [[float(row + column) for column in range(7)] for row in range(horizon)]
 
 
+def test_evaluator_defaults_to_the_real_official_dataset_revision():
+    assert libero_main.Args().dataset_revision == "v2.0"
+
+
 def test_client_holder_passes_finite_inference_deadline(monkeypatch):
     captured = {}
 

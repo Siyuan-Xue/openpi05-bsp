@@ -29,7 +29,7 @@ docker compose -f examples/libero/compose.yml config >/dev/null
 docker compose -f examples/libero/compose.yml build
 
 export CODE_SHA="$(git rev-parse HEAD)"
-export LIBERO_DATASET_REVISION=v2.1
+export LIBERO_DATASET_REVISION=v2.0
 export POLICY_CONTAINER_DIGEST="$(docker image inspect openpi_server --format '{{.Id}}')"
 ```
 

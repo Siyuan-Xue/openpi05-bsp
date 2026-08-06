@@ -113,8 +113,8 @@ def test_libero_h16_configs_keep_baseline_and_bsp_assets_separate():
     assert bsp.model.discrete_state_input is False
     assert baseline.data.assets.asset_id == "libero_baseline_h16"
     assert bsp.data.assets.asset_id == "libero_bsp_h16"
-    assert baseline.data.lerobot_revision == "v2.1"
-    assert bsp.data.lerobot_revision == "v2.1"
+    assert baseline.data.lerobot_revision == "v2.0"
+    assert bsp.data.lerobot_revision == "v2.0"
     assert baseline.data.bsp_cache_path is None
     assert bsp.data.use_bsp is True
 
@@ -197,7 +197,7 @@ def test_bsp_training_reconstructs_manifest_with_the_exact_configured_action_key
         use_bsp=True,
         bsp_cache_path="/cache/bsp.npz",
         lerobot_root="/data/libero",
-        lerobot_revision="v2.1",
+        lerobot_revision="v2.0",
         action_sequence_keys=("custom_actions",),
         prompt_from_task=False,
     )
@@ -207,6 +207,6 @@ def test_bsp_training_reconstructs_manifest_with_the_exact_configured_action_key
     assert isinstance(dataset, _data_loader.BspLeRobotDataset)
     assert captured == {
         "repo_id": "example/libero",
-        "revision": "v2.1",
+        "revision": "v2.0",
         "action_key": "custom_actions",
     }

@@ -61,7 +61,7 @@ class Args:
     config_name: str = ""
     checkpoint_step: int = 0
     code_sha: str = "auto"
-    dataset_revision: str = "v2.1"
+    dataset_revision: str = "v2.0"
     bsp_cache_hash: Optional[str] = None  # noqa: UP045 -- simulator client runs Python 3.8.
     bsp_cache_manifest_fingerprint: Optional[str] = None  # noqa: UP045 -- Python 3.8.
     norm_hash: str = ""

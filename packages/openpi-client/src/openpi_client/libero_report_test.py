@@ -23,7 +23,7 @@ def _manifest(variant, step):
         "native_control_hz": 10,
         "replan_steps": 8,
         "code_sha": "code-sha",
-        "dataset_revision": "v2.1",
+        "dataset_revision": "v2.0",
         "config_name": "pi05_libero_baseline_h16" if baseline else "pi05_libero_bsp_h16",
         "checkpoint_step": step,
         "bsp_cache_hash": None if baseline else _CACHE_SHA,

@@ -9,6 +9,7 @@ import pytest
 from openpi.training.bsp import BspCache
 import openpi.training.bsp_dataset as bsp_dataset
 from openpi.training.bsp_dataset import BspLeRobotDataset
+from openpi.training.bsp_dataset import LIBERO_REVISION
 from openpi.training.bsp_dataset import LeRobotDatasetMetadata
 from openpi.training.bsp_dataset import build_lerobot_bsp_cache
 from openpi.training.bsp_dataset import make_lerobot_cache_manifest
@@ -266,6 +267,22 @@ def test_manifest_covers_exact_schema_action_key_scipy_and_materialization_seman
 
     assert len({manifest.fingerprint, different_action_key.fingerprint, different_schema.fingerprint}) == 3
     assert different_scipy.fingerprint != different_schema.fingerprint
+
+
+def test_official_cache_manifest_records_the_real_requested_revision(monkeypatch):
+    """A nonexistent requested revision can silently resolve to another Hub snapshot in locked LeRobot."""
+    dataset = TinyLeRobotDataset()
+    monkeypatch.setattr(bsp_dataset.importlib.metadata, "version", lambda package: "1.15.3")
+
+    manifest = make_lerobot_cache_manifest(
+        dataset,
+        repo_id="physical-intelligence/libero",
+        revision=LIBERO_REVISION,
+        expected_metadata=TINY_METADATA,
+    )
+
+    assert LIBERO_REVISION == "v2.0"
+    assert json.loads(manifest.source)["revision"] == "v2.0"
 
 
 def test_feature_schema_canonicalization_ignores_mapping_insertion_order(monkeypatch):

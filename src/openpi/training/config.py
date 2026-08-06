@@ -789,7 +789,7 @@ _CONFIGS = [
             assets=AssetsConfig(asset_id="libero_baseline_h16"),
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
-            lerobot_revision="v2.1",
+            lerobot_revision="v2.0",
         ),
         seed=42,
         batch_size=256,
@@ -815,7 +815,7 @@ _CONFIGS = [
             assets=AssetsConfig(asset_id="libero_bsp_h16"),
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
-            lerobot_revision="v2.1",
+            lerobot_revision="v2.0",
             use_bsp=True,
             # Deliberately unset: training must receive an explicitly prepared persistent sidecar path.
             bsp_cache_path=None,

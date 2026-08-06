@@ -114,7 +114,7 @@ $ python3 - <<'PY'
 # no call to build_episode_targets
 ...
 PY
-STATIC CONTRACT PASS: action-only wrapper has no fit call; h16 assets/configs, boundary fingerprint, v2.1, CLI, and asset output present
+STATIC CONTRACT PASS: action-only wrapper has no fit call; h16 assets/configs, boundary fingerprint, v2.0, CLI, and asset output present
 
 $ python3 - <<'PY'
 # dependency-free execution of the real BspLeRobotDataset with import stubs
@@ -135,8 +135,8 @@ DEPENDENCY-FREE WRAPPER PASS: standard fields preserved by identity; mapped acti
   metadata; changed episode splits therefore invalidate a sidecar even when
   frame counts and table fingerprint remain unchanged.
 - Confirmed the new baseline/BSP configs and preparation CLI consistently use
-  LeRobot's valid `v2.1` dataset version rather than the invalid pseudo-version
-  `main`; an explicit compatible version can still be supplied consistently.
+  the official `physical-intelligence/libero` revision `v2.0`; an explicit
+  compatible version can still be supplied consistently.
 - Confirmed episode fitting reads raw `hf_dataset[episode_start:episode_end]`
   seven-dimensional `actions`; it never reads normalized or horizon-windowed
   samples.
@@ -157,11 +157,19 @@ DEPENDENCY-FREE WRAPPER PASS: standard fields preserved by identity; mapped acti
 The first review found three issues before commit: the invalid/mutable `main`
 revision for pinned LeRobot, missing tiny-fixture metadata arguments in one
 test, and omission of exact episode boundaries from the cache identity. The
-fixes use valid `v2.1` consistently for the new baseline/BSP configs and CLI,
-pass `TINY_METADATA` in the test, and include a canonical little-endian SHA-256
-of the exact `from`/`to` arrays plus the loaded metadata revision. The focused
-re-review confirmed all prior findings addressed and found no new Critical or
-Important issues; its fresh `compileall` and `git diff --check` also passed.
+initial fixes pinned a versioned dataset reference, passed `TINY_METADATA` in
+the test, and included a canonical little-endian SHA-256 of the exact
+`from`/`to` arrays plus the loaded metadata revision. The focused re-review
+confirmed those findings addressed and found no new Critical or Important
+issues; its fresh `compileall` and `git diff --check` also passed.
+
+A later Hub-identity audit established that the real published
+`physical-intelligence/libero` revision is `v2.0` and that locked LeRobot may
+silently resolve an unavailable version request. The follow-up correction uses
+`v2.0` in the preparation constant, both phase-one training configs, evaluator
+default, README commands and fixtures. A dependency-free repository contract
+now rejects any tracked stale revision claim, while the dataset test confirms
+the requested revision is embedded in the cache manifest source.
 
 ## Concerns / server follow-up
 

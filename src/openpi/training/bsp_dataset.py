@@ -24,7 +24,7 @@ from openpi.training.bsp import make_cache_manifest
 
 
 LIBERO_REPO_ID = "physical-intelligence/libero"
-LIBERO_REVISION = "v2.1"
+LIBERO_REVISION = "v2.0"
 
 
 @dataclasses.dataclass(frozen=True)
