@@ -1,6 +1,7 @@
 """Fail-fast validation for LIBERO Compose host bind mounts."""
 
 from collections.abc import Mapping
+import itertools
 import os
 from pathlib import Path
 import sys
@@ -44,6 +45,11 @@ def validate_mount_roots(environ: Mapping[str, str] | None = None) -> dict[str, 
     project_marker = resolved["BSP_REPO_DIR"] / "pyproject.toml"
     if not project_marker.is_file():
         raise PreflightError(f"BSP_REPO_DIR must contain the OpenPI pyproject.toml: {project_marker}")
+    for (left_name, left_path), (right_name, right_path) in itertools.combinations(resolved.items(), 2):
+        if left_path == right_path or left_path in right_path.parents or right_path in left_path.parents:
+            raise PreflightError(
+                f"Mount roots overlap: {left_name}={left_path} and {right_name}={right_path}"
+            )
     return resolved
 
 

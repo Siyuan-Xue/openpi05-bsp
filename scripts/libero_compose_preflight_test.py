@@ -85,6 +85,35 @@ class LiberoComposePreflightTest(unittest.TestCase):
         with self.assertRaisesRegex(preflight.PreflightError, "BSP_REPO_DIR.*pyproject.toml"):
             preflight.validate_mount_roots(self.environment)
 
+    def test_equal_mount_roots_are_rejected(self):
+        self.environment["BSP_EXPERIMENTS_DIR"] = self.environment["BSP_REPO_DIR"]
+
+        with self.assertRaisesRegex(
+            preflight.PreflightError,
+            "overlap.*BSP_REPO_DIR.*BSP_EXPERIMENTS_DIR",
+        ):
+            preflight.validate_mount_roots(self.environment)
+
+    def test_repo_ancestor_of_writable_mount_is_rejected(self):
+        nested_experiments = Path(self.environment["BSP_REPO_DIR"], "experiments")
+        nested_experiments.mkdir()
+        self.environment["BSP_EXPERIMENTS_DIR"] = str(nested_experiments)
+
+        with self.assertRaisesRegex(
+            preflight.PreflightError,
+            "overlap.*BSP_REPO_DIR.*BSP_EXPERIMENTS_DIR",
+        ):
+            preflight.validate_mount_roots(self.environment)
+
+    def test_writable_mount_ancestor_of_repo_is_rejected(self):
+        self.environment["BSP_EXPERIMENTS_DIR"] = str(self.root)
+
+        with self.assertRaisesRegex(
+            preflight.PreflightError,
+            "overlap.*BSP_REPO_DIR.*BSP_EXPERIMENTS_DIR",
+        ):
+            preflight.validate_mount_roots(self.environment)
+
     def test_command_validates_the_real_process_environment(self):
         environment = dict(os.environ)
         environment.update(self.environment)
