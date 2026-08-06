@@ -63,6 +63,15 @@ def test_with_fake_dataset():
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
 
 
+def test_jax_data_loader_emits_the_global_micro_batch():
+    config = dataclasses.replace(_config.get_config("debug"), batch_size=4, micro_batch_size=2)
+
+    loader = _data_loader.create_data_loader(config, skip_norm_stats=True, num_batches=1)
+    batch = next(iter(loader))
+
+    assert all(x.shape[0] == 2 for x in jax.tree.leaves(batch))
+
+
 def test_with_real_dataset():
     config = _config.get_config("pi0_aloha_sim")
     config = dataclasses.replace(config, batch_size=4)
@@ -92,12 +101,38 @@ def test_libero_h16_configs_keep_baseline_and_bsp_assets_separate():
 
     assert baseline.model.action_horizon == 16
     assert bsp.model.action_horizon == 16
+    assert baseline.model.pi05 is True
+    assert bsp.model.pi05 is True
+    assert baseline.model.action_dim == 32
+    assert bsp.model.action_dim == 32
+    assert baseline.model.discrete_state_input is False
+    assert bsp.model.discrete_state_input is False
     assert baseline.data.assets.asset_id == "libero_baseline_h16"
     assert bsp.data.assets.asset_id == "libero_bsp_h16"
     assert baseline.data.lerobot_revision == "v2.1"
     assert bsp.data.lerobot_revision == "v2.1"
     assert baseline.data.bsp_cache_path is None
     assert bsp.data.use_bsp is True
+
+
+def test_libero_h16_configs_use_the_same_jax_full_finetuning_recipe():
+    for name in ("pi05_libero_baseline_h16", "pi05_libero_bsp_h16"):
+        config = _config.get_config(name)
+
+        assert config.seed == 42
+        assert config.batch_size == 256
+        assert config.micro_batch_size == 1
+        assert config.num_train_steps == 30_000
+        assert config.save_interval == 1_000
+        assert config.keep_period == 10_000
+        assert config.weight_loader.params_path == "gs://openpi-assets/checkpoints/pi05_base/params"
+        assert config.pytorch_weight_path is None
+        assert config.lr_schedule.warmup_steps == 10_000
+        assert config.lr_schedule.peak_lr == 5e-5
+        assert config.lr_schedule.decay_steps == 1_000_000
+        assert config.lr_schedule.decay_lr == 5e-5
+        assert config.optimizer.clip_gradient_norm == 1.0
+        assert config.ema_decay == 0.999
 
 
 def test_bsp_training_refuses_to_create_a_dataset_without_an_explicit_sidecar(tmp_path):

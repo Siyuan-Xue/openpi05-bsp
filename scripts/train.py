@@ -24,6 +24,7 @@ import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
+import openpi.training.train_planning as train_planning
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
@@ -133,13 +134,16 @@ def init_train_state(
     return train_state, state_sharding
 
 
-@at.typecheck
-def train_step(
+def compute_microbatch_grad(
     config: _config.TrainConfig,
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
     batch: tuple[_model.Observation, _model.Actions],
-) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
+    accumulation_index: at.Int[at.ArrayLike, ""],
+    *,
+    accumulation_steps: int,
+) -> tuple[at.Array, Any]:
+    """Compute one micro-batch gradient without changing optimizer state."""
     model = nnx.merge(state.model_def, state.params)
     model.train()
 
@@ -150,13 +154,39 @@ def train_step(
         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
         return jnp.mean(chunked_loss)
 
-    train_rng = jax.random.fold_in(rng, state.step)
+    step_rng = jax.random.fold_in(rng, state.step)
+    # Keep the legacy single-batch key exactly unchanged. With accumulation, every micro-batch receives a key folded
+    # by both the optimizer step and its accumulation index.
+    train_rng = step_rng if accumulation_steps == 1 else jax.random.fold_in(step_rng, accumulation_index)
     observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
     loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    return loss, grads
 
+
+def add_microbatch_results(left: tuple[at.Array, Any], right: tuple[at.Array, Any]) -> tuple[at.Array, Any]:
+    """Add loss and gradient trees while retaining their device sharding."""
+    left_loss, left_grads = left
+    right_loss, right_grads = right
+    return left_loss + right_loss, train_planning.add_trees(left_grads, right_grads, tree_map=jax.tree.map)
+
+
+def apply_optimizer_step(
+    config: _config.TrainConfig,
+    state: training_utils.TrainState,
+    gradient_sum: Any,
+    loss_sum: at.Array,
+    *,
+    accumulation_steps: int,
+) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
+    """Average accumulated gradients and perform exactly one optimizer/EMA update."""
+    grads = train_planning.average_tree_sum(gradient_sum, accumulation_steps, tree_map=jax.tree.map)
+    loss = loss_sum / accumulation_steps
+
+    model = nnx.merge(state.model_def, state.params)
+    model.train()
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
     new_params = optax.apply_updates(params, updates)
@@ -195,10 +225,20 @@ def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
 
-    if config.batch_size % jax.device_count() != 0:
-        raise ValueError(
-            f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
-        )
+    accumulation_plan = train_planning.plan_gradient_accumulation(
+        batch_size=config.batch_size,
+        micro_batch_size=config.micro_batch_size,
+        process_count=jax.process_count(),
+        device_count=jax.device_count(),
+    )
+    logging.info(
+        "Gradient accumulation: effective_global_batch=%d, global_micro_batch=%d, "
+        "local_micro_batch=%d, accumulation_steps=%d",
+        accumulation_plan.batch_size,
+        accumulation_plan.micro_batch_size,
+        accumulation_plan.local_micro_batch_size,
+        accumulation_plan.accumulation_steps,
+    )
 
     jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
 
@@ -240,37 +280,88 @@ def main(config: _config.TrainConfig):
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
-    ptrain_step = jax.jit(
-        functools.partial(train_step, config),
-        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+    gradient_sharding = train_state_sharding.params.filter(config.trainable_filter)
+    pmicrobatch_grad = jax.jit(
+        functools.partial(
+            compute_microbatch_grad,
+            config,
+            accumulation_steps=accumulation_plan.accumulation_steps,
+        ),
+        in_shardings=(replicated_sharding, train_state_sharding, data_sharding, replicated_sharding),
+        out_shardings=(replicated_sharding, gradient_sharding),
+    )
+    padd_microbatch_results = jax.jit(
+        add_microbatch_results,
+        in_shardings=(
+            (replicated_sharding, gradient_sharding),
+            (replicated_sharding, gradient_sharding),
+        ),
+        out_shardings=(replicated_sharding, gradient_sharding),
+        donate_argnums=(0, 1),
+    )
+    papply_optimizer_step = jax.jit(
+        functools.partial(
+            apply_optimizer_step,
+            config,
+            accumulation_steps=accumulation_plan.accumulation_steps,
+        ),
+        in_shardings=(train_state_sharding, gradient_sharding, replicated_sharding),
         out_shardings=(train_state_sharding, replicated_sharding),
-        donate_argnums=(1,),
+        donate_argnums=(0, 1),
     )
 
     start_step = int(train_state.step)
+    optimizer_steps = train_planning.optimizer_step_numbers(start_step, config.num_train_steps)
     pbar = tqdm.tqdm(
-        range(start_step, config.num_train_steps),
+        optimizer_steps,
         initial=start_step,
         total=config.num_train_steps,
         dynamic_ncols=True,
     )
 
     infos = []
-    for step in pbar:
+    for completed_step in pbar:
+        accumulated_result = None
         with sharding.set_mesh(mesh):
-            train_state, info = ptrain_step(train_rng, train_state, batch)
+            for accumulation_index in accumulation_plan.accumulation_indices:
+                microbatch_result = pmicrobatch_grad(
+                    train_rng,
+                    train_state,
+                    batch,
+                    jnp.asarray(accumulation_index, dtype=jnp.uint32),
+                )
+                accumulated_result = (
+                    microbatch_result
+                    if accumulated_result is None
+                    else padd_microbatch_results(accumulated_result, microbatch_result)
+                )
+                batch = next(data_iter)
+
+            if accumulated_result is None:
+                raise RuntimeError("Gradient accumulation plan did not produce a micro-batch.")
+            loss_sum, gradient_sum = accumulated_result
+            train_state, info = papply_optimizer_step(train_state, gradient_sum, loss_sum)
+
         infos.append(info)
-        if step % config.log_interval == 0:
+        if completed_step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
+            pbar.write(f"Step {completed_step}: {info_str}")
+            wandb.log(reduced_info, step=completed_step)
             infos = []
-        batch = next(data_iter)
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+        if train_planning.should_save_checkpoint(
+            completed_step,
+            num_train_steps=config.num_train_steps,
+            save_interval=config.save_interval,
+        ):
+            updated_state_step = int(train_state.step)
+            if updated_state_step != completed_step:
+                raise RuntimeError(
+                    f"Updated train state step {updated_state_step} does not match checkpoint label {completed_step}."
+                )
+            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, updated_state_step)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()

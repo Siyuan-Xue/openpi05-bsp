@@ -520,10 +520,13 @@ class TrainConfig:
     seed: int = 42
     # Global batch size.
     batch_size: int = 32
+    # Optional global JAX micro-batch size. The loader partitions this across processes, and the trainer accumulates
+    # batch_size / micro_batch_size consecutive micro-batches before one optimizer update.
+    micro_batch_size: int | None = None
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
     num_workers: int = 2
-    # Number of train steps (batches) to run.
+    # Number of optimizer steps to run.
     num_train_steps: int = 30_000
 
     # How often (in steps) to log training metrics.
@@ -779,7 +782,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_libero_baseline_h16",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=16, discrete_state_input=False),
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16, discrete_state_input=False),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
             assets=AssetsConfig(asset_id="libero_baseline_h16"),
@@ -787,7 +790,9 @@ _CONFIGS = [
             extra_delta_transform=False,
             lerobot_revision="v2.1",
         ),
+        seed=42,
         batch_size=256,
+        micro_batch_size=1,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000,
             peak_lr=5e-5,
@@ -797,12 +802,13 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+        save_interval=1_000,
+        keep_period=10_000,
     ),
     TrainConfig(
         name="pi05_libero_bsp_h16",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=16, discrete_state_input=False),
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16, discrete_state_input=False),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
             assets=AssetsConfig(asset_id="libero_bsp_h16"),
@@ -813,7 +819,9 @@ _CONFIGS = [
             # Deliberately unset: training must receive an explicitly prepared persistent sidecar path.
             bsp_cache_path=None,
         ),
+        seed=42,
         batch_size=256,
+        micro_batch_size=1,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000,
             peak_lr=5e-5,
@@ -823,8 +831,9 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+        save_interval=1_000,
+        keep_period=10_000,
     ),
     #
     # Fine-tuning Aloha configs.
@@ -1014,7 +1023,7 @@ _CONFIGS = [
         data=FakeDataConfig(),
         batch_size=2,
         model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
-        weight_loader=weight_loaders.CheckpointWeightLoader("./checkpoints/debug/debug/9/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("./checkpoints/debug/debug/10/params"),
         overwrite=True,
         exp_name="debug",
         num_train_steps=10,
