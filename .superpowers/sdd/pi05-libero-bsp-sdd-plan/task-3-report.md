@@ -188,3 +188,59 @@ For the real H20 job, keep the committed global micro-batch at 1 for the safe
 first run. Probe 1/2/4/8 in separate processes and override **both** H16 configs
 to the same largest stable value only after memory evidence; effective batch
 256 and optimizer-step/checkpoint semantics remain unchanged.
+
+## Review fix — real accumulated-update equivalence coverage
+
+Review identified that the original runtime equivalence test compared
+`micro_batch_size=None` with `micro_batch_size=batch_size`. Both plan one
+micro-batch, so that test covered legacy-path equivalence but never exercised
+gradient accumulation. The planning test likewise proved only indices and step
+labels, not optimizer behavior.
+
+Added
+`test_two_micro_batches_match_one_direct_batch_and_advance_state_once` in
+`scripts/train_test.py`. It uses a two-parameter NNX linear model whose loss
+deliberately ignores RNG, a four-example global batch, and a real production
+plan with global `micro_batch_size=2 < batch_size=4`. The test:
+
+- computes the direct large-batch gradient through
+  `train.compute_microbatch_grad`;
+- computes two consecutive production micro-gradients against the same
+  pre-update state and combines them through `train.add_microbatch_results`;
+- compares the averaged accumulated gradient tree to the direct gradient tree;
+- calls `train.apply_optimizer_step` once for each path with a real Optax Adam
+  state;
+- compares updated parameter, optimizer-state, EMA, loss, and gradient-norm
+  trees between the two paths; and
+- independently asserts a nonzero gradient/parameter change, optimizer count
+  `0 -> 1`, train step `7 -> 8`, and exactly one EMA interpolation from the old
+  EMA tree to the new parameters.
+
+This is not a source/shape assertion: it invokes the three production
+accumulation/application boundaries directly. Removing gradient averaging,
+updating per micro-batch, advancing EMA or optimizer state more than once, or
+incrementing `TrainState.step` per micro-batch makes the contract fail.
+
+The review fix is test-only because the production accumulation path already
+implements the required behavior. The new contract was written before any
+production edit; no production weakening or accommodation was made. Runtime
+RED/GREEN execution is explicitly deferred because the local coding host still
+lacks pytest/JAX/NumPy/Flax/Optax and dependency installation is prohibited:
+
+```text
+$ PYTHONPATH=src python3 -m pytest scripts/train_test.py \
+    -k two_micro_batches_match_one_direct_batch_and_advance_state_once
+/opt/homebrew/opt/python@3.14/bin/python3.14: No module named pytest
+```
+
+Required focused server gate:
+
+```text
+uv run pytest scripts/train_test.py \
+  -k two_micro_batches_match_one_direct_batch_and_advance_state_once
+```
+
+Local static parsing remains available and is included in the final fix
+verification. The server test is deterministic: RNG keys differ between the
+direct and accumulated paths by design, while the tiny loss ignores RNG so the
+mathematical gradient comparison is exact up to float32 tolerance.
