@@ -5,6 +5,7 @@ import dataclasses
 import numpy as np
 import pytest
 
+import openpi.training.bsp as bsp
 from openpi.training.bsp import BspCache
 from openpi.training.bsp import BspCacheValidationError
 from openpi.training.bsp import BspSettings
@@ -128,3 +129,34 @@ def test_cache_fingerprint_is_stable_and_rejects_stale_sidecars(tmp_path):
     np.testing.assert_array_equal(loaded.mapping, cache.mapping)
     with pytest.raises(BspCacheValidationError, match="fingerprint"):
         load_sidecar_cache(cache_path, stale_manifest)
+
+
+def test_cache_reader_waits_for_writer_publication_under_the_shared_lock(tmp_path, monkeypatch):
+    """A first reader must see a writer's atomic publication rather than fail early."""
+    manifest = make_cache_manifest({"repo_id": "libero", "revision": "abc"})
+    cache = BspCache(
+        targets=np.zeros((1, 16, 8), dtype=np.float32),
+        mapping=np.asarray([0], dtype=np.uint32),
+    )
+    cache_path = tmp_path / "published-while-waiting.npz"
+
+    class PublishingLock:
+        def __enter__(self):
+            with cache_path.open("wb") as output:
+                np.savez_compressed(
+                    output,
+                    targets=cache.targets,
+                    mapping=cache.mapping,
+                    manifest=np.asarray(manifest.to_json()),
+                )
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+    monkeypatch.setattr(bsp, "_cache_lock", lambda _path: PublishingLock())
+
+    loaded = load_sidecar_cache(cache_path, manifest)
+
+    np.testing.assert_array_equal(loaded.targets, cache.targets)
+    np.testing.assert_array_equal(loaded.mapping, cache.mapping)

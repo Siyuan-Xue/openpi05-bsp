@@ -95,3 +95,58 @@ FITPACK's candidate-knot behavior and floating-point reconstruction tolerance
 need the required server GREEN run. This local host deliberately lacks the
 NumPy/SciPy/pytest runtime, so numerical fitting, SciPy decode, file-lock
 round-trip, and pytest assertions were not executed here.
+
+## Fix round 1 — review findings
+
+### Changed behavior
+
+- Preserved the applicable upstream MIT copyright and permission notice in
+  `src/openpi/training/bsp.py`, with a stable repository URL, pinned source
+  revision `61ed5f42fced971d50a89b46417493790876ccd1`, and source-file path.
+- Moved the sidecar existence check into `load_sidecar_cache`'s shared lock.
+  A first reader now waits for a concurrent writer to publish atomically,
+  checks the file only after acquiring that lock, then validates/loads it.
+
+### Test-first evidence and changed files
+
+Added `test_cache_reader_waits_for_writer_publication_under_the_shared_lock`
+to `src/openpi/training/bsp_test.py` before the implementation change. Its
+lock context publishes a valid cache while the reader waits: the old ordering
+raises the missing-cache error before entering that context; the fixed
+ordering returns the published targets and mapping.
+
+Changed files:
+
+- `src/openpi/training/bsp.py`
+- `src/openpi/training/bsp_test.py`
+- `.superpowers/sdd/pi05-libero-bsp-sdd-plan/task-1-report.md`
+
+### Commands and output
+
+```text
+$ python3 -m py_compile src/openpi/training/bsp_test.py
+exit 0; no output
+
+$ PYTHONPATH=src python3 -m pytest src/openpi/training/bsp_test.py
+/opt/homebrew/opt/python@3.14/bin/python3.14: No module named pytest
+```
+
+The focused test was therefore written against the prior (RED) ordering but
+cannot be executed locally: pytest, NumPy, and SciPy are intentionally absent
+and dependency installation is prohibited. Required server GREEN gate remains:
+
+```text
+uv run pytest src/openpi/training/bsp_test.py
+```
+
+Post-change static commands and output:
+
+```text
+$ python3 -m py_compile src/openpi/training/bsp.py src/openpi/training/bsp_test.py
+$ python3 -m compileall -q src/openpi/training/bsp.py src/openpi/training/bsp_test.py
+$ awk 'length($0) > 120 { print FILENAME ":" FNR ":" length($0); exit 1 }' \
+    src/openpi/training/bsp.py src/openpi/training/bsp_test.py
+exit 0 for all; no output
+```
+
+No deferred minor test-coverage scope was changed.

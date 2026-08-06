@@ -1,10 +1,35 @@
 """B-spline targets and durable sidecar storage for LIBERO training.
 
-The FITPACK chunking and knot repair behavior in this module are derived from
-``bspline_policy.common.bspline_action`` in the MIT-licensed bspline-policy
-project.  This is a small, standalone port; the author project is never an
-OpenPI runtime dependency.
+This is a small, standalone port of the FITPACK chunking and knot repair
+behavior in the source below; the author project is never an OpenPI runtime
+dependency.
 """
+
+# Derived source repository: https://github.com/B-spline-policy/bspline-policy
+# Derived source revision: 61ed5f42fced971d50a89b46417493790876ccd1
+# Derived source path: bspline_policy/bspline_policy/common/bspline_action.py
+#
+# MIT License
+#
+# Copyright (c) 2026 Haoyu Xiong
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 from __future__ import annotations
 
@@ -348,9 +373,9 @@ def load_sidecar_cache(
     settings = settings or BspSettings()
     expected_manifest.validate()
     cache_path = Path(path)
-    if not cache_path.is_file():
-        raise BspCacheValidationError(f"BSP sidecar cache does not exist: {cache_path}")
     with _cache_lock(cache_path):
+        if not cache_path.is_file():
+            raise BspCacheValidationError(f"BSP sidecar cache does not exist: {cache_path}")
         try:
             with np.load(cache_path, allow_pickle=False) as archive:
                 required = {"targets", "mapping", "manifest"}
