@@ -41,6 +41,7 @@ class Args:
     host: str = "0.0.0.0"
     port: int = 8000
     connection_timeout_s: float = 30.0
+    inference_timeout_s: float = 120.0
     resize_size: int = 224
 
     # Benchmark protocol. `task_suite_name` retains the official example's CLI name.
@@ -54,6 +55,7 @@ class Args:
 
     # Audit manifest identities. `code_sha=auto` reads the current checkout.
     policy_variant: str = "baseline"
+    expected_action_horizon: Optional[int] = None  # noqa: UP045 -- simulator client runs Python 3.8.
     code_sha: str = "auto"
     dataset_revision: str = "v2.1"
     bsp_cache_hash: Optional[str] = None  # noqa: UP045 -- simulator client runs Python 3.8.
@@ -75,6 +77,7 @@ class _ClientHolder:
                     self._args.host,
                     self._args.port,
                     connection_timeout=self._args.connection_timeout_s,
+                    inference_timeout=self._args.inference_timeout_s,
                 )
             except Exception as error:
                 raise _eval.classify_exception(error, phase="server_connect") from error
@@ -155,20 +158,21 @@ def _resolve_code_sha(value: str) -> str:
     return result.stdout.strip()
 
 
-def _validate_args(args: Args) -> tuple[str, ...]:
+def _validate_args(args: Args) -> tuple[tuple[str, ...], _eval.PolicyProtocol]:
     suites = _eval.resolve_suites(args.task_suite_name)
-    if args.policy_variant not in {"baseline", "bsp"}:
-        raise ValueError("policy_variant must be baseline or bsp")
+    protocol = _eval.resolve_policy_protocol(args.policy_variant, args.expected_action_horizon)
     if args.num_trials_per_task < 1 or args.num_steps_wait < 0:
         raise ValueError("Episode counts must be positive and wait steps non-negative")
     if args.eval_seed < 0 or args.train_seed < 0:
         raise ValueError("Training and evaluation seeds must be non-negative")
-    if args.resize_size < 1 or args.connection_timeout_s <= 0:
-        raise ValueError("Image size and connection timeout must be positive")
-    return suites
+    if args.resize_size < 1 or args.connection_timeout_s <= 0 or args.inference_timeout_s <= 0:
+        raise ValueError("Image size and connection/inference timeouts must be positive")
+    return suites, protocol
 
 
-def _make_manifest(args: Args, suites: tuple[str, ...]) -> _eval.EvaluationManifest:
+def _make_manifest(
+    args: Args, suites: tuple[str, ...], protocol: _eval.PolicyProtocol
+) -> _eval.EvaluationManifest:
     bsp_cache_hash = args.bsp_cache_hash or None
     return _eval.EvaluationManifest(
         code_sha=_resolve_code_sha(args.code_sha),
@@ -181,10 +185,16 @@ def _make_manifest(args: Args, suites: tuple[str, ...]) -> _eval.EvaluationManif
         eval_seed=args.eval_seed,
         policy_variant=args.policy_variant,
         bsp_parameters=_eval.BSP_PARAMETERS,
+        policy_protocol=protocol.name,
+        expected_action_horizon=protocol.expected_action_horizon,
+        execution_horizon=REPLAN_STEPS,
         suites=suites,
         trials_per_task=args.num_trials_per_task,
         num_steps_wait=args.num_steps_wait,
         max_steps_by_suite={suite: MAX_STEPS_BY_SUITE[suite] for suite in suites},
+        connection_timeout_s=args.connection_timeout_s,
+        inference_timeout_s=args.inference_timeout_s,
+        infrastructure_retries=2,
     )
 
 
@@ -230,7 +240,7 @@ def _infer_action_plan(
     identity: _eval.EpisodeIdentity,
     eval_seed: int,
     replan_index: int,
-    policy_variant: str,
+    expected_action_horizon: int,
 ) -> tuple[tuple[tuple[float, ...], ...], float]:
     request[_inference.INFERENCE_SEED_KEY] = _eval.stable_replan_seed(eval_seed, identity, replan_index)
     start_time = time.monotonic()
@@ -246,8 +256,10 @@ def _infer_action_plan(
     if not isinstance(result, Mapping) or "actions" not in result:
         client_holder.invalidate()
         raise _eval.PolicyFailure("Policy response is missing the actions field")
-    expected_horizon = 8 if policy_variant == "bsp" else 16
-    return _eval.select_replan_actions(result["actions"], expected_horizon=expected_horizon), elapsed_ms
+    return (
+        _eval.select_replan_actions(result["actions"], expected_horizon=expected_action_horizon),
+        elapsed_ms,
+    )
 
 
 def _run_attempt(
@@ -260,6 +272,7 @@ def _run_attempt(
     args: Args,
     max_steps: int,
 ) -> _eval.AttemptResult:
+    protocol = _eval.resolve_policy_protocol(args.policy_variant, args.expected_action_horizon)
     obs = environment.reset_to(initial_state)
     action_plan = collections.deque()
     replay_images = []
@@ -287,7 +300,7 @@ def _run_attempt(
                     identity,
                     args.eval_seed,
                     replan_index,
-                    args.policy_variant,
+                    protocol.expected_action_horizon,
                 )
             except _eval.PolicyFailure as error:
                 return _eval.AttemptResult(
@@ -333,15 +346,61 @@ def _get_benchmark_suite(suite_name: str):
     return benchmark.get_benchmark_dict()[suite_name]()
 
 
+def _persist_episode_artifacts(
+    record: _eval.EpisodeRecord,
+    writer: _eval.ArtifactWriter,
+    video_selector: _eval.VideoSelector,
+    *,
+    video_encoder=None,
+) -> tuple[_eval.EpisodeRecord, _eval.ArtifactError | None]:
+    """Persist the rollout first, then encode or separately audit its video."""
+    replay_frames = record.replay_frames
+    persisted_record = dataclasses.replace(record, replay_frames=())
+    writer.append_episode(persisted_record)
+
+    video_path = video_selector.claim(persisted_record)
+    if video_path is None:
+        return persisted_record, None
+
+    artifact_error = None
+    if not replay_frames:
+        artifact_error = _eval.ArtifactError(
+            episode_id=persisted_record.identity.episode_id,
+            artifact_type="video",
+            path=str(video_path),
+            error="selected rollout has no replay frames",
+        )
+    else:
+        encoder = imageio.mimwrite if video_encoder is None else video_encoder
+        try:
+            encoder(
+                video_path,
+                [np.asarray(frame) for frame in replay_frames],
+                fps=LIBERO_NATIVE_HZ,
+            )
+        except Exception as error:
+            artifact_error = _eval.ArtifactError(
+                episode_id=persisted_record.identity.episode_id,
+                artifact_type="video",
+                path=str(video_path),
+                error=f"{type(error).__name__}: {error}",
+            )
+
+    if artifact_error is not None:
+        writer.append_artifact_error(artifact_error)
+    return persisted_record, artifact_error
+
+
 def eval_libero(args: Args) -> dict:
-    suites = _validate_args(args)
+    suites, protocol = _validate_args(args)
     output_dir = Path(args.output_dir)
     _ensure_new_run_directory(output_dir)
     writer = _eval.ArtifactWriter(output_dir)
-    writer.write_manifest(_make_manifest(args, suites))
+    writer.write_manifest(_make_manifest(args, suites, protocol))
     video_selector = _eval.VideoSelector(output_dir / "videos")
     client_holder = _ClientHolder(args)
     records = []
+    artifact_errors = []
     np.random.seed(args.eval_seed)
 
     try:
@@ -395,16 +454,10 @@ def eval_libero(args: Args) -> dict:
                             eval_seed=args.eval_seed,
                             infrastructure_retries=2,
                         )
-                        video_path = video_selector.claim(record)
-                        if video_path is not None and record.replay_frames:
-                            imageio.mimwrite(
-                                video_path,
-                                [np.asarray(frame) for frame in record.replay_frames],
-                                fps=LIBERO_NATIVE_HZ,
-                            )
-                        record = dataclasses.replace(record, replay_frames=())
-                        writer.append_episode(record)
+                        record, artifact_error = _persist_episode_artifacts(record, writer, video_selector)
                         records.append(record)
+                        if artifact_error is not None:
+                            artifact_errors.append(artifact_error)
                         logging.info(
                             "%s status=%s attempts=%d steps=%d",
                             identity.episode_id,
@@ -417,12 +470,13 @@ def eval_libero(args: Args) -> dict:
     finally:
         client_holder.close()
 
-    summary = writer.write_summary(records)
+    summary = writer.write_summary(records, artifact_errors=artifact_errors)
     logging.info("Suite macro success rate: %s", summary["suite_macro_success_rate"])
-    if summary["incomplete_infrastructure_count"]:
+    if not summary["acceptance_complete"]:
         raise RuntimeError(
             "Evaluation acceptance is incomplete: "
-            f"{summary['incomplete_infrastructure_count']} episodes exhausted infrastructure retries"
+            f"{summary['incomplete_infrastructure_count']} exhausted infrastructure episodes, "
+            f"{summary['artifact_error_count']} artifact errors"
         )
     return summary
 

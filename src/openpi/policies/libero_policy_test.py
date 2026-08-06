@@ -24,6 +24,12 @@ def test_bsp_libero_outputs_ignore_only_inactive_controls_and_reject_invalid_par
     target[12:, :7] = 10_000
     np.testing.assert_allclose(libero_policy.BspLiberoOutputs()({"actions": target})["actions"], expected)
 
-    for invalid in (np.zeros((15, 32)), np.full((16, 32), np.nan), np.zeros((16, 7))):
+    for invalid in (
+        np.zeros((15, 32)),
+        np.full((16, 32), np.nan),
+        np.zeros((16, 7)),
+        np.zeros((16, 9)),
+        np.zeros((16, 31)),
+    ):
         with pytest.raises(ValueError):
             libero_policy.BspLiberoOutputs()({"actions": invalid})

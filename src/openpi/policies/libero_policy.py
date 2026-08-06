@@ -113,10 +113,10 @@ class BspLiberoOutputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         actions = np.asarray(data["actions"])
         settings = _bsp.BspSettings()
-        if actions.ndim != 2 or actions.shape[0] != settings.target_rows or actions.shape[1] < settings.target_channels:
+        expected_shape = (settings.target_rows, 32)
+        if actions.shape != expected_shape:
             raise ValueError(
-                "BSP policy output must have shape "
-                f"({settings.target_rows}, at least {settings.target_channels}), got {actions.shape}"
+                f"BSP policy output must have padded shape {expected_shape}, got {actions.shape}"
             )
         if not np.isfinite(actions).all():
             raise ValueError("BSP policy output contains non-finite parameters")

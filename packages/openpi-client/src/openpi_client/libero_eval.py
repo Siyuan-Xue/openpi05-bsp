@@ -58,6 +58,31 @@ def resolve_suites(selection: str) -> tuple[str, ...]:
         raise ValueError(f"Unsupported LIBERO suite {selection!r}; supported values: {supported}") from error
 
 
+@dataclasses.dataclass(frozen=True)
+class PolicyProtocol:
+    """Strict server-output contract for one evaluator run."""
+
+    name: str
+    expected_action_horizon: int
+
+
+def resolve_policy_protocol(policy_variant: str, expected_action_horizon: int | None) -> PolicyProtocol:
+    """Resolve phase-one, calibration, or decoded-BSP output without shape relaxation."""
+    if policy_variant == "baseline":
+        horizon = 16 if expected_action_horizon is None else expected_action_horizon
+        if horizon == 16:
+            return PolicyProtocol(name="baseline_h16", expected_action_horizon=16)
+        if horizon == 10:
+            return PolicyProtocol(name="baseline_h10_calibration", expected_action_horizon=10)
+        raise ValueError("Baseline expected_action_horizon must be 16 (phase one) or 10 (official calibration)")
+    if policy_variant == "bsp":
+        horizon = 8 if expected_action_horizon is None else expected_action_horizon
+        if horizon != 8:
+            raise ValueError("BSP policy output must be the decoded horizon-8 protocol")
+        return PolicyProtocol(name="bsp_decoded_h8", expected_action_horizon=8)
+    raise ValueError("Policy variant must be baseline or bsp")
+
+
 def _safe_component(value: str, *, fallback: str) -> str:
     component = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip()).strip("-._").lower()
     return component or fallback
@@ -360,7 +385,9 @@ def _rate(successes: int, eligible: int) -> float | None:
     return successes / eligible if eligible else None
 
 
-def aggregate_records(records: Sequence[EpisodeRecord]) -> dict[str, Any]:
+def aggregate_records(
+    records: Sequence[EpisodeRecord], *, artifact_errors: Sequence[ArtifactError] = ()
+) -> dict[str, Any]:
     """Aggregate episode results without putting infrastructure into denominators."""
     task_groups: dict[tuple[str, int], list[EpisodeRecord]] = {}
     for record in records:
@@ -425,7 +452,8 @@ def aggregate_records(records: Sequence[EpisodeRecord]) -> dict[str, Any]:
         "eligible_episodes": sum(record.include_in_success_rate for record in records),
         "successes": sum(record.success is True for record in records),
         "incomplete_infrastructure_count": incomplete_count,
-        "acceptance_complete": incomplete_count == 0,
+        "artifact_error_count": len(artifact_errors),
+        "acceptance_complete": incomplete_count == 0 and not artifact_errors,
     }
 
 
@@ -441,10 +469,16 @@ class EvaluationManifest:
     eval_seed: int
     policy_variant: str
     bsp_parameters: Mapping[str, Any]
+    policy_protocol: str
+    expected_action_horizon: int
+    execution_horizon: int
     suites: Sequence[str] = ()
     trials_per_task: int = 50
     num_steps_wait: int = 10
     max_steps_by_suite: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    connection_timeout_s: float = 30.0
+    inference_timeout_s: float = 120.0
+    infrastructure_retries: int = 2
 
     def __post_init__(self) -> None:
         if self.policy_variant not in {"baseline", "bsp"}:
@@ -465,10 +499,21 @@ class EvaluationManifest:
             raise ValueError("Baseline evaluation must record a null BSP cache hash")
         if not self.bsp_parameters:
             raise ValueError("Evaluation manifest must record the fixed BSP parameters")
+        protocol = resolve_policy_protocol(self.policy_variant, self.expected_action_horizon)
+        if self.policy_protocol != protocol.name:
+            raise ValueError(
+                f"Manifest protocol {self.policy_protocol!r} does not match resolved protocol {protocol.name!r}"
+            )
+        if self.execution_horizon != _REPLAN_ACTIONS:
+            raise ValueError(f"LIBERO evaluation must execute exactly {_REPLAN_ACTIONS} actions per replan")
         if self.suites and any(suite not in SUPPORTED_SUITES for suite in self.suites):
             raise ValueError("Evaluation manifest contains an unsupported suite")
         if self.trials_per_task < 1 or self.num_steps_wait < 0:
             raise ValueError("Evaluation rollout counts are invalid")
+        if self.connection_timeout_s <= 0 or self.inference_timeout_s <= 0:
+            raise ValueError("Evaluation connection and inference timeouts must be positive")
+        if self.infrastructure_retries != 2:
+            raise ValueError("LIBERO evaluation protocol requires exactly two infrastructure retries")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -503,6 +548,23 @@ class VideoSelector:
         return directory / f"{outcome}-init-{record.identity.init_state_index:03d}-{record.identity.episode_id}.mp4"
 
 
+@dataclasses.dataclass(frozen=True)
+class ArtifactError:
+    """A non-rollout artifact failure preserved separately from policy metrics."""
+
+    episode_id: str
+    artifact_type: str
+    path: str
+    error: str
+
+    def __post_init__(self) -> None:
+        if not all((self.episode_id, self.artifact_type, self.path, self.error)):
+            raise ValueError("Artifact error fields must be non-empty")
+
+    def to_dict(self) -> dict[str, str]:
+        return dataclasses.asdict(self)
+
+
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
@@ -535,6 +597,7 @@ class ArtifactWriter:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.episodes_path = self.output_dir / "episodes.jsonl"
+        self.artifact_errors_path = self.output_dir / "artifact_errors.jsonl"
 
     def write_manifest(self, manifest: EvaluationManifest) -> None:
         _atomic_json(self.output_dir / "manifest.json", manifest.to_dict())
@@ -545,8 +608,16 @@ class ArtifactWriter:
             output.write("\n")
             output.flush()
 
-    def write_summary(self, records: Sequence[EpisodeRecord]) -> dict[str, Any]:
-        summary = aggregate_records(records)
+    def append_artifact_error(self, error: ArtifactError) -> None:
+        with self.artifact_errors_path.open("a", encoding="utf-8") as output:
+            json.dump(error.to_dict(), output, sort_keys=True, allow_nan=False)
+            output.write("\n")
+            output.flush()
+
+    def write_summary(
+        self, records: Sequence[EpisodeRecord], *, artifact_errors: Sequence[ArtifactError] = ()
+    ) -> dict[str, Any]:
+        summary = aggregate_records(records, artifact_errors=artifact_errors)
         _write_csv(self.output_dir / "tasks.csv", summary["tasks"])
         _write_csv(self.output_dir / "suites.csv", summary["suites"])
         _atomic_json(self.output_dir / "summary.json", summary)

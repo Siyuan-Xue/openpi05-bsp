@@ -215,3 +215,108 @@ simulation, training, inference, or heavyweight test was performed.
   intentionally outside Task 4. The decoder is shift-invariant and consumes
   the unnormalized `[16,8]` parameters it receives without changing cache
   semantics.
+
+## Independent-review fix round 1
+
+The independent Task 4 review found two Important and three Minor issues. This
+round addresses all five without changing Task 1/2 data semantics or entering
+Task 5 scope.
+
+### Fixes
+
+- Added `inference_timeout` to `WebsocketClientPolicy`, independently from the
+  connection/metadata deadline. Its default remains `None`, which preserves
+  the existing unbounded `recv()` behavior for every existing client. The
+  evaluator passes a finite default of 120 seconds and the client calls
+  `recv(timeout=...)`; a resulting `TimeoutError` follows the already tested
+  network-infrastructure classification, connection invalidation, identical
+  seed, and at-most-two-retry path. Both deadlines and retry count are now in
+  the manifest.
+- Added a strict policy-protocol resolver and explicit
+  `expected_action_horizon` evaluator option. Phase-one baseline defaults to
+  `baseline_h16`, the official `pi05_libero` calibration checkpoint can select
+  `baseline_h10_calibration` with horizon 10, and BSP is fixed to
+  `bsp_decoded_h8`. Other baseline horizons and any non-8 BSP decoded horizon
+  are rejected. The protocol name, expected server horizon, and fixed executed
+  horizon 8 are recorded and cross-validated in the manifest.
+- Added fake-based central wiring contracts for the real evaluator path: the
+  exact initial-state object is reused, the reserved derived seed reaches the
+  websocket request, a timeout invalidates the connection, retry resets the
+  same state and reuses the same seed, and `_ClientHolder` passes a finite
+  inference deadline. Added a `Policy.infer` integration contract proving the
+  reserved field is absent before the first observation transform while the
+  caller's request remains unchanged.
+- Reordered episode/video publication. The completed episode JSONL row is now
+  appended before video selection or ffmpeg. Video failures are caught only
+  around encoding, appended to independent `artifact_errors.jsonl`, counted in
+  `summary.json`, and make `acceptance_complete=false`; the rollout result is
+  retained and policy metrics remain unchanged. A focused call-order test
+  requires `episode -> video -> artifact_error`.
+- Tightened `BspLiberoOutputs` to the fixed model contract `(16,32)` before it
+  extracts the `[16,8]` controls/knot payload. Tests now reject `(16,9)` and
+  `(16,31)` in addition to wrong rows, too-few channels, and non-finite data.
+
+### Review-fix TDD evidence
+
+The dependency-free contracts for policy protocol and artifact auditing were
+added before their implementations. The focused RED run failed at the missing
+production symbols:
+
+```text
+$ PYTHONPATH=packages/openpi-client/src python3 -m unittest \
+    openpi_client.inference_test openpi_client.libero_eval_test
+....E........E...
+...
+AttributeError: module 'openpi_client.libero_eval' has no attribute 'ArtifactError'
+...
+AttributeError: module 'openpi_client.libero_eval' has no attribute 'resolve_policy_protocol'
+...
+Ran 17 tests in 0.003s
+FAILED (errors=2)
+```
+
+After implementation, the dependency-free GREEN gate is:
+
+```text
+$ PYTHONPATH=packages/openpi-client/src python3 -m unittest \
+    openpi_client.inference_test openpi_client.libero_eval_test
+.................
+----------------------------------------------------------------------
+Ran 17 tests in 0.005s
+
+OK
+```
+
+The fake websocket/evaluator, NumPy/SciPy BSP, and JAX policy integration tests
+are written but remain server-only because the local coding host has no pytest
+or project dependencies:
+
+```text
+$ PYTHONPATH=src:packages/openpi-client/src python3 -m pytest \
+    packages/openpi-client/src/openpi_client/websocket_client_policy_test.py \
+    scripts/libero_eval_test.py \
+    src/openpi/policies/libero_policy_test.py \
+    src/openpi/policies/policy_seed_test.py
+/opt/homebrew/opt/python@3.14/bin/python3.14: No module named pytest
+```
+
+Required focused server gate for this review round:
+
+```text
+uv run pytest \
+  packages/openpi-client/src/openpi_client/inference_test.py \
+  packages/openpi-client/src/openpi_client/libero_eval_test.py \
+  packages/openpi-client/src/openpi_client/websocket_client_policy_test.py \
+  scripts/libero_eval_test.py \
+  src/openpi/policies/libero_policy_test.py \
+  src/openpi/policies/policy_seed_test.py
+```
+
+Static `py_compile`, Python 3.7 client grammar, Python 3.8 evaluator grammar,
+and `git diff --check` remain green. No dependency install/sync, network
+download, policy server, simulator, training, or inference was run locally.
+
+Remaining server-only gates are the real locked-websockets timeout behavior,
+the JAX transform/RNG integration, SciPy BSP decoding, an official horizon-10
+calibration smoke, a horizon-16 baseline smoke, and a decoded-horizon-8 BSP
+smoke in LIBERO/EGL.

@@ -41,6 +41,23 @@ class LiberoEvaluationTest(unittest.TestCase):
         self.assertGreaterEqual(seed, 0)
         self.assertLess(seed, 2**32)
 
+    def test_policy_protocol_defaults_to_phase_one_but_allows_official_h10_calibration(self):
+        self.assertEqual(
+            libero_eval.resolve_policy_protocol("baseline", None),
+            libero_eval.PolicyProtocol(name="baseline_h16", expected_action_horizon=16),
+        )
+        self.assertEqual(
+            libero_eval.resolve_policy_protocol("baseline", 10),
+            libero_eval.PolicyProtocol(name="baseline_h10_calibration", expected_action_horizon=10),
+        )
+        self.assertEqual(
+            libero_eval.resolve_policy_protocol("bsp", None),
+            libero_eval.PolicyProtocol(name="bsp_decoded_h8", expected_action_horizon=8),
+        )
+        for variant, horizon in (("baseline", 8), ("baseline", 11), ("bsp", 16)):
+            with self.subTest(variant=variant, horizon=horizon), self.assertRaises(ValueError):
+                libero_eval.resolve_policy_protocol(variant, horizon)
+
     def test_episode_identity_is_paired_by_suite_task_and_exact_init_state(self):
         identity = _identity(suite="libero_goal", task_id=4, init_index=9)
 
@@ -192,12 +209,18 @@ class LiberoEvaluationTest(unittest.TestCase):
             eval_seed=7,
             policy_variant="bsp",
             bsp_parameters=libero_eval.BSP_PARAMETERS,
+            policy_protocol="bsp_decoded_h8",
+            expected_action_horizon=8,
+            execution_horizon=8,
         )
 
         payload = manifest.to_dict()
         self.assertEqual(payload["code_sha"], "abc")
         self.assertEqual(payload["bsp_cache_hash"], "cache")
         self.assertEqual(payload["bsp_parameters"]["target_rows"], 16)
+        self.assertEqual(payload["policy_protocol"], "bsp_decoded_h8")
+        self.assertEqual(payload["expected_action_horizon"], 8)
+        self.assertEqual(payload["execution_horizon"], 8)
 
     def test_artifact_writer_emits_jsonl_csv_and_summary(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -212,6 +235,29 @@ class LiberoEvaluationTest(unittest.TestCase):
             self.assertTrue((root / "tasks.csv").is_file())
             self.assertTrue((root / "suites.csv").is_file())
             self.assertEqual(json.loads((root / "summary.json").read_text()), summary)
+
+    def test_artifact_failure_is_separately_audited_and_marks_summary_incomplete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            writer = libero_eval.ArtifactWriter(root)
+            record = libero_eval.EpisodeRecord.from_attempt(_identity(), 42, 1, success=True)
+            error = libero_eval.ArtifactError(
+                episode_id=record.identity.episode_id,
+                artifact_type="video",
+                path="videos/example.mp4",
+                error="ffmpeg exited 1",
+            )
+
+            writer.append_episode(record)
+            writer.append_artifact_error(error)
+            summary = writer.write_summary([record], artifact_errors=[error])
+
+            persisted_episode = json.loads((root / "episodes.jsonl").read_text())
+            persisted_error = json.loads((root / "artifact_errors.jsonl").read_text())
+            self.assertTrue(persisted_episode["success"])
+            self.assertEqual(persisted_error["artifact_type"], "video")
+            self.assertEqual(summary["artifact_error_count"], 1)
+            self.assertFalse(summary["acceptance_complete"])
 
 
 if __name__ == "__main__":

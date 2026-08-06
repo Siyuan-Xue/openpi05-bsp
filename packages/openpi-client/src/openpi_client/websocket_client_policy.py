@@ -21,6 +21,7 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
         port: Optional[int] = None,
         api_key: Optional[str] = None,
         connection_timeout: Optional[float] = None,
+        inference_timeout: Optional[float] = None,
     ) -> None:
         if host.startswith("ws"):
             self._uri = host
@@ -32,7 +33,10 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
         self._api_key = api_key
         if connection_timeout is not None and connection_timeout <= 0:
             raise ValueError("connection_timeout must be positive")
+        if inference_timeout is not None and inference_timeout <= 0:
+            raise ValueError("inference_timeout must be positive")
         self._connection_timeout = connection_timeout
+        self._inference_timeout = inference_timeout
         self._ws, self._server_metadata = self._wait_for_server()
 
     def get_server_metadata(self) -> Dict:
@@ -76,7 +80,11 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
     def infer(self, obs: Dict) -> Dict:  # noqa: UP006
         data = self._packer.pack(obs)
         self._ws.send(data)
-        response = self._ws.recv()
+        response = (
+            self._ws.recv()
+            if self._inference_timeout is None
+            else self._ws.recv(timeout=self._inference_timeout)
+        )
         if isinstance(response, str):
             # we're expecting bytes; if the server sends a string, it's an error.
             raise RuntimeError(f"Error in inference server:\n{response}")
