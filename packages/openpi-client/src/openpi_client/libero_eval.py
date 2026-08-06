@@ -66,6 +66,22 @@ def resolve_suites(selection: str) -> tuple[str, ...]:
         raise ValueError(f"Unsupported LIBERO suite {selection!r}; supported values: {supported}") from error
 
 
+def resolve_task_ids(selection: Sequence[int] | None) -> tuple[int, ...]:
+    """Return a deterministic non-empty subset of the ten tasks in every phase-one suite."""
+    if selection is None:
+        return tuple(range(10))
+    task_ids = tuple(selection)
+    if not task_ids:
+        raise ValueError("At least one LIBERO task id is required")
+    if any(isinstance(task_id, bool) or not isinstance(task_id, int) for task_id in task_ids):
+        raise ValueError("LIBERO task ids must be integers")
+    if any(task_id < 0 or task_id >= 10 for task_id in task_ids):
+        raise ValueError("LIBERO task ids must be in the inclusive range 0..9")
+    if len(set(task_ids)) != len(task_ids):
+        raise ValueError("LIBERO task ids must be unique")
+    return tuple(sorted(task_ids))
+
+
 @dataclasses.dataclass(frozen=True)
 class PolicyProtocol:
     """Strict server-output contract for one evaluator run."""
@@ -469,7 +485,10 @@ def aggregate_records(
 class EvaluationManifest:
     code_sha: str
     dataset_revision: str
+    config_name: str
+    checkpoint_step: int
     bsp_cache_hash: str | None
+    bsp_cache_manifest_fingerprint: str | None
     norm_hash: str
     checkpoint: str
     container_digest: str
@@ -481,6 +500,7 @@ class EvaluationManifest:
     expected_action_horizon: int
     execution_horizon: int
     suites: Sequence[str] = ()
+    task_ids: Sequence[int] = tuple(range(10))
     trials_per_task: int = 50
     num_steps_wait: int = 10
     max_steps_by_suite: Mapping[str, int] = dataclasses.field(default_factory=dict)
@@ -494,6 +514,7 @@ class EvaluationManifest:
         required = {
             "code_sha": self.code_sha,
             "dataset_revision": self.dataset_revision,
+            "config_name": self.config_name,
             "norm_hash": self.norm_hash,
             "checkpoint": self.checkpoint,
             "container_digest": self.container_digest,
@@ -501,10 +522,30 @@ class EvaluationManifest:
         missing = sorted(key for key, value in required.items() if not value)
         if missing:
             raise ValueError(f"Evaluation manifest is missing required identities: {missing}")
-        if self.policy_variant == "bsp" and not self.bsp_cache_hash:
-            raise ValueError("BSP evaluation requires the sidecar cache hash")
-        if self.policy_variant == "baseline" and self.bsp_cache_hash is not None:
-            raise ValueError("Baseline evaluation must record a null BSP cache hash")
+        if isinstance(self.checkpoint_step, bool) or not isinstance(self.checkpoint_step, int):
+            raise ValueError("Evaluation checkpoint_step must be an integer")
+        if self.checkpoint_step < 0:
+            raise ValueError("Evaluation checkpoint_step must be non-negative")
+        if len(self.norm_hash) != 64 or any(character not in "0123456789abcdef" for character in self.norm_hash):
+            raise ValueError("norm_hash must be the lowercase SHA256 of norm_stats.json")
+        cache_identities_present = (self.bsp_cache_hash is not None, self.bsp_cache_manifest_fingerprint is not None)
+        if self.policy_variant == "bsp" and cache_identities_present != (True, True):
+            raise ValueError("BSP evaluation requires both the sidecar NPZ SHA256 and manifest fingerprint")
+        if self.policy_variant == "baseline" and cache_identities_present != (False, False):
+            raise ValueError("Baseline evaluation must record null BSP cache identities")
+        if self.bsp_cache_hash is not None and (
+            len(self.bsp_cache_hash) != 64
+            or any(character not in "0123456789abcdef" for character in self.bsp_cache_hash)
+        ):
+            raise ValueError("bsp_cache_hash must be the lowercase SHA256 of the actual sidecar NPZ")
+        if self.bsp_cache_manifest_fingerprint is not None and (
+            len(self.bsp_cache_manifest_fingerprint) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.bsp_cache_manifest_fingerprint
+            )
+        ):
+            raise ValueError("bsp_cache_manifest_fingerprint must be a lowercase SHA256")
         if not self.bsp_parameters:
             raise ValueError("Evaluation manifest must record the fixed BSP parameters")
         protocol = resolve_policy_protocol(self.policy_variant, self.expected_action_horizon)
@@ -516,6 +557,9 @@ class EvaluationManifest:
             raise ValueError(f"LIBERO evaluation must execute exactly {_REPLAN_ACTIONS} actions per replan")
         if self.suites and any(suite not in SUPPORTED_SUITES for suite in self.suites):
             raise ValueError("Evaluation manifest contains an unsupported suite")
+        canonical_task_ids = resolve_task_ids(self.task_ids)
+        if tuple(self.task_ids) != canonical_task_ids:
+            raise ValueError("Evaluation manifest task_ids must be unique and sorted")
         if self.trials_per_task < 1 or self.num_steps_wait < 0:
             raise ValueError("Evaluation rollout counts are invalid")
         if self.connection_timeout_s <= 0 or self.inference_timeout_s <= 0:
@@ -524,9 +568,12 @@ class EvaluationManifest:
             raise ValueError("LIBERO evaluation protocol requires exactly two infrastructure retries")
 
     def to_dict(self) -> dict[str, Any]:
+        payload = dataclasses.asdict(self)
+        payload["suites"] = list(self.suites)
+        payload["task_ids"] = list(self.task_ids)
         return {
-            **dataclasses.asdict(self),
-            "schema_version": 1,
+            **payload,
+            "schema_version": 2,
             "native_control_hz": 10,
             "replan_steps": _REPLAN_ACTIONS,
         }

@@ -1,5 +1,7 @@
 import dataclasses
 
+import pytest
+
 from openpi_client import inference
 from openpi_client import libero_eval
 
@@ -63,6 +65,12 @@ def _args():
         libero_main.Args(),
         num_steps_wait=0,
         expected_action_horizon=16,
+        config_name="pi05_libero_baseline_h16",
+        checkpoint_step=10000,
+        norm_hash="b" * 64,
+        checkpoint="checkpoint/10000",
+        container_digest="sha256:container",
+        code_sha="abc",
     )
 
 
@@ -87,10 +95,33 @@ def test_client_holder_passes_finite_inference_deadline(monkeypatch):
 def test_official_calibration_resolves_strict_horizon_10_protocol():
     args = dataclasses.replace(_args(), expected_action_horizon=10)
 
-    _, protocol = libero_main._validate_args(args)
+    _, _, protocol = libero_main._validate_args(args)
 
     assert protocol.name == "baseline_h10_calibration"
     assert protocol.expected_action_horizon == 10
+
+
+def test_single_task_smoke_filter_is_canonical_and_recorded_in_manifest():
+    args = dataclasses.replace(
+        _args(),
+        task_suite_name="libero_spatial",
+        task_ids=(0,),
+        num_trials_per_task=1,
+    )
+
+    suites, task_ids, protocol = libero_main._validate_args(args)
+    manifest = libero_main._make_manifest(args, suites, task_ids, protocol).to_dict()
+
+    assert suites == ("libero_spatial",)
+    assert task_ids == (0,)
+    assert manifest["task_ids"] == [0]
+    assert manifest["trials_per_task"] == 1
+
+
+@pytest.mark.parametrize("task_ids", [(), (0, 0), (-1,), (10,)])
+def test_invalid_task_filters_are_rejected(task_ids):
+    with pytest.raises(ValueError):
+        libero_main._validate_args(dataclasses.replace(_args(), task_ids=task_ids))
 
 
 def test_run_attempt_sends_reserved_seed_and_uses_exact_initial_state(monkeypatch):

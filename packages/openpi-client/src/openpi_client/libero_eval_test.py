@@ -1,3 +1,4 @@
+import ast
 import dataclasses
 import json
 import tempfile
@@ -18,6 +19,13 @@ def _identity(suite: str = "libero_spatial", task_id: int = 0, init_index: int =
 
 
 class LiberoEvaluationTest(unittest.TestCase):
+    def test_task_filter_is_canonical_and_rejects_duplicates_or_out_of_range_ids(self):
+        self.assertEqual(libero_eval.resolve_task_ids(None), tuple(range(10)))
+        self.assertEqual(libero_eval.resolve_task_ids((7, 0, 3)), (0, 3, 7))
+        for invalid in ((0, 0), (-1,), (10,), ()):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                libero_eval.resolve_task_ids(invalid)
+
     def test_resolve_suites_accepts_four_named_suites_or_all_but_not_libero_90(self):
         self.assertEqual(libero_eval.resolve_suites("spatial"), ("libero_spatial",))
         self.assertEqual(libero_eval.resolve_suites("libero_10"), ("libero_10",))
@@ -201,8 +209,11 @@ class LiberoEvaluationTest(unittest.TestCase):
         manifest = libero_eval.EvaluationManifest(
             code_sha="abc",
             dataset_revision="v2.1",
-            bsp_cache_hash="cache",
-            norm_hash="norm",
+            config_name="pi05_libero_bsp_h16",
+            checkpoint_step=10000,
+            bsp_cache_hash="a" * 64,
+            bsp_cache_manifest_fingerprint="c" * 64,
+            norm_hash="b" * 64,
             checkpoint="checkpoint/10000",
             container_digest="sha256:container",
             train_seed=42,
@@ -212,15 +223,61 @@ class LiberoEvaluationTest(unittest.TestCase):
             policy_protocol="bsp_decoded_h8",
             expected_action_horizon=8,
             execution_horizon=8,
+            suites=libero_eval.SUPPORTED_SUITES,
+            task_ids=(0, 3),
         )
 
         payload = manifest.to_dict()
         self.assertEqual(payload["code_sha"], "abc")
-        self.assertEqual(payload["bsp_cache_hash"], "cache")
+        self.assertEqual(payload["config_name"], "pi05_libero_bsp_h16")
+        self.assertEqual(payload["checkpoint_step"], 10000)
+        self.assertEqual(payload["bsp_cache_hash"], "a" * 64)
+        self.assertEqual(payload["bsp_cache_manifest_fingerprint"], "c" * 64)
+        self.assertEqual(payload["schema_version"], 2)
         self.assertEqual(payload["bsp_parameters"]["target_rows"], 16)
         self.assertEqual(payload["policy_protocol"], "bsp_decoded_h8")
         self.assertEqual(payload["expected_action_horizon"], 8)
         self.assertEqual(payload["execution_horizon"], 8)
+        self.assertEqual(payload["task_ids"], [0, 3])
+
+    def test_manifest_requires_cache_sha_and_fingerprint_together_only_for_bsp(self):
+        shared = dict(
+            code_sha="abc",
+            dataset_revision="v2.1",
+            norm_hash="b" * 64,
+            checkpoint="checkpoint/10000",
+            checkpoint_step=10000,
+            container_digest="sha256:container",
+            train_seed=42,
+            eval_seed=42,
+            bsp_parameters=libero_eval.BSP_PARAMETERS,
+            execution_horizon=8,
+        )
+        baseline = libero_eval.EvaluationManifest(
+            **shared,
+            config_name="pi05_libero_baseline_h16",
+            bsp_cache_hash=None,
+            bsp_cache_manifest_fingerprint=None,
+            policy_variant="baseline",
+            policy_protocol="baseline_h16",
+            expected_action_horizon=16,
+        )
+        self.assertIsNone(baseline.to_dict()["bsp_cache_hash"])
+        for cache_hash, fingerprint in ((None, "c" * 64), ("a" * 64, None)):
+            with self.subTest(cache_hash=cache_hash, fingerprint=fingerprint), self.assertRaises(ValueError):
+                libero_eval.EvaluationManifest(
+                    **shared,
+                    config_name="pi05_libero_bsp_h16",
+                    bsp_cache_hash=cache_hash,
+                    bsp_cache_manifest_fingerprint=fingerprint,
+                    policy_variant="bsp",
+                    policy_protocol="bsp_decoded_h8",
+                    expected_action_horizon=8,
+                )
+
+    def test_client_evaluation_module_parses_as_python_37(self):
+        source = Path(libero_eval.__file__).read_text(encoding="utf-8")
+        ast.parse(source, filename=str(libero_eval.__file__), feature_version=(3, 7))
 
     def test_artifact_writer_emits_jsonl_csv_and_summary(self):
         with tempfile.TemporaryDirectory() as directory:

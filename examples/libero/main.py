@@ -10,7 +10,7 @@ import math
 from pathlib import Path
 import subprocess
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 import imageio
 import numpy as np
@@ -46,6 +46,8 @@ class Args:
 
     # Benchmark protocol. `task_suite_name` retains the official example's CLI name.
     task_suite_name: str = "libero_spatial"
+    # Omit for all ten tasks. A singleton such as `(0,)` enables the real EGL smoke run.
+    task_ids: Optional[Tuple[int, ...]] = None  # noqa: UP045 -- simulator client runs Python 3.8.
     num_steps_wait: int = 10
     num_trials_per_task: int = 50
     eval_seed: int = 42
@@ -56,9 +58,12 @@ class Args:
     # Audit manifest identities. `code_sha=auto` reads the current checkout.
     policy_variant: str = "baseline"
     expected_action_horizon: Optional[int] = None  # noqa: UP045 -- simulator client runs Python 3.8.
+    config_name: str = ""
+    checkpoint_step: int = 0
     code_sha: str = "auto"
     dataset_revision: str = "v2.1"
     bsp_cache_hash: Optional[str] = None  # noqa: UP045 -- simulator client runs Python 3.8.
+    bsp_cache_manifest_fingerprint: Optional[str] = None  # noqa: UP045 -- Python 3.8.
     norm_hash: str = ""
     checkpoint: str = ""
     container_digest: str = ""
@@ -158,8 +163,9 @@ def _resolve_code_sha(value: str) -> str:
     return result.stdout.strip()
 
 
-def _validate_args(args: Args) -> tuple[tuple[str, ...], _eval.PolicyProtocol]:
+def _validate_args(args: Args) -> tuple[tuple[str, ...], tuple[int, ...], _eval.PolicyProtocol]:
     suites = _eval.resolve_suites(args.task_suite_name)
+    task_ids = _eval.resolve_task_ids(args.task_ids)
     protocol = _eval.resolve_policy_protocol(args.policy_variant, args.expected_action_horizon)
     if args.num_trials_per_task < 1 or args.num_steps_wait < 0:
         raise ValueError("Episode counts must be positive and wait steps non-negative")
@@ -167,17 +173,24 @@ def _validate_args(args: Args) -> tuple[tuple[str, ...], _eval.PolicyProtocol]:
         raise ValueError("Training and evaluation seeds must be non-negative")
     if args.resize_size < 1 or args.connection_timeout_s <= 0 or args.inference_timeout_s <= 0:
         raise ValueError("Image size and connection/inference timeouts must be positive")
-    return suites, protocol
+    return suites, task_ids, protocol
 
 
 def _make_manifest(
-    args: Args, suites: tuple[str, ...], protocol: _eval.PolicyProtocol
+    args: Args,
+    suites: tuple[str, ...],
+    task_ids: tuple[int, ...],
+    protocol: _eval.PolicyProtocol,
 ) -> _eval.EvaluationManifest:
     bsp_cache_hash = args.bsp_cache_hash or None
+    bsp_cache_manifest_fingerprint = args.bsp_cache_manifest_fingerprint or None
     return _eval.EvaluationManifest(
         code_sha=_resolve_code_sha(args.code_sha),
         dataset_revision=args.dataset_revision,
+        config_name=args.config_name,
+        checkpoint_step=args.checkpoint_step,
         bsp_cache_hash=bsp_cache_hash,
+        bsp_cache_manifest_fingerprint=bsp_cache_manifest_fingerprint,
         norm_hash=args.norm_hash,
         checkpoint=args.checkpoint,
         container_digest=args.container_digest,
@@ -189,6 +202,7 @@ def _make_manifest(
         expected_action_horizon=protocol.expected_action_horizon,
         execution_horizon=REPLAN_STEPS,
         suites=suites,
+        task_ids=task_ids,
         trials_per_task=args.num_trials_per_task,
         num_steps_wait=args.num_steps_wait,
         max_steps_by_suite={suite: MAX_STEPS_BY_SUITE[suite] for suite in suites},
@@ -392,11 +406,11 @@ def _persist_episode_artifacts(
 
 
 def eval_libero(args: Args) -> dict:
-    suites, protocol = _validate_args(args)
+    suites, task_ids, protocol = _validate_args(args)
     output_dir = Path(args.output_dir)
     _ensure_new_run_directory(output_dir)
     writer = _eval.ArtifactWriter(output_dir)
-    writer.write_manifest(_make_manifest(args, suites, protocol))
+    writer.write_manifest(_make_manifest(args, suites, task_ids, protocol))
     video_selector = _eval.VideoSelector(output_dir / "videos")
     client_holder = _ClientHolder(args)
     records = []
@@ -412,7 +426,7 @@ def eval_libero(args: Args) -> dict:
                 )
             logging.info("Evaluating suite %s", suite_name)
 
-            for task_id in tqdm.tqdm(range(task_suite.n_tasks), desc=suite_name):
+            for task_id in tqdm.tqdm(task_ids, desc=suite_name):
                 task = task_suite.get_task(task_id)
                 task_description = str(task.language)
                 initial_states = task_suite.get_task_init_states(task_id)
