@@ -180,7 +180,16 @@ def bsp_cache_contents_sha256(cache: BspCache) -> str:
 def _episode_actions(dataset: Any, start: int, end: int, action_key: str) -> np.ndarray:
     try:
         rows = dataset.hf_dataset[start:end]
-        actions = np.asarray(rows[action_key], dtype=np.float32)
+        raw_actions = rows[action_key]
+        try:
+            action_rows = iter(raw_actions)
+        except TypeError:
+            actions = np.asarray(raw_actions, dtype=np.float32)
+        else:
+            actions = np.stack(
+                [np.asarray(action_row, dtype=np.float32) for action_row in action_rows],
+                axis=0,
+            )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError(f"LeRobot hf_dataset does not contain usable raw '{action_key}' actions") from error
     if actions.shape != (end - start, BspSettings().action_dim):

@@ -37,6 +37,36 @@ class TinyHfDataset:
         return {"actions": self._actions[index]}
 
 
+class TensorLikeActionRow:
+    """CPU tensor analogue whose NumPy conversion is valid one frame at a time."""
+
+    def __init__(self, values):
+        self._values = np.asarray(values, dtype=np.float32)
+
+    def __array__(self, dtype=None, copy=None):
+        values = self._values if dtype is None else self._values.astype(dtype, copy=False)
+        return values.copy() if copy else values
+
+
+class TensorLikeActionRows(list):
+    """Model the locked HF slice: a list of tensor rows, not one batch tensor."""
+
+    def __array__(self, dtype=None, copy=None):
+        del dtype, copy
+        raise TypeError("tensor rows must be converted individually")
+
+
+class TensorFormattedTinyHfDataset(TinyHfDataset):
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return {
+                "actions": TensorLikeActionRows(
+                    TensorLikeActionRow(row) for row in self._actions[index]
+                )
+            }
+        return {"actions": TensorLikeActionRow(self._actions[index])}
+
+
 class TinyLeRobotDataset:
     """Exercises wrapper behavior without mocking LeRobot calls."""
 
@@ -69,6 +99,50 @@ class TinyLeRobotDataset:
 
 
 TINY_METADATA = LeRobotDatasetMetadata(episodes=2, frames=16, tasks=2, fps=10)
+
+
+def test_episode_actions_stacks_tensor_like_rows_from_the_complete_episode_slice():
+    """Batch-coercing a real LeRobot list of tensors fails before BSP fitting starts."""
+    all_actions = np.arange(35, dtype=np.float32).reshape(5, 7)
+    expected = all_actions[1:4]
+    hf_dataset = TensorFormattedTinyHfDataset(all_actions)
+    dataset = type("Dataset", (), {"hf_dataset": hf_dataset})()
+
+    actual = bsp_dataset._episode_actions(dataset, 1, 4, "actions")
+
+    assert actual.dtype == np.float32
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_episode_actions_remains_compatible_with_ndarray_batches():
+    """Fixing tensor-list ingestion must not change the existing ndarray path."""
+    expected = np.arange(14, dtype=np.float64).reshape(2, 7)
+    dataset = type("Dataset", (), {"hf_dataset": TinyHfDataset(expected)})()
+
+    actual = bsp_dataset._episode_actions(dataset, 0, 2, "actions")
+
+    assert actual.dtype == np.float32
+    np.testing.assert_array_equal(actual, expected.astype(np.float32))
+
+
+def test_episode_actions_rejects_tensor_like_rows_with_the_wrong_action_width():
+    """Per-row conversion must not weaken the seven-dimensional LIBERO action contract."""
+    hf_dataset = TensorFormattedTinyHfDataset(np.zeros((2, 6), dtype=np.float32))
+    dataset = type("Dataset", (), {"hf_dataset": hf_dataset})()
+
+    with pytest.raises(ValueError, match=r"shape \(2, 7\).+got \(2, 6\)"):
+        bsp_dataset._episode_actions(dataset, 0, 2, "actions")
+
+
+def test_cache_build_rejects_nonfinite_tensor_like_episode_actions():
+    """Stacking tensor rows must preserve the finite-value gate before FITPACK."""
+    dataset = TinyLeRobotDataset()
+    actions = dataset.hf_dataset._actions.copy()
+    actions[3, 2] = np.nan
+    dataset.hf_dataset = TensorFormattedTinyHfDataset(actions)
+
+    with pytest.raises(ValueError, match="finite"):
+        build_lerobot_bsp_cache(dataset, expected_metadata=TINY_METADATA)
 
 
 def test_wrapper_preserves_standard_sample_and_replaces_only_mapped_actions():
