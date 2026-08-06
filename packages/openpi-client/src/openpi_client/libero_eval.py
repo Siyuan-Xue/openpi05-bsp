@@ -522,6 +522,16 @@ class EvaluationManifest:
         missing = sorted(key for key, value in required.items() if not value)
         if missing:
             raise ValueError(f"Evaluation manifest is missing required identities: {missing}")
+        if not isinstance(self.code_sha, str) or re.fullmatch(
+            r"(?:[0-9a-f]{40}|[0-9a-f]{64})", self.code_sha
+        ) is None:
+            raise ValueError("Evaluation code_sha must be a lowercase 40- or 64-character Git SHA")
+        if self.dataset_revision != "v2.0":
+            raise ValueError("Physical Intelligence LIBERO evaluation requires dataset revision v2.0")
+        if not isinstance(self.container_digest, str) or re.fullmatch(
+            r"sha256:[0-9a-f]{64}", self.container_digest
+        ) is None:
+            raise ValueError("Evaluation container_digest must be a lowercase sha256 digest")
         if isinstance(self.checkpoint_step, bool) or not isinstance(self.checkpoint_step, int):
             raise ValueError("Evaluation checkpoint_step must be an integer")
         if self.checkpoint_step < 0:
@@ -562,8 +572,17 @@ class EvaluationManifest:
             raise ValueError("Evaluation manifest task_ids must be unique and sorted")
         if self.trials_per_task < 1 or self.num_steps_wait < 0:
             raise ValueError("Evaluation rollout counts are invalid")
-        if self.connection_timeout_s <= 0 or self.inference_timeout_s <= 0:
-            raise ValueError("Evaluation connection and inference timeouts must be positive")
+        for name, timeout in (
+            ("connection_timeout_s", self.connection_timeout_s),
+            ("inference_timeout_s", self.inference_timeout_s),
+        ):
+            if (
+                isinstance(timeout, bool)
+                or not isinstance(timeout, (int, float))
+                or not math.isfinite(timeout)
+                or timeout <= 0
+            ):
+                raise ValueError(f"Evaluation {name} must be positive and finite")
         if self.infrastructure_retries != 2:
             raise ValueError("LIBERO evaluation protocol requires exactly two infrastructure retries")
 

@@ -1,5 +1,6 @@
 import copy
 import csv
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -14,6 +15,23 @@ _BASELINE_NORM = "b" * 64
 _BSP_NORM = "c" * 64
 _CACHE_SHA = "d" * 64
 _CACHE_FINGERPRINT = "e" * 64
+_CODE_SHA = "a" * 40
+_CONTAINER_DIGEST = "sha256:" + "f" * 64
+_CACHE_CONTENTS_SHA = "1" * 64
+_BASELINE_ACTION_SHA = "2" * 64
+_BSP_ACTION_SHA = "3" * 64
+_VERIFICATION_FLAGS = (
+    "strict_reconstruction_tolerance",
+    "ground_truth_knots_nondecreasing",
+    "tail_padding_valid",
+    "future_segment_mapping_valid",
+    "target_index_bounds_valid",
+    "no_cross_episode_mapping",
+    "all_frames_covered",
+    "targets_match_rebuild",
+    "mapping_matches_rebuild",
+    "cache_contents_deterministic",
+)
 
 
 def _manifest(variant, step):
@@ -22,7 +40,7 @@ def _manifest(variant, step):
         "schema_version": 2,
         "native_control_hz": 10,
         "replan_steps": 8,
-        "code_sha": "code-sha",
+        "code_sha": _CODE_SHA,
         "dataset_revision": "v2.0",
         "config_name": "pi05_libero_baseline_h16" if baseline else "pi05_libero_bsp_h16",
         "checkpoint_step": step,
@@ -30,7 +48,7 @@ def _manifest(variant, step):
         "bsp_cache_manifest_fingerprint": None if baseline else _CACHE_FINGERPRINT,
         "norm_hash": _BASELINE_NORM if baseline else _BSP_NORM,
         "checkpoint": "checkpoint/{}/{}".format(variant, step),
-        "container_digest": "sha256:container",
+        "container_digest": _CONTAINER_DIGEST,
         "train_seed": 42,
         "eval_seed": 42,
         "policy_variant": variant,
@@ -55,7 +73,9 @@ def _manifest(variant, step):
 
 
 def _episode(suite, task_id, init_index, success):
-    fingerprint = "state-{}-{}-{}".format(suite, task_id, init_index)
+    fingerprint = hashlib.sha256(
+        "state-{}-{}-{}".format(suite, task_id, init_index).encode("utf-8")
+    ).hexdigest()
     identity = libero_eval.EpisodeIdentity(
         suite=suite,
         task_id=task_id,
@@ -68,7 +88,8 @@ def _episode(suite, task_id, init_index, success):
         steps=task_id + init_index + 1,
         replans=1,
         failure_kind=None if success else "policy",
-        inference_ms=(1.0, 2.0),
+        error=None if success else "policy output invalid",
+        inference_ms=(1.0,),
     )
     return libero_eval.EpisodeRecord.from_attempt(
         identity,
@@ -100,23 +121,50 @@ def _write_run(path, variant, step):
     )
 
 
+def _bsp_diagnostics():
+    return {
+        **{flag: True for flag in _VERIFICATION_FLAGS},
+        "verification_passed": True,
+        "strict_comparison": True,
+        "scipy_version": "1.15.3",
+        "required_scipy_version": "1.15.3",
+        "scipy_version_matches_required": True,
+        "episode_count": 1693,
+        "frame_count": 273465,
+        "strict_max_reconstruction_error": 0.001,
+        "mean_reconstruction_error": 0.0002,
+        "p95_reconstruction_error": 0.0008,
+        "max_error_threshold": 0.002,
+        "cache_sha256": _CACHE_SHA,
+        "cache_manifest_fingerprint": _CACHE_FINGERPRINT,
+        "cache_contents_sha256": _CACHE_CONTENTS_SHA,
+        "rebuilt_contents_sha256": _CACHE_CONTENTS_SHA,
+        "code_sha": _CODE_SHA,
+    }
+
+
+def _norm_diagnostics():
+    return {
+        "state_stats_equal": True,
+        "asset_directories_isolated": True,
+        "action_stats_isolated": True,
+        "baseline_norm_stats_sha256": _BASELINE_NORM,
+        "bsp_norm_stats_sha256": _BSP_NORM,
+        "baseline_action_stats_sha256": _BASELINE_ACTION_SHA,
+        "bsp_action_stats_sha256": _BSP_ACTION_SHA,
+        "baseline_asset_dir": "/experiments/assets/libero_baseline_h16",
+        "bsp_asset_dir": "/experiments/assets/libero_bsp_h16",
+        "state_fields": {field: {"equal": True} for field in ("mean", "std", "q01", "q99")},
+        "rtol": 1e-7,
+        "atol": 1e-8,
+    }
+
+
 def _write_diagnostics(root):
     bsp = root / "bsp-verification.json"
     bsp.write_text(
         json.dumps(
-            {
-                "verification_passed": True,
-                "strict_comparison": True,
-                "scipy_version": "1.15.3",
-                "episode_count": 1693,
-                "frame_count": 273465,
-                "strict_max_reconstruction_error": 0.001,
-                "mean_reconstruction_error": 0.0002,
-                "p95_reconstruction_error": 0.0008,
-                "max_error_threshold": 0.002,
-                "cache_sha256": _CACHE_SHA,
-                "cache_manifest_fingerprint": _CACHE_FINGERPRINT,
-            },
+            _bsp_diagnostics(),
             allow_nan=False,
             sort_keys=True,
         )
@@ -126,13 +174,7 @@ def _write_diagnostics(root):
     norm = root / "norm-comparison.json"
     norm.write_text(
         json.dumps(
-            {
-                "state_stats_equal": True,
-                "asset_directories_isolated": True,
-                "action_stats_isolated": True,
-                "baseline_norm_stats_sha256": _BASELINE_NORM,
-                "bsp_norm_stats_sha256": _BSP_NORM,
-            },
+            _norm_diagnostics(),
             allow_nan=False,
             sort_keys=True,
         )
@@ -215,6 +257,40 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
         for manifests in cases:
             with self.subTest(case=cases.index(manifests)), self.assertRaises(libero_report.ComparisonError):
                 libero_report.classify_phase_one_manifests(manifests)
+
+    def test_manifest_classifier_binds_unique_checkpoint_paths_to_their_steps(self):
+        valid = [_manifest(variant, step) for variant in ("baseline", "bsp") for step in _STEPS]
+        trailing_slash = copy.deepcopy(valid)
+        trailing_slash[0]["checkpoint"] += "/"
+        libero_report.classify_phase_one_manifests(trailing_slash)
+
+        duplicate_path = copy.deepcopy(valid)
+        duplicate_path[3]["checkpoint"] = duplicate_path[0]["checkpoint"] + "///"
+        wrong_step = copy.deepcopy(valid)
+        wrong_step[0]["checkpoint"] = "checkpoint/baseline/9999"
+        for manifests in (duplicate_path, wrong_step):
+            with self.subTest(manifests=manifests), self.assertRaises(libero_report.ComparisonError):
+                libero_report.classify_phase_one_manifests(manifests)
+
+    def test_manifest_requires_real_revision_hashes_finite_timeouts_and_shared_deadlines(self):
+        valid = [_manifest(variant, step) for variant in ("baseline", "bsp") for step in _STEPS]
+        mutations = (
+            ("dataset_revision", "v2.1"),
+            ("code_sha", "code-sha"),
+            ("container_digest", "sha256:container"),
+            ("connection_timeout_s", 0.0),
+            ("inference_timeout_s", float("inf")),
+        )
+        for field, value in mutations:
+            manifests = copy.deepcopy(valid)
+            manifests[0][field] = value
+            with self.subTest(field=field), self.assertRaises(libero_report.ComparisonError):
+                libero_report.classify_phase_one_manifests(manifests)
+
+        mismatched = copy.deepcopy(valid)
+        mismatched[-1]["inference_timeout_s"] = 60.0
+        with self.assertRaises(libero_report.ComparisonError):
+            libero_report.classify_phase_one_manifests(mismatched)
 
     def test_strict_json_rejects_nan_and_truncated_input(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -325,28 +401,100 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
             with self.assertRaises(libero_report.ComparisonError):
                 libero_report.load_run(summary_run)
 
+    def test_episode_validation_rejects_noncanonical_or_internally_inconsistent_records(self):
+        manifest = _manifest("baseline", 10000)
+        valid = _episode("libero_spatial", 0, 0, True).to_dict()
+        libero_report._validate_episode(valid, manifest)
+
+        mutations = (
+            {"init_state_fingerprint": "not-a-sha"},
+            {"init_state_fingerprint": "A" * 64},
+            {"paired_key": "forged-pair"},
+            {"episode_id": "forged-episode"},
+            {"steps": 221},
+            {"attempts": 0},
+            {"attempts": 4},
+            {"replans": 29, "inference_ms": [1.0] * 29, "mean_inference_ms": 1.0},
+            {"status": "policy_failure"},
+            {"failure_kind": "policy"},
+            {"error": "unexpected"},
+            {"inference_ms": []},
+            {"mean_inference_ms": 2.0},
+        )
+        for mutation in mutations:
+            record = dict(valid)
+            record.update(mutation)
+            with self.subTest(mutation=mutation), self.assertRaises(libero_report.ComparisonError):
+                libero_report._validate_episode(record, manifest)
+
+        for missing in ("error", "mean_inference_ms"):
+            record = dict(valid)
+            record.pop(missing)
+            with self.subTest(missing=missing), self.assertRaises(libero_report.ComparisonError):
+                libero_report._validate_episode(record, manifest)
+
+        failure = _episode("libero_spatial", 0, 0, False).to_dict()
+        libero_report._validate_episode(failure, manifest)
+        for mutation in (
+            {"failure_kind": None},
+            {"failure_kind": "timeout"},
+            {"error": None},
+            {"status": "success"},
+        ):
+            record = dict(failure)
+            record.update(mutation)
+            with self.subTest(failure_mutation=mutation), self.assertRaises(libero_report.ComparisonError):
+                libero_report._validate_episode(record, manifest)
+
+    def test_episode_validation_accepts_real_retry_history_and_rejects_forged_history(self):
+        manifest = _manifest("baseline", 10000)
+        identity = _episode("libero_spatial", 0, 0, True).identity
+
+        def attempt(attempt_number):
+            if attempt_number == 1:
+                raise libero_eval.InfrastructureFailure("network", "socket timeout")
+            if attempt_number == 2:
+                raise libero_eval.InfrastructureFailure("simulator", "EGL reset")
+            return libero_eval.AttemptResult(
+                success=True,
+                steps=1,
+                replans=1,
+                inference_ms=(1.0,),
+            )
+
+        valid = libero_eval.run_episode_with_retries(
+            identity,
+            attempt,
+            eval_seed=42,
+            infrastructure_retries=2,
+        )
+        valid = valid.to_dict()
+        libero_report._validate_episode(valid, manifest)
+
+        histories = (
+            valid["infrastructure_history"][:1],
+            [
+                {"attempt": 2, "kind": "network", "error": "socket timeout"},
+                valid["infrastructure_history"][1],
+            ],
+            [
+                {"attempt": 1, "kind": "policy", "error": "wrong layer"},
+                valid["infrastructure_history"][1],
+            ],
+            [
+                {"attempt": 1, "kind": "network", "error": ""},
+                valid["infrastructure_history"][1],
+            ],
+        )
+        for history in histories:
+            record = dict(valid, infrastructure_history=history)
+            with self.subTest(history=history), self.assertRaises(libero_report.ComparisonError):
+                libero_report._validate_episode(record, manifest)
+
     def test_diagnostics_must_match_all_variant_artifact_identities(self):
         manifests = [_manifest(variant, step) for variant in ("baseline", "bsp") for step in _STEPS]
-        bsp = {
-            "verification_passed": True,
-            "strict_comparison": True,
-            "scipy_version": "1.15.3",
-            "episode_count": 1693,
-            "frame_count": 273465,
-            "strict_max_reconstruction_error": 0.001,
-            "mean_reconstruction_error": 0.0002,
-            "p95_reconstruction_error": 0.0008,
-            "max_error_threshold": 0.002,
-            "cache_sha256": _CACHE_SHA,
-            "cache_manifest_fingerprint": _CACHE_FINGERPRINT,
-        }
-        norm = {
-            "state_stats_equal": True,
-            "asset_directories_isolated": True,
-            "action_stats_isolated": True,
-            "baseline_norm_stats_sha256": _BASELINE_NORM,
-            "bsp_norm_stats_sha256": _BSP_NORM,
-        }
+        bsp = _bsp_diagnostics()
+        norm = _norm_diagnostics()
         libero_report.validate_diagnostics(manifests, bsp, norm)
         for payload, key, replacement in (
             (bsp, "cache_sha256", "f" * 64),
@@ -354,8 +502,19 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
             (bsp, "strict_max_reconstruction_error", 0.002),
             (bsp, "mean_reconstruction_error", -0.1),
             (bsp, "p95_reconstruction_error", 0.0015),
+            (bsp, "scipy_version_matches_required", False),
+            (bsp, "required_scipy_version", "1.14.1"),
+            (bsp, "code_sha", "4" * 40),
+            (bsp, "cache_contents_sha256", "not-a-sha"),
+            (bsp, "rebuilt_contents_sha256", "4" * 64),
             (norm, "state_stats_equal", False),
             (norm, "baseline_norm_stats_sha256", "f" * 64),
+            (norm, "state_fields", {"mean": {"equal": True}}),
+            (norm, "baseline_action_stats_sha256", "not-a-sha"),
+            (norm, "bsp_action_stats_sha256", _BASELINE_ACTION_SHA),
+            (norm, "bsp_asset_dir", "/experiments/assets/libero_baseline_h16"),
+            (norm, "rtol", 1e-6),
+            (norm, "atol", 1e-7),
         ):
             changed_bsp = copy.deepcopy(bsp)
             changed_norm = copy.deepcopy(norm)
@@ -363,6 +522,29 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
             target[key] = replacement
             with self.subTest(key=key), self.assertRaises(libero_report.ComparisonError):
                 libero_report.validate_diagnostics(manifests, changed_bsp, changed_norm)
+
+        for flag in _VERIFICATION_FLAGS:
+            changed = _bsp_diagnostics()
+            changed[flag] = False
+            with self.subTest(verification_flag=flag), self.assertRaises(libero_report.ComparisonError):
+                libero_report.validate_diagnostics(manifests, changed, norm)
+
+        for field in ("mean", "std", "q01", "q99"):
+            changed = _norm_diagnostics()
+            changed["state_fields"][field]["equal"] = False
+            with self.subTest(state_field=field), self.assertRaises(libero_report.ComparisonError):
+                libero_report.validate_diagnostics(manifests, bsp, changed)
+
+    def test_diagnostics_allow_mean_reconstruction_error_above_p95_under_the_strict_maximum(self):
+        manifests = [_manifest(variant, step) for variant in ("baseline", "bsp") for step in _STEPS]
+        bsp = _bsp_diagnostics()
+        bsp["mean_reconstruction_error"] = 0.0009
+        bsp["p95_reconstruction_error"] = 0.0008
+
+        result = libero_report.validate_diagnostics(manifests, bsp, _norm_diagnostics())
+
+        self.assertEqual(result["mean_reconstruction_error"], 0.0009)
+        self.assertEqual(result["p95_reconstruction_error"], 0.0008)
 
 
 if __name__ == "__main__":

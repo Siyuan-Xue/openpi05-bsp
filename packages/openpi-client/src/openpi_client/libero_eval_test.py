@@ -207,7 +207,7 @@ class LiberoEvaluationTest(unittest.TestCase):
 
     def test_manifest_preserves_all_audit_identities_and_bsp_parameters(self):
         manifest = libero_eval.EvaluationManifest(
-            code_sha="abc",
+            code_sha="a" * 40,
             dataset_revision="v2.0",
             config_name="pi05_libero_bsp_h16",
             checkpoint_step=10000,
@@ -215,7 +215,7 @@ class LiberoEvaluationTest(unittest.TestCase):
             bsp_cache_manifest_fingerprint="c" * 64,
             norm_hash="b" * 64,
             checkpoint="checkpoint/10000",
-            container_digest="sha256:container",
+            container_digest="sha256:" + "d" * 64,
             train_seed=42,
             eval_seed=7,
             policy_variant="bsp",
@@ -228,7 +228,7 @@ class LiberoEvaluationTest(unittest.TestCase):
         )
 
         payload = manifest.to_dict()
-        self.assertEqual(payload["code_sha"], "abc")
+        self.assertEqual(payload["code_sha"], "a" * 40)
         self.assertEqual(payload["config_name"], "pi05_libero_bsp_h16")
         self.assertEqual(payload["checkpoint_step"], 10000)
         self.assertEqual(payload["bsp_cache_hash"], "a" * 64)
@@ -242,12 +242,12 @@ class LiberoEvaluationTest(unittest.TestCase):
 
     def test_manifest_requires_cache_sha_and_fingerprint_together_only_for_bsp(self):
         shared = dict(
-            code_sha="abc",
+            code_sha="a" * 40,
             dataset_revision="v2.0",
             norm_hash="b" * 64,
             checkpoint="checkpoint/10000",
             checkpoint_step=10000,
-            container_digest="sha256:container",
+            container_digest="sha256:" + "d" * 64,
             train_seed=42,
             eval_seed=42,
             bsp_parameters=libero_eval.BSP_PARAMETERS,
@@ -274,6 +274,37 @@ class LiberoEvaluationTest(unittest.TestCase):
                     policy_protocol="bsp_decoded_h8",
                     expected_action_horizon=8,
                 )
+
+    def test_manifest_rejects_unverifiable_source_identities_or_nonfinite_timeouts(self):
+        manifest = libero_eval.EvaluationManifest(
+            code_sha="a" * 40,
+            dataset_revision="v2.0",
+            config_name="pi05_libero_baseline_h16",
+            checkpoint_step=10000,
+            bsp_cache_hash=None,
+            bsp_cache_manifest_fingerprint=None,
+            norm_hash="b" * 64,
+            checkpoint="checkpoint/baseline/10000",
+            container_digest="sha256:" + "d" * 64,
+            train_seed=42,
+            eval_seed=42,
+            policy_variant="baseline",
+            bsp_parameters=libero_eval.BSP_PARAMETERS,
+            policy_protocol="baseline_h16",
+            expected_action_horizon=16,
+            execution_horizon=8,
+        )
+        for field, value in (
+            ("code_sha", "abc"),
+            ("code_sha", 123),
+            ("dataset_revision", "v2.1"),
+            ("container_digest", "sha256:container"),
+            ("container_digest", 123),
+            ("connection_timeout_s", 0.0),
+            ("inference_timeout_s", float("inf")),
+        ):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                dataclasses.replace(manifest, **{field: value})
 
     def test_client_evaluation_module_parses_as_python_37(self):
         source = Path(libero_eval.__file__).read_text(encoding="utf-8")

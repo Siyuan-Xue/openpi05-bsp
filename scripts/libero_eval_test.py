@@ -69,8 +69,8 @@ def _args():
         checkpoint_step=10000,
         norm_hash="b" * 64,
         checkpoint="checkpoint/10000",
-        container_digest="sha256:container",
-        code_sha="abc",
+        container_digest="sha256:" + "d" * 64,
+        code_sha="a" * 40,
     )
 
 

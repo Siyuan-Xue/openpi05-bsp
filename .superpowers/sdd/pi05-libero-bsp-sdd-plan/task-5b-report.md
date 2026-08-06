@@ -69,3 +69,23 @@ Also passed:
 
 No environment was installed or synchronized, and no dataset, checkpoint,
 training, policy server, simulator, or container was run locally.
+
+## Independent-review hardening
+
+The independent Task 5B review identified identity and artifact fields that
+were present but not yet fully bound to one another. The follow-up now also:
+
+- requires six globally unique checkpoint strings after removing trailing
+  slashes and binds each terminal path component to its integer optimizer step;
+- validates all ten preparation verification flags, both SciPy-version gates,
+  code/cache/rebuilt-content identities, and the complete normalization-state,
+  action-hash, asset-directory, and tolerance contract;
+- accepts either ordering of reconstruction mean and p95 while requiring both
+  to be non-negative and at most the strict maximum below `0.002`;
+- reconstructs canonical episode IDs from a lowercase SHA256 simulator-state
+  fingerprint and audits step/replan/retry/status/error/timing consistency;
+- requires the real `v2.0` dataset identity, lowercase 40/64-character Git SHA,
+  Docker `sha256:` digest, and positive finite shared network deadlines.
+
+The expanded dependency-free suite contains 36 tests, including the complete
+12,000-rollout fixture and adversarial episode/manifest/diagnostics cases.

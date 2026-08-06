@@ -10,6 +10,7 @@ import json
 import math
 from pathlib import Path
 import random
+import re
 import statistics
 import tempfile
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -38,6 +39,19 @@ _MAX_STEPS_BY_SUITE = {
     "libero_goal": 300,
     "libero_10": 520,
 }
+_BSP_VERIFICATION_FLAGS = (
+    "strict_reconstruction_tolerance",
+    "ground_truth_knots_nondecreasing",
+    "tail_padding_valid",
+    "future_segment_mapping_valid",
+    "target_index_bounds_valid",
+    "no_cross_episode_mapping",
+    "all_frames_covered",
+    "targets_match_rebuild",
+    "mapping_matches_rebuild",
+    "cache_contents_deterministic",
+)
+_STATE_STAT_FIELDS = ("mean", "std", "q01", "q99")
 _IDENTITY_FIELDS = (
     "suite",
     "task_id",
@@ -57,6 +71,8 @@ _SHARED_MANIFEST_FIELDS = (
     "trials_per_task",
     "num_steps_wait",
     "max_steps_by_suite",
+    "connection_timeout_s",
+    "inference_timeout_s",
 )
 
 
@@ -178,6 +194,8 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> Tuple[str, int]:
         "trials_per_task",
         "num_steps_wait",
         "max_steps_by_suite",
+        "connection_timeout_s",
+        "inference_timeout_s",
         "infrastructure_retries",
     )
     _require_fields(manifest, required, label="evaluation manifest")
@@ -223,6 +241,17 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> Tuple[str, int]:
     for field in ("code_sha", "dataset_revision", "checkpoint", "container_digest"):
         if not isinstance(manifest[field], str) or not manifest[field]:
             raise ComparisonError("Evaluation manifest {} must be non-empty".format(field))
+    if manifest["dataset_revision"] != "v2.0":
+        raise ComparisonError("Phase-one evaluation requires dataset revision v2.0")
+    if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", manifest["code_sha"]) is None:
+        raise ComparisonError("Evaluation manifest code_sha must be lowercase 40- or 64-character hex")
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", manifest["container_digest"]) is None:
+        raise ComparisonError("Evaluation manifest container_digest must be sha256: followed by 64 lowercase hex")
+    for field in ("connection_timeout_s", "inference_timeout_s"):
+        _finite_number(manifest[field], label=field, nonnegative=True, strictly_positive=True)
+    normalized_checkpoint = manifest["checkpoint"].rstrip("/")
+    if not normalized_checkpoint or normalized_checkpoint.rsplit("/", 1)[-1] != str(step):
+        raise ComparisonError("Evaluation checkpoint terminal component must equal checkpoint_step")
     if not _is_sha256(manifest["norm_hash"]):
         raise ComparisonError("Evaluation manifest norm_hash must be a lowercase SHA256")
     if manifest["bsp_parameters"] != libero_eval.BSP_PARAMETERS:
@@ -256,6 +285,10 @@ def classify_phase_one_manifests(
         extra = sorted(set(classified).difference(expected))
         raise ComparisonError("Phase-one run set mismatch; missing={}, extra={}".format(missing, extra))
 
+    normalized_checkpoints = [manifest["checkpoint"].rstrip("/") for manifest in manifests]
+    if len(set(normalized_checkpoints)) != len(normalized_checkpoints):
+        raise ComparisonError("All six normalized checkpoint identities must be globally unique")
+
     reference = next(iter(classified.values()))
     for key, manifest in classified.items():
         mismatched = [field for field in _SHARED_MANIFEST_FIELDS if manifest[field] != reference[field]]
@@ -273,12 +306,19 @@ def classify_phase_one_manifests(
     return classified
 
 
-def _finite_number(value: Any, *, label: str, nonnegative: bool = False) -> float:
+def _finite_number(
+    value: Any, *, label: str, nonnegative: bool = False, strictly_positive: bool = False
+) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ComparisonError("{} must be numeric".format(label))
     number = float(value)
-    if not math.isfinite(number) or (nonnegative and number < 0.0):
-        raise ComparisonError("{} must be finite{}".format(label, " and non-negative" if nonnegative else ""))
+    if (
+        not math.isfinite(number)
+        or (nonnegative and number < 0.0)
+        or (strictly_positive and number <= 0.0)
+    ):
+        qualifier = " and positive" if strictly_positive else " and non-negative" if nonnegative else ""
+        raise ComparisonError("{} must be finite{}".format(label, qualifier))
     return number
 
 
@@ -298,9 +338,11 @@ def _validate_episode(record: Mapping[str, Any], manifest: Mapping[str, Any]) ->
         "attempts",
         "failure_kind",
         "infrastructure_kind",
+        "error",
         "steps",
         "replans",
         "inference_ms",
+        "mean_inference_ms",
         "infrastructure_history",
     )
     _require_fields(record, required, label="episode record")
@@ -313,17 +355,39 @@ def _validate_episode(record: Mapping[str, Any], manifest: Mapping[str, Any]) ->
     for field in ("episode_id", "paired_key", "task_name", "init_state_fingerprint"):
         if not isinstance(record[field], str) or not record[field]:
             raise ComparisonError("Episode {} must be non-empty".format(field))
+    if not _is_sha256(record["init_state_fingerprint"]):
+        raise ComparisonError("Episode init_state_fingerprint must be a lowercase SHA256")
+    try:
+        canonical_identity = libero_eval.EpisodeIdentity(
+            suite=record["suite"],
+            task_id=record["task_id"],
+            task_name=record["task_name"],
+            init_state_index=record["init_state_index"],
+            init_state_fingerprint=record["init_state_fingerprint"],
+        )
+    except (TypeError, ValueError) as error:
+        raise ComparisonError("Episode identity is malformed") from error
+    if record["paired_key"] != canonical_identity.paired_key:
+        raise ComparisonError("Episode paired_key is not canonical for its identity")
+    if record["episode_id"] != canonical_identity.episode_id:
+        raise ComparisonError("Episode episode_id is not canonical for its identity")
     if record["eval_seed"] != manifest["eval_seed"]:
         raise ComparisonError("Episode eval_seed does not match its manifest")
     if record["include_in_success_rate"] is not True:
         raise ComparisonError("Every phase-one episode must be eligible; infrastructure run is incomplete")
     if not isinstance(record["success"], bool):
         raise ComparisonError("Every phase-one episode success value must be boolean")
-    expected_status = "success" if record["success"] else None
-    if expected_status is not None and record["status"] != expected_status:
-        raise ComparisonError("Successful episode has an inconsistent status")
-    if not record["success"] and record["status"] not in ("policy_failure", "timeout_failure"):
-        raise ComparisonError("Failed episode must be a counted policy or timeout failure")
+    if record["success"]:
+        if record["status"] != "success" or record["failure_kind"] is not None or record["error"] is not None:
+            raise ComparisonError("Successful episode has inconsistent status/failure/error fields")
+    else:
+        failure_kind = record["failure_kind"]
+        if failure_kind not in ("policy", "timeout"):
+            raise ComparisonError("Failed episode must have policy or timeout failure_kind")
+        if record["status"] != "{}_failure".format(failure_kind):
+            raise ComparisonError("Failed episode status does not match failure_kind")
+        if not isinstance(record["error"], str) or not record["error"].strip():
+            raise ComparisonError("Failed episode must record a non-empty error")
     if record["infrastructure_kind"] is not None:
         raise ComparisonError("Eligible episode cannot retain an infrastructure failure kind")
     for field in ("attempts", "steps", "replans"):
@@ -331,13 +395,43 @@ def _validate_episode(record: Mapping[str, Any], manifest: Mapping[str, Any]) ->
         minimum = 1 if field == "attempts" else 0
         if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
             raise ComparisonError("Episode {} must be an integer >= {}".format(field, minimum))
+    if record["attempts"] > 3:
+        raise ComparisonError("Episode attempts cannot exceed the three-attempt retry protocol")
+    max_steps = _MAX_STEPS_BY_SUITE[record["suite"]]
+    if record["steps"] > max_steps:
+        raise ComparisonError("Episode steps exceed the suite maximum")
+    if record["replans"] > math.ceil(max_steps / 8):
+        raise ComparisonError("Episode replans exceed the suite maximum at an eight-step horizon")
     timings = record["inference_ms"]
     if not isinstance(timings, list):
         raise ComparisonError("Episode inference_ms must be a list")
-    for timing in timings:
-        _finite_number(timing, label="inference_ms", nonnegative=True)
-    if not isinstance(record["infrastructure_history"], list):
+    finite_timings = [_finite_number(timing, label="inference_ms", nonnegative=True) for timing in timings]
+    if len(finite_timings) != record["replans"]:
+        raise ComparisonError("Episode inference_ms length must equal replans")
+    if finite_timings:
+        recorded_mean = _finite_number(
+            record["mean_inference_ms"], label="mean_inference_ms", nonnegative=True
+        )
+        expected_mean = sum(finite_timings) / len(finite_timings)
+        if not math.isclose(recorded_mean, expected_mean, rel_tol=1e-12, abs_tol=1e-12):
+            raise ComparisonError("Episode mean_inference_ms is inconsistent with inference_ms")
+    elif record["mean_inference_ms"] is not None:
+        raise ComparisonError("Episode mean_inference_ms must be null when inference_ms is empty")
+    history = record["infrastructure_history"]
+    if not isinstance(history, list):
         raise ComparisonError("Episode infrastructure_history must be a list")
+    if len(history) != record["attempts"] - 1:
+        raise ComparisonError("Episode infrastructure_history length must equal attempts - 1")
+    for expected_attempt, entry in enumerate(history, start=1):
+        if not isinstance(entry, dict):
+            raise ComparisonError("Episode infrastructure history entries must be objects")
+        _require_fields(entry, ("attempt", "kind", "error"), label="infrastructure history entry")
+        if entry["attempt"] != expected_attempt:
+            raise ComparisonError("Episode infrastructure history attempts must be consecutive")
+        if entry["kind"] not in ("simulator", "container", "network"):
+            raise ComparisonError("Episode infrastructure history has an invalid kind")
+        if not isinstance(entry["error"], str) or not entry["error"].strip():
+            raise ComparisonError("Episode infrastructure history error must be non-empty")
 
 
 def _derive_summary(records: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
@@ -629,9 +723,12 @@ def validate_diagnostics(
     """Validate Task-6 cache and normalization gates against all six manifests."""
     classified = classify_phase_one_manifests(manifests)
     required_bsp = (
+        *_BSP_VERIFICATION_FLAGS,
         "verification_passed",
         "strict_comparison",
         "scipy_version",
+        "required_scipy_version",
+        "scipy_version_matches_required",
         "episode_count",
         "frame_count",
         "strict_max_reconstruction_error",
@@ -640,11 +737,21 @@ def validate_diagnostics(
         "max_error_threshold",
         "cache_sha256",
         "cache_manifest_fingerprint",
+        "cache_contents_sha256",
+        "rebuilt_contents_sha256",
+        "code_sha",
     )
     _require_fields(bsp_diagnostics, required_bsp, label="BSP verification diagnostics")
     if bsp_diagnostics["verification_passed"] is not True or bsp_diagnostics["strict_comparison"] is not True:
         raise ComparisonError("BSP verification and strict-comparison gates must pass")
-    if bsp_diagnostics["scipy_version"] != "1.15.3":
+    failed_flags = [flag for flag in _BSP_VERIFICATION_FLAGS if bsp_diagnostics[flag] is not True]
+    if failed_flags:
+        raise ComparisonError("BSP verification flags did not pass: {}".format(failed_flags))
+    if (
+        bsp_diagnostics["scipy_version"] != "1.15.3"
+        or bsp_diagnostics["required_scipy_version"] != "1.15.3"
+        or bsp_diagnostics["scipy_version_matches_required"] is not True
+    ):
         raise ComparisonError("BSP cache must be verified with SciPy 1.15.3")
     if bsp_diagnostics["episode_count"] != 1693 or bsp_diagnostics["frame_count"] != 273465:
         raise ComparisonError("BSP verification metadata must be exactly 1,693 episodes / 273,465 frames")
@@ -662,8 +769,14 @@ def validate_diagnostics(
     threshold = _finite_number(
         bsp_diagnostics["max_error_threshold"], label="max error threshold", nonnegative=True
     )
-    if threshold != 0.002 or not maximum < 0.002 or not mean <= p95 <= maximum:
+    if threshold != 0.002 or not maximum < 0.002 or mean > maximum or p95 > maximum:
         raise ComparisonError("BSP reconstruction requires the strict maximum error < 0.002")
+    contents_sha = bsp_diagnostics["cache_contents_sha256"]
+    rebuilt_sha = bsp_diagnostics["rebuilt_contents_sha256"]
+    if not _is_sha256(contents_sha) or not _is_sha256(rebuilt_sha) or contents_sha != rebuilt_sha:
+        raise ComparisonError("BSP cache and rebuilt canonical content SHA256 values must match")
+    if any(bsp_diagnostics["code_sha"] != manifest["code_sha"] for manifest in classified.values()):
+        raise ComparisonError("BSP diagnostics code SHA does not match all evaluation manifests")
     for step in MILESTONES:
         manifest = classified[("bsp", step)]
         if bsp_diagnostics["cache_sha256"] != manifest["bsp_cache_hash"]:
@@ -677,11 +790,45 @@ def validate_diagnostics(
         "action_stats_isolated",
         "baseline_norm_stats_sha256",
         "bsp_norm_stats_sha256",
+        "baseline_action_stats_sha256",
+        "bsp_action_stats_sha256",
+        "baseline_asset_dir",
+        "bsp_asset_dir",
+        "state_fields",
+        "rtol",
+        "atol",
     )
     _require_fields(norm_diagnostics, required_norm, label="normalization diagnostics")
     for flag in ("state_stats_equal", "asset_directories_isolated", "action_stats_isolated"):
         if norm_diagnostics[flag] is not True:
             raise ComparisonError("Normalization gate {} must be true".format(flag))
+    state_fields = norm_diagnostics["state_fields"]
+    if not isinstance(state_fields, dict) or set(state_fields) != set(_STATE_STAT_FIELDS):
+        raise ComparisonError("Normalization state_fields must be exactly mean/std/q01/q99")
+    for field in _STATE_STAT_FIELDS:
+        result = state_fields[field]
+        if not isinstance(result, dict) or result.get("equal") is not True:
+            raise ComparisonError("Normalization state field {} must be equal".format(field))
+    baseline_action_sha = norm_diagnostics["baseline_action_stats_sha256"]
+    bsp_action_sha = norm_diagnostics["bsp_action_stats_sha256"]
+    if (
+        not _is_sha256(baseline_action_sha)
+        or not _is_sha256(bsp_action_sha)
+        or baseline_action_sha == bsp_action_sha
+    ):
+        raise ComparisonError("Baseline/BSP action-stat SHA256 values must be valid and distinct")
+    baseline_asset_dir = norm_diagnostics["baseline_asset_dir"]
+    bsp_asset_dir = norm_diagnostics["bsp_asset_dir"]
+    if (
+        not isinstance(baseline_asset_dir, str)
+        or not baseline_asset_dir.strip()
+        or not isinstance(bsp_asset_dir, str)
+        or not bsp_asset_dir.strip()
+        or Path(baseline_asset_dir) == Path(bsp_asset_dir)
+    ):
+        raise ComparisonError("Baseline/BSP normalization asset directories must be non-empty and distinct")
+    if norm_diagnostics["rtol"] != 1e-7 or norm_diagnostics["atol"] != 1e-8:
+        raise ComparisonError("Normalization comparison must use rtol=1e-7 and atol=1e-8")
     for step in MILESTONES:
         if norm_diagnostics["baseline_norm_stats_sha256"] != classified[("baseline", step)]["norm_hash"]:
             raise ComparisonError("Baseline norm file SHA256 does not match evaluation manifests")
