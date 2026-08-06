@@ -90,18 +90,11 @@ export CLIENT_ARGS="\
 docker compose -f examples/libero/compose.yml up
 ```
 
-If EGL fails after the NVIDIA/EGL installation has been checked, GLX/X11 is a
-troubleshooting fallback only. It requires a host X server and an explicit
-one-off socket mount; these are deliberately absent from the normal Compose
-configuration:
-
-```bash
-sudo xhost +local:docker
-docker compose -f examples/libero/compose.yml up -d openpi_server
-docker compose -f examples/libero/compose.yml run --rm \
-  -e DISPLAY="$DISPLAY" -e MUJOCO_GL=glx -e PYOPENGL_PLATFORM=glx \
-  -v /tmp/.X11-unix:/tmp/.X11-unix:ro runtime
-```
+For the phase-one BSP comparison, do not fall back to GLX/X11, change host X
+server access controls, or auto-remove evaluation containers. If the EGL or
+nested-Docker gate fails, stop and follow the isolated-environment route in the
+[authoritative server runbook](../../docs/pi05_libero_bsp_phase1_server.md),
+which preserves the audit artifacts and stops if host EGL libraries are absent.
 
 ## Without Docker (not recommended)
 
@@ -119,8 +112,8 @@ export PYTHONPATH=$PYTHONPATH:$PWD/third_party/libero
 # Export the same auditable CLIENT_ARGS shown above, then run the simulation.
 python examples/libero/main.py $CLIENT_ARGS
 
-# To run with glx for Mujoco instead (use this if you have egl errors):
-MUJOCO_GL=glx python examples/libero/main.py
+# For the phase-one protocol, use the isolated EGL route from the server
+# runbook. Stop and report the inventory if the host EGL gate fails.
 ```
 
 Terminal window 2:
