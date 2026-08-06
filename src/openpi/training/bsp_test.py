@@ -3,6 +3,7 @@
 import dataclasses
 
 import numpy as np
+from openpi_client import libero_eval
 import pytest
 
 import openpi.training.bsp as bsp
@@ -34,6 +35,12 @@ def test_settings_are_fixed_to_the_libero_bsp_protocol():
     assert settings.stride == 1
     with pytest.raises(dataclasses.FrozenInstanceError):
         settings.degree = 2
+
+    shared_manifest_parameters = dict(libero_eval.BSP_PARAMETERS)
+    shared_manifest_parameters.pop("control_rows")
+    shared_manifest_parameters.pop("layout")
+    shared_manifest_parameters.pop("decode_interval")
+    assert shared_manifest_parameters == dataclasses.asdict(settings)
 
 
 def test_episode_targets_keep_controls_first_and_use_twelve_controls():

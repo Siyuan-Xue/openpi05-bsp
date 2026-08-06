@@ -5,6 +5,7 @@ import numpy as np
 
 from openpi import transforms
 from openpi.models import model as _model
+from openpi.training import bsp as _bsp
 
 
 def make_libero_example() -> dict:
@@ -98,3 +99,26 @@ class LiberoOutputs(transforms.DataTransformFn):
         # For Libero, we only return the first 7 actions (since the rest is padding).
         # For your own dataset, replace `7` with the action dimension of your dataset.
         return {"actions": np.asarray(data["actions"][..., :7])}
+
+
+@dataclasses.dataclass(frozen=True)
+class BspLiberoOutputs(transforms.DataTransformFn):
+    """Decode unnormalized BSP parameters into eight native LIBERO actions.
+
+    Policy construction places data transforms after quantile unnormalization.
+    The model's remaining padded channels are deliberately discarded here;
+    channels 0:7 are controls and channel 7 is the knot vector.
+    """
+
+    def __call__(self, data: dict) -> dict:
+        actions = np.asarray(data["actions"])
+        settings = _bsp.BspSettings()
+        if actions.ndim != 2 or actions.shape[0] != settings.target_rows or actions.shape[1] < settings.target_channels:
+            raise ValueError(
+                "BSP policy output must have shape "
+                f"({settings.target_rows}, at least {settings.target_channels}), got {actions.shape}"
+            )
+        if not np.isfinite(actions).all():
+            raise ValueError("BSP policy output contains non-finite parameters")
+        parameters = actions[:, : settings.target_channels]
+        return {"actions": _bsp.decode_actions(parameters, settings)}

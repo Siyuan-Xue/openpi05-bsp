@@ -4,6 +4,7 @@ import jax
 import pytest
 
 from openpi.models import pi0_config
+from openpi.policies import libero_policy
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
 
@@ -113,6 +114,11 @@ def test_libero_h16_configs_keep_baseline_and_bsp_assets_separate():
     assert bsp.data.lerobot_revision == "v2.1"
     assert baseline.data.bsp_cache_path is None
     assert bsp.data.use_bsp is True
+
+    baseline_data = baseline.data.create(baseline.assets_dirs, baseline.model)
+    bsp_data = bsp.data.create(bsp.assets_dirs, bsp.model)
+    assert isinstance(baseline_data.data_transforms.outputs[0], libero_policy.LiberoOutputs)
+    assert isinstance(bsp_data.data_transforms.outputs[0], libero_policy.BspLiberoOutputs)
 
 
 def test_libero_h16_configs_use_the_same_jax_full_finetuning_recipe():

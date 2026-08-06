@@ -330,9 +330,10 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # We defined these transforms in `libero_policy.py`. You can check the detailed comments there for
         # how to modify the transforms to match your dataset. Once you created your own transforms, you can
         # replace the transforms below with your own.
+        output_transform = libero_policy.BspLiberoOutputs() if self.use_bsp else libero_policy.LiberoOutputs()
         data_transforms = _transforms.Group(
             inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
-            outputs=[libero_policy.LiberoOutputs()],
+            outputs=[output_transform],
         )
 
         # One additional data transform: pi0 models are trained on delta actions (relative to the first

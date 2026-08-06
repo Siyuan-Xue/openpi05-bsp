@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from openpi_client import base_policy as _base_policy
+from openpi_client import inference as _inference
 import torch
 from typing_extensions import override
 
@@ -19,6 +20,16 @@ from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
 
 BasePolicy: TypeAlias = _base_policy.BasePolicy
+
+
+def _select_jax_inference_rng(
+    stateful_rng: at.KeyArrayLike, inference_seed: int | None
+) -> tuple[at.KeyArrayLike, at.KeyArrayLike]:
+    """Select sampling RNG without advancing state for an explicit request seed."""
+    if inference_seed is not None:
+        return stateful_rng, jax.random.key(inference_seed)
+    next_rng, sample_rng = jax.random.split(stateful_rng)
+    return next_rng, sample_rng
 
 
 class Policy(BasePolicy):
@@ -66,13 +77,16 @@ class Policy(BasePolicy):
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
-        # Make a copy since transformations may modify the inputs in place.
-        inputs = jax.tree.map(lambda x: x, obs)
+        # The seed belongs to the request envelope, not the model observation.
+        # pop_inference_seed copies the top-level mapping so the caller is not mutated.
+        inputs, inference_seed = _inference.pop_inference_seed(obs)
+        # Make a tree copy since transformations may modify the inputs in place.
+        inputs = jax.tree.map(lambda x: x, inputs)
         inputs = self._input_transform(inputs)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
-            self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
+            self._rng, sample_rng_or_pytorch_device = _select_jax_inference_rng(self._rng, inference_seed)
         else:
             # Convert inputs to PyTorch tensors and move to correct device
             inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
