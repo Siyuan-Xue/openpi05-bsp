@@ -23,6 +23,7 @@ import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.training.optimizer as _optimizer
+import openpi.training.runtime_paths as runtime_paths
 import openpi.training.sharding as sharding
 import openpi.training.train_planning as train_planning
 import openpi.training.utils as training_utils
@@ -240,7 +241,7 @@ def main(config: _config.TrainConfig):
         accumulation_plan.accumulation_steps,
     )
 
-    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
+    jax.config.update("jax_compilation_cache_dir", runtime_paths.jax_compilation_cache_dir())
 
     rng = jax.random.key(config.seed)
     train_rng, init_rng = jax.random.split(rng)

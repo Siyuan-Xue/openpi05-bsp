@@ -13,12 +13,10 @@ services:
     network_mode: host
     privileged: true
     volumes:
-      - $PWD:/app
-      - ../../data:/data
-      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+      - ${BSP_REPO_DIR:?BSP_REPO_DIR must be an absolute path}:/app
+      - ${BSP_EXPERIMENTS_DIR:?BSP_EXPERIMENTS_DIR must be an absolute path}:/experiments
     environment:
       - CLIENT_ARGS
-      - DISPLAY=$DISPLAY
       - MUJOCO_GL=${MUJOCO_GL:-egl}
       - MUJOCO_EGL_DEVICE_ID=0
       - NVIDIA_DRIVER_CAPABILITIES=all
@@ -40,11 +38,14 @@ services:
     tty: true
     network_mode: host
     volumes:
-      - $PWD:/app
-      - ${OPENPI_DATA_HOME:-~/.cache/openpi}:/openpi_assets
+      - ${BSP_REPO_DIR:?BSP_REPO_DIR must be an absolute path}:/app
+      - ${BSP_EXPERIMENTS_DIR:?BSP_EXPERIMENTS_DIR must be an absolute path}:/experiments:ro
+      - ${BSP_OPENPI_CACHE_DIR:?BSP_OPENPI_CACHE_DIR must be an absolute path}:/openpi_assets
+      - ${BSP_JAX_CACHE_DIR:?BSP_JAX_CACHE_DIR must be an absolute path}:/jax_cache
     environment:
       - SERVER_ARGS
       - OPENPI_DATA_HOME=/openpi_assets
+      - JAX_COMPILATION_CACHE_DIR=/jax_cache
       - IS_DOCKER=true
 
     # Comment out this block if not running on a machine with GPUs.

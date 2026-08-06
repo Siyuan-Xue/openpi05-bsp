@@ -4,34 +4,55 @@ This example runs the LIBERO benchmark: https://github.com/Lifelong-Robot-Learni
 
 Note: When updating requirements.txt in this directory, there is an additional flag `--extra-index-url https://download.pytorch.org/whl/cu113` that must be added to the `uv pip compile` command.
 
-This example requires git submodules to be initialized. Don't forget to run:
+This example requires only the LIBERO submodule for this benchmark:
 
 ```bash
-git submodule update --init --recursive
+git submodule update --init --recursive third_party/libero
 ```
 
 ## With Docker (recommended)
 
+The default Compose path is headless EGL and does not require an X server or
+`xhost`. Compose intentionally has no working-directory or home-directory
+mount fallback: set every source below to an existing **absolute** host path.
+Unset variables fail during Compose interpolation before either container is
+started.
+
 ```bash
-# Grant access to the X11 server:
-sudo xhost +local:docker
+export BSP_REPO_DIR=/mnt/workspace/openpi-bsp/repo/openpi05-bsp
+export BSP_EXPERIMENTS_DIR=/mnt/workspace/openpi-bsp/experiments
+export BSP_OPENPI_CACHE_DIR=/mnt/workspace/openpi-bsp/cache/openpi
+export BSP_JAX_CACHE_DIR=/mnt/workspace/openpi-bsp/cache/jax
 
-# To run with the default checkpoint and task suite:
-SERVER_ARGS="--env LIBERO" docker compose -f examples/libero/compose.yml up --build
+export SERVER_ARGS="--env LIBERO"
+export CLIENT_ARGS="--output-dir /experiments/eval/libero-smoke"
 
-# To run with glx for Mujoco instead (use this if you have egl errors):
-MUJOCO_GL=glx SERVER_ARGS="--env LIBERO" docker compose -f examples/libero/compose.yml up --build
+docker compose -f examples/libero/compose.yml config >/dev/null
+docker compose -f examples/libero/compose.yml up --build
 ```
 
 You can customize the loaded checkpoint by providing additional `SERVER_ARGS` (see `scripts/serve_policy.py`), and the LIBERO task suite by providing additional `CLIENT_ARGS` (see `examples/libero/main.py`).
 For example:
 
 ```bash
-# To load a custom checkpoint (located in the top-level openpi/ directory):
-export SERVER_ARGS="--env LIBERO policy:checkpoint --policy.config pi05_libero --policy.dir ./my_custom_checkpoint"
+# Checkpoints and evaluation artifacts live outside the repository checkout.
+export SERVER_ARGS="--env LIBERO policy:checkpoint --policy.config pi05_libero_baseline_h16 --policy.dir /experiments/checkpoints/pi05_libero_baseline_h16/run/30000"
 
 # To run the libero_10 task suite:
-export CLIENT_ARGS="--args.task-suite-name libero_10"
+export CLIENT_ARGS="--task-suite-name libero_10 --output-dir /experiments/eval/baseline-30k-libero-10"
+```
+
+If EGL fails after the NVIDIA/EGL installation has been checked, GLX/X11 is a
+troubleshooting fallback only. It requires a host X server and an explicit
+one-off socket mount; these are deliberately absent from the normal Compose
+configuration:
+
+```bash
+sudo xhost +local:docker
+docker compose -f examples/libero/compose.yml up -d openpi_server
+docker compose -f examples/libero/compose.yml run --rm \
+  -e DISPLAY="$DISPLAY" -e MUJOCO_GL=glx -e PYOPENGL_PLATFORM=glx \
+  -v /tmp/.X11-unix:/tmp/.X11-unix:ro runtime
 ```
 
 ## Without Docker (not recommended)
