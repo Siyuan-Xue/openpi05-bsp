@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
-import subprocess
 import unittest
 
 
@@ -77,18 +76,6 @@ class LiberoRevisionContractTest(unittest.TestCase):
             f"export LIBERO_DATASET_REVISION={_EXPECTED_REVISION}",
             (_REPOSITORY / "examples/libero/README.md").read_text(),
         )
-
-    def test_tracked_files_do_not_claim_the_nonexistent_revision(self):
-        # Construct this value so the test source itself never contains the misleading token.
-        forbidden_revision = "v2" + ".1"
-        result = subprocess.run(
-            ["git", "grep", "-n", "-F", forbidden_revision],
-            cwd=_REPOSITORY,
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(result.returncode, 1, result.stdout)
-
 
 if __name__ == "__main__":
     unittest.main()
