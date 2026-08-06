@@ -164,13 +164,15 @@ def create_torch_dataset(
     if data_config.use_bsp:
         if len(data_config.action_sequence_keys) != 1:
             raise ValueError("BSP training requires exactly one LeRobot action sequence key")
+        action_key = data_config.action_sequence_keys[0]
         expected_manifest = make_lerobot_cache_manifest(
             dataset,
             repo_id=repo_id,
             revision=data_config.lerobot_revision,
+            action_key=action_key,
         )
         cache = load_sidecar_cache(data_config.bsp_cache_path, expected_manifest)
-        dataset = BspLeRobotDataset(dataset, cache, action_key=data_config.action_sequence_keys[0])
+        dataset = BspLeRobotDataset(dataset, cache, action_key=action_key)
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])

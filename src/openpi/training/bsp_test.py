@@ -1,6 +1,7 @@
 """Focused contract tests for the BSP training primitives."""
 
 import dataclasses
+import json
 
 import numpy as np
 from openpi_client import libero_eval
@@ -37,10 +38,56 @@ def test_settings_are_fixed_to_the_libero_bsp_protocol():
         settings.degree = 2
 
     shared_manifest_parameters = dict(libero_eval.BSP_PARAMETERS)
-    shared_manifest_parameters.pop("control_rows")
-    shared_manifest_parameters.pop("layout")
-    shared_manifest_parameters.pop("decode_interval")
-    assert shared_manifest_parameters == dataclasses.asdict(settings)
+    assert {
+        key: shared_manifest_parameters[key] for key in dataclasses.asdict(settings)
+    } == dataclasses.asdict(settings)
+    assert shared_manifest_parameters["projection_epsilon"] == 1e-6
+    assert shared_manifest_parameters["model_action_dim"] == 32
+    assert shared_manifest_parameters["model_action_horizon"] == 16
+    assert shared_manifest_parameters["control_rows"] == 12
+    assert shared_manifest_parameters["control_selection"] == "first_12_rows"
+    assert shared_manifest_parameters["executed_actions"] == 8
+    assert shared_manifest_parameters["materialized_knot_origin"] == "current_episode_local_frame"
+
+
+def test_cache_protocol_and_evaluation_manifest_share_fixed_knot_semantics():
+    """Different names or values across training and evaluation make an audit manifest ambiguous."""
+    protocol = json.loads(make_cache_manifest({"dataset": "tiny"}).protocol)
+    shared_keys = (
+        "time_axis",
+        "cached_knot_origin",
+        "materialized_knot_origin",
+        "channel_layout",
+        "projection_epsilon",
+    )
+
+    assert {key: libero_eval.BSP_PARAMETERS[key] for key in shared_keys} == {
+        key: protocol[key] for key in shared_keys
+    }
+
+
+def test_fit_requires_error_strictly_below_the_threshold(monkeypatch):
+    """Accepting a candidate exactly at 0.002 diverges from the published author implementation."""
+    import scipy.interpolate
+
+    actions = np.zeros((4, 7), dtype=np.float64)
+    candidates = [np.asarray([1.0]), np.asarray([2.0])]
+
+    class FakeSpline:
+        def __init__(self, candidate):
+            self._candidate = candidate
+            self.tck = (candidate, np.zeros((1, 7), dtype=np.float64), 3)
+
+        def __call__(self, _frames):
+            error = 0.002 if self._candidate[0] == 1.0 else 0.001
+            return actions + error
+
+    monkeypatch.setattr(scipy.interpolate, "generate_knots", lambda *_args, **_kwargs: iter(candidates))
+    monkeypatch.setattr(scipy.interpolate, "make_lsq_spline", lambda _x, _y, knots, **_kwargs: FakeSpline(knots))
+
+    selected_knots, *_ = bsp._fit_full_episode(actions, BspSettings())
+
+    np.testing.assert_array_equal(selected_knots, candidates[1])
 
 
 def test_episode_targets_keep_controls_first_and_use_twelve_controls():

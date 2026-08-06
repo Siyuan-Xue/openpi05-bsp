@@ -41,8 +41,16 @@ BSP_PARAMETERS = {
     "relative_knots": False,
     "decoded_actions": 8,
     "control_rows": 12,
-    "layout": "controls[0:7],knot[7]",
+    "control_selection": "first_12_rows",
+    "channel_layout": "controls[0:7],knot[7]",
+    "time_axis": "episode_local_frame_index",
+    "cached_knot_origin": "episode_start",
+    "materialized_knot_origin": "current_episode_local_frame",
     "decode_interval": "[knots[3],knots[-4]]",
+    "projection_epsilon": 1e-6,
+    "model_action_dim": 32,
+    "model_action_horizon": 16,
+    "executed_actions": 8,
 }
 
 

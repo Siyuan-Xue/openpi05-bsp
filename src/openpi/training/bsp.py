@@ -45,8 +45,12 @@ from typing import Mapping
 import numpy as np
 
 
-_CACHE_FORMAT_VERSION = 1
+_CACHE_FORMAT_VERSION = 2
 _KNOT_PROJECTION_EPSILON = 1e-6
+_TIME_AXIS = "episode_local_frame_index"
+_CACHED_KNOT_ORIGIN = "episode_start"
+_MATERIALIZED_KNOT_ORIGIN = "current_episode_local_frame"
+_CHANNEL_LAYOUT = "controls[0:7],knot[7]"
 
 
 class BspCacheValidationError(ValueError):
@@ -102,6 +106,15 @@ class BspEpisode:
 
     targets: np.ndarray
     mapping: np.ndarray
+
+
+@dataclasses.dataclass(frozen=True)
+class BspFitArtifacts:
+    """Full-episode fit details retained only by explicit preparation verification."""
+
+    full_knots: np.ndarray
+    controls: np.ndarray
+    absolute_errors: np.ndarray
 
 
 @dataclasses.dataclass(frozen=True)
@@ -163,7 +176,15 @@ def make_cache_manifest(source: Mapping[str, Any], settings: BspSettings | None 
         source_json = json.dumps(source, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     except (TypeError, ValueError) as error:
         raise ValueError("BSP cache source must be JSON serializable") from error
-    protocol_json = json.dumps(dataclasses.asdict(settings), sort_keys=True, separators=(",", ":"))
+    protocol = {
+        **dataclasses.asdict(settings),
+        "time_axis": _TIME_AXIS,
+        "cached_knot_origin": _CACHED_KNOT_ORIGIN,
+        "materialized_knot_origin": _MATERIALIZED_KNOT_ORIGIN,
+        "channel_layout": _CHANNEL_LAYOUT,
+        "projection_epsilon": _KNOT_PROJECTION_EPSILON,
+    }
+    protocol_json = json.dumps(protocol, sort_keys=True, separators=(",", ":"))
     fingerprint = _fingerprint_manifest(source_json, protocol_json)
     return BspCacheManifest(fingerprint=fingerprint, source=source_json, protocol=protocol_json)
 
@@ -221,7 +242,9 @@ def _validate_episode_actions(actions: np.ndarray, settings: BspSettings) -> np.
     return array
 
 
-def _fit_full_episode(actions: np.ndarray, settings: BspSettings) -> tuple[np.ndarray, np.ndarray]:
+def _fit_full_episode(
+    actions: np.ndarray, settings: BspSettings
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Fit the entire episode with FITPACK's adaptive knot generator."""
     # Import lazily so static tooling can inspect this module without SciPy installed.
     from scipy.interpolate import generate_knots
@@ -234,9 +257,13 @@ def _fit_full_episode(actions: np.ndarray, settings: BspSettings) -> tuple[np.nd
         reconstruction = spline(frame_indices)
         error = float(np.max(np.abs(reconstruction - actions)))
         last_error = error
-        if error <= settings.max_abs_error:
+        if error < settings.max_abs_error:
             full_knots, controls, _ = spline.tck
-            return np.asarray(full_knots, dtype=np.float64), np.asarray(controls, dtype=np.float64)
+            return (
+                np.asarray(full_knots, dtype=np.float64),
+                np.asarray(controls, dtype=np.float64),
+                np.abs(np.asarray(reconstruction, dtype=np.float64) - actions),
+            )
     if last_error is None:
         raise ValueError("FITPACK did not produce a candidate BSP knot vector")
     raise ValueError(
@@ -245,8 +272,10 @@ def _fit_full_episode(actions: np.ndarray, settings: BspSettings) -> tuple[np.nd
     )
 
 
-def build_episode_targets(actions: np.ndarray, settings: BspSettings | None = None) -> BspEpisode:
-    """Fit one complete episode and emit compact controls-first BSP targets.
+def build_episode_targets_with_artifacts(
+    actions: np.ndarray, settings: BspSettings | None = None
+) -> tuple[BspEpisode, BspFitArtifacts]:
+    """Fit one complete episode and retain artifacts for explicit verification.
 
     Each target has shape ``[16, 8]``: channels ``0:7`` are controls and
     channel ``7`` is the frame-index knot vector.  All 16 rows are retained
@@ -254,7 +283,7 @@ def build_episode_targets(actions: np.ndarray, settings: BspSettings | None = No
     """
     settings = settings or BspSettings()
     episode_actions = _validate_episode_actions(actions, settings)
-    full_knots, controls = _fit_full_episode(episode_actions, settings)
+    full_knots, controls, absolute_errors = _fit_full_episode(episode_actions, settings)
     unique_knots = full_knots[settings.degree : -settings.degree]
     if unique_knots.size < 2:
         raise ValueError("FITPACK produced too few unique BSP knots for chunking")
@@ -276,7 +305,20 @@ def build_episode_targets(actions: np.ndarray, settings: BspSettings | None = No
 
     target_array = np.stack(targets, axis=0)
     mapping = map_timesteps_to_future_segments(episode_actions.shape[0], np.asarray(starts))
-    return BspEpisode(targets=target_array, mapping=mapping)
+    return (
+        BspEpisode(targets=target_array, mapping=mapping),
+        BspFitArtifacts(
+            full_knots=full_knots,
+            controls=controls,
+            absolute_errors=absolute_errors,
+        ),
+    )
+
+
+def build_episode_targets(actions: np.ndarray, settings: BspSettings | None = None) -> BspEpisode:
+    """Fit one complete episode and emit compact controls-first BSP targets."""
+    episode, _ = build_episode_targets_with_artifacts(actions, settings)
+    return episode
 
 
 def decode_actions(target: np.ndarray, settings: BspSettings | None = None) -> np.ndarray:

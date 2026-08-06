@@ -1,10 +1,13 @@
 import dataclasses
+import types
 
 import jax
+import numpy as np
 import pytest
 
 from openpi.models import pi0_config
 from openpi.policies import libero_policy
+from openpi.training.bsp import BspCache
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
 
@@ -148,3 +151,62 @@ def test_bsp_training_refuses_to_create_a_dataset_without_an_explicit_sidecar(tm
 
     with pytest.raises(ValueError, match="explicit precomputed cache path"):
         _data_loader.create_torch_dataset(data_config, config.model.action_horizon, config.model)
+
+
+def test_bsp_training_reconstructs_manifest_with_the_exact_configured_action_key(monkeypatch):
+    """Preparation and training must not fingerprint different action columns for one sidecar."""
+    captured = {}
+
+    class DatasetMetadata:
+        fps = 10
+        tasks = {0: "task"}
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    class LeRobotDataset:
+        episode_data_index = {"from": np.asarray([0]), "to": np.asarray([1])}
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, _index):
+            return {"custom_actions": np.zeros((16, 7), dtype=np.float32)}
+
+    def make_manifest(_dataset, *, repo_id, revision, action_key):
+        captured.update(repo_id=repo_id, revision=revision, action_key=action_key)
+        return "expected-manifest"
+
+    cache = BspCache(
+        targets=np.zeros((1, 16, 8), dtype=np.float32),
+        mapping=np.zeros(1, dtype=np.uint32),
+    )
+    monkeypatch.setattr(_data_loader.lerobot_dataset, "LeRobotDatasetMetadata", DatasetMetadata)
+    monkeypatch.setattr(_data_loader.lerobot_dataset, "LeRobotDataset", LeRobotDataset)
+    monkeypatch.setattr(_data_loader, "make_lerobot_cache_manifest", make_manifest)
+    monkeypatch.setattr(
+        _data_loader,
+        "load_sidecar_cache",
+        lambda path, manifest: cache if (path, manifest) == ("/cache/bsp.npz", "expected-manifest") else None,
+    )
+    data_config = types.SimpleNamespace(
+        repo_id="example/libero",
+        use_bsp=True,
+        bsp_cache_path="/cache/bsp.npz",
+        lerobot_root="/data/libero",
+        lerobot_revision="v2.1",
+        action_sequence_keys=("custom_actions",),
+        prompt_from_task=False,
+    )
+
+    dataset = _data_loader.create_torch_dataset(data_config, action_horizon=16, model_config=object())
+
+    assert isinstance(dataset, _data_loader.BspLeRobotDataset)
+    assert captured == {
+        "repo_id": "example/libero",
+        "revision": "v2.1",
+        "action_key": "custom_actions",
+    }
