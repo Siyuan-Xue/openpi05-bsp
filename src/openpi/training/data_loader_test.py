@@ -1,6 +1,7 @@
 import dataclasses
 
 import jax
+import pytest
 
 from openpi.models import pi0_config
 from openpi.training import config as _config
@@ -82,3 +83,27 @@ def test_with_real_dataset():
 
     for _, actions in batches:
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
+
+
+def test_libero_h16_configs_keep_baseline_and_bsp_assets_separate():
+    """Sharing action stats would normalize raw actions and BSP parameters with incompatible distributions."""
+    baseline = _config.get_config("pi05_libero_baseline_h16")
+    bsp = _config.get_config("pi05_libero_bsp_h16")
+
+    assert baseline.model.action_horizon == 16
+    assert bsp.model.action_horizon == 16
+    assert baseline.data.assets.asset_id == "libero_baseline_h16"
+    assert bsp.data.assets.asset_id == "libero_bsp_h16"
+    assert baseline.data.lerobot_revision == "v2.1"
+    assert bsp.data.lerobot_revision == "v2.1"
+    assert baseline.data.bsp_cache_path is None
+    assert bsp.data.use_bsp is True
+
+
+def test_bsp_training_refuses_to_create_a_dataset_without_an_explicit_sidecar(tmp_path):
+    """Falling back to worker-time fitting would make training nondeterministic and prohibitively slow."""
+    config = _config.get_config("pi05_libero_bsp_h16")
+    data_config = config.data.create(tmp_path, config.model)
+
+    with pytest.raises(ValueError, match="explicit precomputed cache path"):
+        _data_loader.create_torch_dataset(data_config, config.model.action_horizon, config.model)

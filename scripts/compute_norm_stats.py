@@ -5,6 +5,9 @@ will compute the mean and standard deviation of the data in the dataset and save
 to the config assets directory.
 """
 
+import dataclasses
+from pathlib import Path
+
 import numpy as np
 import tqdm
 import tyro
@@ -19,6 +22,13 @@ import openpi.transforms as transforms
 class RemoveStrings(transforms.DataTransformFn):
     def __call__(self, x: dict) -> dict:
         return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
+
+
+def norm_stats_output_path(assets_dir: Path, *, asset_id: str | None) -> Path:
+    """Select the same asset namespace that DataConfigFactory loads during training."""
+    if asset_id is None:
+        raise ValueError("Data config must have an asset_id before normalization stats can be written")
+    return assets_dir / asset_id
 
 
 def create_torch_dataloader(
@@ -86,9 +96,30 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
+def main(
+    config_name: str,
+    max_frames: int | None = None,
+    *,
+    assets_dir: Path | None = None,
+    bsp_cache_path: Path | None = None,
+    dataset_root: Path | None = None,
+):
     config = _config.get_config(config_name)
-    data_config = config.data.create(config.assets_dirs, config.model)
+    data_factory = config.data
+    overrides = {}
+    if bsp_cache_path is not None:
+        if not hasattr(data_factory, "bsp_cache_path"):
+            raise ValueError(f"Config {config_name!r} does not support a BSP cache path")
+        overrides["bsp_cache_path"] = str(bsp_cache_path.expanduser().resolve())
+    if dataset_root is not None:
+        if not hasattr(data_factory, "lerobot_root"):
+            raise ValueError(f"Config {config_name!r} does not support a LeRobot dataset root")
+        overrides["lerobot_root"] = str(dataset_root.expanduser().resolve())
+    if overrides:
+        data_factory = dataclasses.replace(data_factory, **overrides)
+
+    persistent_assets_dir = (assets_dir or config.assets_dirs).expanduser().resolve()
+    data_config = data_factory.create(persistent_assets_dir, config.model)
 
     if data_config.rlds_data_dir is not None:
         data_loader, num_batches = create_rlds_dataloader(
@@ -108,7 +139,9 @@ def main(config_name: str, max_frames: int | None = None):
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
+    # Model transforms are intentionally absent above: BSP stats therefore see compact [16, 8]
+    # targets, while baseline stats see raw [16, 7] actions, before either representation is padded.
+    output_path = norm_stats_output_path(persistent_assets_dir, asset_id=data_config.asset_id)
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 

@@ -90,6 +90,14 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # Optional persistent LeRobot location and Hub revision. If unset, LeRobot keeps its standard behavior.
+    lerobot_root: str | None = None
+    lerobot_revision: str | None = None
+
+    # BSP sidecars are opt-in and must be prepared explicitly before loading training data.
+    use_bsp: bool = False
+    bsp_cache_path: str | None = None
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -287,6 +295,10 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
     """
 
     extra_delta_transform: bool = False
+    lerobot_root: str | None = None
+    lerobot_revision: str | None = None
+    use_bsp: bool = False
+    bsp_cache_path: str | None = None
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -352,6 +364,10 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            lerobot_root=self.lerobot_root,
+            lerobot_revision=self.lerobot_revision,
+            use_bsp=self.use_bsp,
+            bsp_cache_path=self.bsp_cache_path,
         )
 
 
@@ -747,6 +763,55 @@ _CONFIGS = [
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_libero_baseline_h16",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=16, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(asset_id="libero_baseline_h16"),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            lerobot_revision="v2.1",
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_libero_bsp_h16",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=16, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(asset_id="libero_bsp_h16"),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            lerobot_revision="v2.1",
+            use_bsp=True,
+            # Deliberately unset: training must receive an explicitly prepared persistent sidecar path.
+            bsp_cache_path=None,
         ),
         batch_size=256,
         lr_schedule=_optimizer.CosineDecaySchedule(

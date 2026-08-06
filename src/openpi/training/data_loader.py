@@ -12,6 +12,9 @@ import numpy as np
 import torch
 
 import openpi.models.model as _model
+from openpi.training.bsp import load_sidecar_cache
+from openpi.training.bsp_dataset import BspLeRobotDataset
+from openpi.training.bsp_dataset import make_lerobot_cache_manifest
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
@@ -137,13 +140,37 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    if data_config.use_bsp and data_config.bsp_cache_path is None:
+        raise ValueError(
+            "BSP training requires an explicit precomputed cache path. "
+            "Run scripts/prepare_libero_bsp.py in build mode, then set bsp_cache_path."
+        )
+
+    lerobot_kwargs = {}
+    if data_config.lerobot_root is not None:
+        lerobot_kwargs["root"] = data_config.lerobot_root
+    if data_config.lerobot_revision is not None:
+        lerobot_kwargs["revision"] = data_config.lerobot_revision
+
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, **lerobot_kwargs)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        **lerobot_kwargs,
     )
+
+    if data_config.use_bsp:
+        if len(data_config.action_sequence_keys) != 1:
+            raise ValueError("BSP training requires exactly one LeRobot action sequence key")
+        expected_manifest = make_lerobot_cache_manifest(
+            dataset,
+            repo_id=repo_id,
+            revision=data_config.lerobot_revision,
+        )
+        cache = load_sidecar_cache(data_config.bsp_cache_path, expected_manifest)
+        dataset = BspLeRobotDataset(dataset, cache, action_key=data_config.action_sequence_keys[0])
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
