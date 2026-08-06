@@ -13,8 +13,18 @@ services:
     network_mode: host
     privileged: true
     volumes:
-      - ${BSP_REPO_DIR:?BSP_REPO_DIR must be an absolute path}:/app
-      - ${BSP_EXPERIMENTS_DIR:?BSP_EXPERIMENTS_DIR must be an absolute path}:/experiments
+      - type: bind
+        source: ${BSP_REPO_DIR:?BSP_REPO_DIR must be an absolute path}
+        target: /app
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${BSP_EXPERIMENTS_DIR:?BSP_EXPERIMENTS_DIR must be an absolute path}
+        target: /experiments
+        read_only: false
+        bind:
+          create_host_path: false
     environment:
       - CLIENT_ARGS
       - MUJOCO_GL=${MUJOCO_GL:-egl}
@@ -38,10 +48,30 @@ services:
     tty: true
     network_mode: host
     volumes:
-      - ${BSP_REPO_DIR:?BSP_REPO_DIR must be an absolute path}:/app
-      - ${BSP_EXPERIMENTS_DIR:?BSP_EXPERIMENTS_DIR must be an absolute path}:/experiments:ro
-      - ${BSP_OPENPI_CACHE_DIR:?BSP_OPENPI_CACHE_DIR must be an absolute path}:/openpi_assets
-      - ${BSP_JAX_CACHE_DIR:?BSP_JAX_CACHE_DIR must be an absolute path}:/jax_cache
+      - type: bind
+        source: ${BSP_REPO_DIR:?BSP_REPO_DIR must be an absolute path}
+        target: /app
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${BSP_EXPERIMENTS_DIR:?BSP_EXPERIMENTS_DIR must be an absolute path}
+        target: /experiments
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${BSP_OPENPI_CACHE_DIR:?BSP_OPENPI_CACHE_DIR must be an absolute path}
+        target: /openpi_assets
+        read_only: false
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${BSP_JAX_CACHE_DIR:?BSP_JAX_CACHE_DIR must be an absolute path}
+        target: /jax_cache
+        read_only: false
+        bind:
+          create_host_path: false
     environment:
       - SERVER_ARGS
       - OPENPI_DATA_HOME=/openpi_assets

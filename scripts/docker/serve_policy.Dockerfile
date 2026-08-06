@@ -21,6 +21,7 @@ ENV UV_LINK_MODE=copy
 # Write the virtual environment outside of the project directory so it doesn't
 # leak out of the container when we mount the application code.
 ENV UV_PROJECT_ENVIRONMENT=/.venv
+ENV PYTHONPATH=/app/src:/app/packages/openpi-client/src
 
 # Install the project's dependencies using the lockfile and settings
 RUN uv venv --python 3.11.9 $UV_PROJECT_ENVIRONMENT
@@ -35,4 +36,4 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY src/openpi/models_pytorch/transformers_replace/ /tmp/transformers_replace/
 RUN /.venv/bin/python -c "import transformers; print(transformers.__file__)" | xargs dirname | xargs -I{} cp -r /tmp/transformers_replace/* {} && rm -rf /tmp/transformers_replace
 
-CMD /bin/bash -c "uv run --frozen --no-dev scripts/serve_policy.py $SERVER_ARGS"
+CMD /bin/bash -c "exec /.venv/bin/python scripts/serve_policy.py $SERVER_ARGS"
