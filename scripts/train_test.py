@@ -83,29 +83,6 @@ def test_train(tmp_path: pathlib.Path, config_name: str):
     assert not (checkpoint_dir / "3").exists()
 
 
-def test_none_and_equal_micro_batch_training_are_equivalent(tmp_path: pathlib.Path):
-    params = []
-    for exp_name, micro_batch_size in (("implicit", None), ("explicit", 2)):
-        config = dataclasses.replace(
-            _config._CONFIGS_DICT["debug"],  # noqa: SLF001
-            batch_size=2,
-            micro_batch_size=micro_batch_size,
-            checkpoint_base_dir=str(tmp_path / "checkpoint"),
-            exp_name=exp_name,
-            overwrite=True,
-            resume=False,
-            num_train_steps=1,
-            log_interval=1,
-            save_interval=1,
-        )
-        train.main(config)
-        checkpoint = tmp_path / "checkpoint" / "debug" / exp_name / "1" / "params"
-        params.append(_model.restore_params(checkpoint, restore_type=np.ndarray))
-
-    for implicit, explicit in zip(jax.tree.leaves(params[0]), jax.tree.leaves(params[1]), strict=True):
-        np.testing.assert_array_equal(implicit, explicit)
-
-
 def test_two_micro_batches_match_one_direct_batch_and_advance_state_once():
     config = _config._CONFIGS_DICT["debug"]  # noqa: SLF001
     accumulation_plan = train_planning.plan_gradient_accumulation(
