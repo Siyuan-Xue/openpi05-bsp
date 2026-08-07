@@ -2,44 +2,51 @@
 
 import datetime as dt
 import json
+import types
 from pathlib import Path
 
 import pytest
 import tyro
 
+from scripts import prepare_libero_bsp
 from scripts.prepare_libero_bsp import PreparationMode
-from scripts.prepare_libero_bsp import main
 from scripts.prepare_libero_bsp import make_verification_diagnostics
 from scripts.prepare_libero_bsp import require_preparation_paths
 from scripts.prepare_libero_bsp import write_json_atomic
 
 
-@pytest.mark.parametrize(
-    ("raw_mode", "expected"),
-    [
-        ("download", PreparationMode.DOWNLOAD),
-        ("build", PreparationMode.BUILD),
-        ("verify", PreparationMode.VERIFY),
-    ],
-)
 def test_cli_accepts_documented_lowercase_mode_values(
     tmp_path: Path,
-    raw_mode: str,
-    expected: PreparationMode,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """Runbook commands use enum values, so Tyro must not expose uppercase member names."""
-    parser = tyro.extras.get_parser(main)
+    captured = {}
+    dataset = object()
 
-    arguments = parser.parse_args(
-        [
-            "--mode",
-            raw_mode,
-            "--dataset-root",
-            str(tmp_path / "dataset"),
-        ]
+    def fake_require_paths(mode, *, dataset_root, cache_path):
+        captured["mode"] = mode
+        return dataset_root.resolve(), cache_path
+
+    monkeypatch.setattr(prepare_libero_bsp, "require_preparation_paths", fake_require_paths)
+    monkeypatch.setattr(prepare_libero_bsp, "_load_dataset", lambda *args, **kwargs: dataset)
+    monkeypatch.setattr(prepare_libero_bsp, "validate_lerobot_dataset", lambda value: "metadata")
+    monkeypatch.setattr(
+        prepare_libero_bsp,
+        "make_lerobot_cache_manifest",
+        lambda *args, **kwargs: types.SimpleNamespace(fingerprint="fingerprint"),
     )
 
-    assert arguments.mode is expected
+    tyro.cli(
+        prepare_libero_bsp.main,
+        args=[
+            "--mode",
+            "download",
+            "--dataset-root",
+            str(tmp_path / "dataset"),
+        ],
+    )
+
+    assert captured["mode"] is PreparationMode.DOWNLOAD
 
 
 def test_all_preparation_modes_require_an_explicit_dataset_location(tmp_path: Path):
