@@ -172,7 +172,7 @@ def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def main(
-    mode: PreparationMode,
+    mode: tyro.conf.EnumChoicesFromValues[PreparationMode],
     *,
     dataset_root: Path | None = None,
     cache_path: Path | None = None,

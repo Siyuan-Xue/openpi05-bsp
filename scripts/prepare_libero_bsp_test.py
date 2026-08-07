@@ -5,11 +5,41 @@ import json
 from pathlib import Path
 
 import pytest
+import tyro
 
 from scripts.prepare_libero_bsp import PreparationMode
+from scripts.prepare_libero_bsp import main
 from scripts.prepare_libero_bsp import make_verification_diagnostics
 from scripts.prepare_libero_bsp import require_preparation_paths
 from scripts.prepare_libero_bsp import write_json_atomic
+
+
+@pytest.mark.parametrize(
+    ("raw_mode", "expected"),
+    [
+        ("download", PreparationMode.DOWNLOAD),
+        ("build", PreparationMode.BUILD),
+        ("verify", PreparationMode.VERIFY),
+    ],
+)
+def test_cli_accepts_documented_lowercase_mode_values(
+    tmp_path: Path,
+    raw_mode: str,
+    expected: PreparationMode,
+):
+    """Runbook commands use enum values, so Tyro must not expose uppercase member names."""
+    parser = tyro.extras.get_parser(main)
+
+    arguments = parser.parse_args(
+        [
+            "--mode",
+            raw_mode,
+            "--dataset-root",
+            str(tmp_path / "dataset"),
+        ]
+    )
+
+    assert arguments.mode is expected
 
 
 def test_all_preparation_modes_require_an_explicit_dataset_location(tmp_path: Path):
