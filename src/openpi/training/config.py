@@ -576,6 +576,17 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
+# Shared immutable model config keeps the LoRA freeze filter exactly aligned with both phase-one variants.
+_PI05_LIBERO_LORA_H16_MODEL = pi0_config.Pi0Config(
+    pi05=True,
+    action_dim=32,
+    action_horizon=16,
+    discrete_state_input=False,
+    paligemma_variant="gemma_2b_lora",
+    action_expert_variant="gemma_300m_lora",
+)
+
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
@@ -831,6 +842,63 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        save_interval=1_000,
+        keep_period=10_000,
+    ),
+    TrainConfig(
+        name="pi05_libero_baseline_lora_h16",
+        model=_PI05_LIBERO_LORA_H16_MODEL,
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(asset_id="libero_baseline_h16"),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            lerobot_revision="v2.0",
+        ),
+        seed=42,
+        batch_size=256,
+        micro_batch_size=1,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=_PI05_LIBERO_LORA_H16_MODEL.get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        save_interval=1_000,
+        keep_period=10_000,
+    ),
+    TrainConfig(
+        name="pi05_libero_bsp_lora_h16",
+        model=_PI05_LIBERO_LORA_H16_MODEL,
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(asset_id="libero_bsp_h16"),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            lerobot_revision="v2.0",
+            use_bsp=True,
+            # Deliberately unset: training must receive an explicitly prepared persistent sidecar path.
+            bsp_cache_path=None,
+        ),
+        seed=42,
+        batch_size=256,
+        micro_batch_size=1,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=_PI05_LIBERO_LORA_H16_MODEL.get_freeze_filter(),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
         save_interval=1_000,

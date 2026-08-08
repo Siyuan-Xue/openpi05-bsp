@@ -769,7 +769,7 @@ python3 -m pip config list
 
 - 第一阶段固定 seed 42、有效 batch 256、30,000 optimizer steps 和同一 `pi05_base` 初始化。
 - micro-batch 只用于梯度累积，不得改变有效 batch。
-- baseline 或 BSP 在 micro-batch 1 仍无法完成一个 optimizer step 时必须停止并报告；禁止自动改 LoRA 或降低有效 batch。
+- 全量 baseline 或 BSP 在共同 micro-batch 2 的持续训练门禁仍失败时，必须停止全量路线并报告；只允许切换到仓库中独立注册、经过合同测试的官方 JAX LoRA 配置，禁止临时改模型或降低有效 batch。
 - 当前 pilot 经用户明确选择使用 `ema_decay=None`；正式报告必须标明它与原计划 EMA 协议
   不同，不能把“可运行”解释成“效果等价”。
 - 禁止挑选“最好 checkpoint”；固定评测 10k、20k、30k。
@@ -780,18 +780,21 @@ python3 -m pip config list
 仿真、官方 checkpoint 校准、sidecar、verification 和两套 norm stats 已完成。当前唯一
 阻止进入正式训练的直接技术门禁是：全量微调在单张 H20 上无法连续稳定运行既定协议。
 
-下一轮应严格按以下顺序进行：
+下一轮已经由用户批准，必须严格按以下顺序进行：
 
-1. 保留现有失败日志和路径，不重试同名实验、不删除 checkpoint；先定位为何无 EMA、
-   micro-batch 8 能完成 Step 1，却在下一次 `pmicrobatch_grad` 申请约 3.70 GiB 时 OOM。
-2. 由用户明确选择后再验证候选方案。若继续全量微调，应从更小的共同 micro-batch
-   做至少 10-step 稳定性门禁，而不是把单步成功当作可训练证据；有效 batch 仍固定 256。
-3. baseline 与 BSP 的同参数 10-step 都通过后，才顺序运行两组 100-step pilot；两组
-   不得并行，且每组都必须检查有限 metrics、最终 checkpoint、Orbax 临时目录和磁盘余量。
-4. 只有 100-step 双组稳定后，才准备 30k 正式训练，并在 manifest 中明确记录
-   `ema_decay=None`。这是用户为当前硬件选择的实验协议，不能误写成原计划的 EMA 协议。
-5. 正式训练前仍需解决 checkpoint 持久性：`/root` 具备本地性能但未证明跨 DSW 重建
-   持久，`/mnt/data` 的 `ossfs2` 又未证明满足 Orbax POSIX 语义。
+1. 保留现有失败日志和路径，不重试同名实验、不删除 checkpoint。全量路线依次运行
+   baseline/BSP 的 micro-batch 4、10-step 和 100-step 门禁；四项全部通过就选择 4，
+   不再为了寻找更小数值而运行 2。
+2. 任一 micro-batch 4 阶段失败时，baseline/BSP 都从同一 `pi05_base` 重新按完整
+   10/100-step 序列验证 micro-batch 2，不能只补跑失败的一组。有效 batch 始终为 256。
+3. micro-batch 2 仍失败时，全量路线判为当前 H20 硬件阻塞，正式候选切换为独立的
+   `pi05_libero_baseline_lora_h16` 和 `pi05_libero_bsp_lora_h16`。LoRA 候选从 64 开始，
+   按 64/32/16/8/4/2/1 递减并选择 A/B 共同稳定的最大值。
+4. baseline 与 BSP 不得并行；每项都必须检查有限 metrics、目标 checkpoint、Orbax
+   临时目录、GPU 释放和磁盘余量。单步成功不能替代 10/100-step 稳定性门禁。
+5. 任一路线的两组 100-step pilot 通过后暂停，不自动启动 30k。正式训练前先复核
+   checkpoint 容量和持久性：`/root` 未证明跨 DSW 重建持久，`ossfs2` 也未证明满足
+   Orbax POSIX 语义。
 
 自动监控 `0-5-libero-pilot` 已因 mb8 OOM 暂停；在用户批准新的显存方案前不得自动恢复。
 
@@ -908,3 +911,20 @@ python3 -m pip config list
 - 自动化只允许串行启动一项 GPU 作业；每阶段要求无 GPU compute process、路径无碰撞、
   `/root` 至少 80 GiB 可用，并在异常时暂停。
 - 本轮文档整理只修改本地仓库中的本 Markdown，不对服务器执行命令，也不提交或推送。
+
+## 15. 2026-08-09 LoRA 扩展决策
+
+1. 现有 `pi05_libero_baseline_h16` 和 `pi05_libero_bsp_h16` 保持不变；LoRA 不是覆盖或
+   隐式降级，而是两个独立配置：`pi05_libero_baseline_lora_h16` 和
+   `pi05_libero_bsp_lora_h16`。
+2. 两个 LoRA 配置均使用 OpenPI 官方 JAX LoRA 变体：PaliGemma `gemma_2b_lora`、action
+   expert `gemma_300m_lora`，并使用与该模型配置严格匹配的 `get_freeze_filter()`。
+3. LoRA 仍沿用第一阶段的 π0.5、horizon 16、action dim 32、LIBERO v2.0、seed 42、
+   effective batch 256、阶段一学习率/AdamW、30k 和固定 checkpoint 周期。它只改变
+   可训练参数集合。
+4. `ema_decay=None` 与 OpenPI 官方 LoRA 示例一致，不把全量模型 EMA 副本重新引入显存。
+   全量路线当前也由用户选择无 EMA，但两条路线仍必须在 manifest 中分别标注训练配置。
+5. LoRA 不改变数据分布或 BSP 表示，因此复用已经验收的 baseline/BSP norm stats；在
+   新配置的 assets 目录中原子复制后，目标 SHA-256 必须与来源完全一致，不重新扫描数据。
+6. LoRA 代码无论全量路线是否成功都会进入仓库；只有全量 micro-batch 2 的持续训练门禁
+   失败时才启动 LoRA GPU pilot。任一路线通过 A/B 100-step 后都暂停，等待正式训练复核。

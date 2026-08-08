@@ -144,6 +144,49 @@ def test_libero_h16_configs_use_the_same_jax_full_finetuning_recipe():
         assert config.ema_decay == 0.999
 
 
+def test_libero_h16_lora_configs_preserve_the_phase_one_recipe():
+    """LoRA changes trainability, not the A/B data protocol or optimizer-step semantics."""
+    pairs = (
+        ("pi05_libero_baseline_lora_h16", "pi05_libero_baseline_h16"),
+        ("pi05_libero_bsp_lora_h16", "pi05_libero_bsp_h16"),
+    )
+
+    for lora_name, full_name in pairs:
+        lora_config = _config.get_config(lora_name)
+        full_config = _config.get_config(full_name)
+
+        assert lora_config.model.pi05 is True
+        assert lora_config.model.action_dim == 32
+        assert lora_config.model.action_horizon == 16
+        assert lora_config.model.discrete_state_input is False
+        assert lora_config.model.paligemma_variant == "gemma_2b_lora"
+        assert lora_config.model.action_expert_variant == "gemma_300m_lora"
+        assert lora_config.freeze_filter == lora_config.model.get_freeze_filter()
+        assert lora_config.ema_decay is None
+
+        for field in (
+            "seed",
+            "batch_size",
+            "micro_batch_size",
+            "num_train_steps",
+            "save_interval",
+            "keep_period",
+        ):
+            assert getattr(lora_config, field) == getattr(full_config, field)
+        assert lora_config.weight_loader == full_config.weight_loader
+        assert lora_config.lr_schedule == full_config.lr_schedule
+        assert lora_config.optimizer == full_config.optimizer
+
+        assert lora_config.data.assets.asset_id == full_config.data.assets.asset_id
+        assert lora_config.data.lerobot_revision == full_config.data.lerobot_revision == "v2.0"
+        assert lora_config.data.use_bsp == full_config.data.use_bsp
+        assert lora_config.data.bsp_cache_path is None
+
+        lora_data = lora_config.data.create(lora_config.assets_dirs, lora_config.model)
+        full_data = full_config.data.create(full_config.assets_dirs, full_config.model)
+        assert type(lora_data.data_transforms.outputs[0]) is type(full_data.data_transforms.outputs[0])
+
+
 def test_bsp_training_refuses_to_create_a_dataset_without_an_explicit_sidecar(tmp_path):
     """Falling back to worker-time fitting would make training nondeterministic and prohibitively slow."""
     config = _config.get_config("pi05_libero_bsp_h16")

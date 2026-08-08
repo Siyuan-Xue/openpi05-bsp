@@ -9,6 +9,12 @@ import unittest
 
 _REPOSITORY = Path(__file__).resolve().parents[1]
 _EXPECTED_REVISION = "v2.0"
+_PHASE_ONE_CONFIG_NAMES = {
+    "pi05_libero_baseline_h16",
+    "pi05_libero_bsp_h16",
+    "pi05_libero_baseline_lora_h16",
+    "pi05_libero_bsp_lora_h16",
+}
 
 
 def _module_assignment(path: Path, name: str):
@@ -45,7 +51,7 @@ def _phase_one_config_revisions(path: Path) -> dict[str, str]:
         if "name" not in keywords or "data" not in keywords:
             continue
         name = ast.literal_eval(keywords["name"])
-        if name not in {"pi05_libero_baseline_h16", "pi05_libero_bsp_h16"}:
+        if name not in _PHASE_ONE_CONFIG_NAMES:
             continue
         data_call = keywords["data"]
         if not isinstance(data_call, ast.Call):
@@ -66,6 +72,8 @@ class LiberoRevisionContractTest(unittest.TestCase):
             {
                 "pi05_libero_baseline_h16": _EXPECTED_REVISION,
                 "pi05_libero_bsp_h16": _EXPECTED_REVISION,
+                "pi05_libero_baseline_lora_h16": _EXPECTED_REVISION,
+                "pi05_libero_bsp_lora_h16": _EXPECTED_REVISION,
             },
         )
         self.assertEqual(
