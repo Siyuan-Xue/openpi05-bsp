@@ -99,7 +99,6 @@ class PhaseOneServerRunbookContractTest(unittest.TestCase):
             "micro-batch-size",
             "num-train-steps",
             "save-interval",
-            "keep-period",
             "assets-base-dir",
             "checkpoint-base-dir",
             "resume",
@@ -183,7 +182,9 @@ class PhaseOneServerRunbookContractTest(unittest.TestCase):
             "--args.num-trials-per-task 50",
             '--bsp-verification "$BSP_VERIFY"',
             '--norm-comparison "$NORM_COMPARISON"',
-            "12,000 episodes",
+            "20,000 episodes",
+            "permanent_checkpoint_steps",
+            "0k/5k/10k/20k/30k",
             "10,000 次",
             "seed 43/44",
             "modified_libero_rlds",
@@ -192,6 +193,19 @@ class PhaseOneServerRunbookContractTest(unittest.TestCase):
         for fragment in required_fragments:
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, self.runbook)
+
+        for variant in ("baseline", "bsp"):
+            for step in (0, 5000, 10000, 20000, 30000):
+                with self.subTest(variant=variant, step=step):
+                    self.assertIn(f'"$EVAL_BASE/{variant}-step-{step}"', self.runbook)
+
+        comparison_command = re.search(
+            r'"\$OPENPI_PY" scripts/compare_libero_phase1\.py \\\n(.*?)\n\s*--bsp-verification',
+            self.runbook,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(comparison_command)
+        self.assertEqual(comparison_command.group(1).count('"$EVAL_BASE/'), 10)
 
         for artifact in (
             "task_comparison.csv",

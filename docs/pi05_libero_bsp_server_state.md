@@ -412,8 +412,8 @@ baseline/BSP action stats 摘要不同。审计归档
 
 - 可连续运行的 baseline/BSP 100-step pilot；当前全量微调即使无 EMA、micro-batch 8
   仍在第二个 optimizer step OOM。
-- 两组 30k 正式训练和 10k/20k/30k 六个固定 checkpoint。
-- 六个 checkpoint 的四套件 × 50 rollouts（合计 12,000 回合）及 bootstrap 统计报告。
+- 两组 30k 正式训练和 0k/5k/10k/20k/30k 十个固定 checkpoint。
+- 十个 checkpoint 的四套件 × 50 rollouts（合计 20,000 回合）及 bootstrap 统计报告。
 - 正式 checkpoint 的可靠持久化方案；`/root` 仍未证明跨 DSW 重建持久，直接写
   `ossfs2` 的 Orbax 语义也未验证。
 
@@ -772,7 +772,7 @@ python3 -m pip config list
 - 全量 baseline 或 BSP 在共同 micro-batch 2 的持续训练门禁仍失败时，必须停止全量路线并报告；只允许切换到仓库中独立注册、经过合同测试的官方 JAX LoRA 配置，禁止临时改模型或降低有效 batch。
 - 当前 pilot 经用户明确选择使用 `ema_decay=None`；正式报告必须标明它与原计划 EMA 协议
   不同，不能把“可运行”解释成“效果等价”。
-- 禁止挑选“最好 checkpoint”；固定评测 10k、20k、30k。
+- 禁止挑选“最好 checkpoint”；固定评测 0k、5k、10k、20k、30k。
 - 禁止在第一阶段增加额外 reconstruction、smoothness、monotonicity loss 或 2×/4× 加速。
 
 ## 12. 当前下一步
@@ -928,3 +928,22 @@ python3 -m pip config list
    新配置的 assets 目录中原子复制后，目标 SHA-256 必须与来源完全一致，不重新扫描数据。
 6. LoRA 代码无论全量路线是否成功都会进入仓库；只有全量 micro-batch 2 的持续训练门禁
    失败时才启动 LoRA GPU pilot。任一路线通过 A/B 100-step 后都暂停，等待正式训练复核。
+
+## 16. 2026-08-09 固定验收扩展：0k 与 5k
+
+用户已确认将第一阶段固定里程碑从 `10k/20k/30k` 扩展为
+`0k/5k/10k/20k/30k`。本节记录协议决定和代码能力，不把尚未发生的服务器产物写成已完成：
+
+1. `0k` 的严格含义是对应 Baseline 或 BSP 配置已经从同一个 `pi05_base` 加载权重，但
+   optimizer update 次数仍为 0；它不是官方 `pi05_libero` checkpoint。
+2. 全量和 LoRA 四个第一阶段配置均声明
+   `permanent_checkpoint_steps=(0, 5000, 10000, 20000, 30000)`；每 1,000 step 的恢复保存与
+   `keep_period=10000` 保持不变，但永久保留集合不会额外包含 15k/25k。
+3. step 0 必须走正常 Orbax 保存路径，包含 `params/`、`train_state/` 和对应配置的 norm
+   assets；只有 `0/` 时执行 `--resume` 必须从 step 0 恢复，并从 step 1 继续。
+4. 固定比较现在要求同一训练家族的十个 run：Baseline/BSP 各五个里程碑。每个 run 仍为
+   2,000 episodes，因此完整验收为 20,000 episodes；全量与 LoRA run 禁止混入同一报告。
+5. 报告仍只生成六种审计文件，但学习曲线固定显示五个点，不选择 best checkpoint。
+6. 截至写入本节时，上述改动仍需完成整套测试、合并到 `main`、推送并由服务器
+   `pull --ff-only` 后才会生效；服务器上尚未产生正式 0k/5k checkpoint，也未开始正式
+   30k 训练。
