@@ -83,6 +83,46 @@ def test_train(tmp_path: pathlib.Path, config_name: str):
     assert not (checkpoint_dir / "3").exists()
 
 
+def _step_zero_config(tmp_path: pathlib.Path, *, exp_name: str) -> _config.TrainConfig:
+    return dataclasses.replace(
+        _config._CONFIGS_DICT["debug"],  # noqa: SLF001
+        batch_size=2,
+        micro_batch_size=1,
+        checkpoint_base_dir=str(tmp_path / "checkpoint"),
+        exp_name=exp_name,
+        overwrite=False,
+        resume=False,
+        num_train_steps=0,
+        log_interval=1,
+        save_interval=2,
+        keep_period=None,
+        permanent_checkpoint_steps=(0,),
+        wandb_enabled=False,
+    )
+
+
+def test_train_saves_step_zero_before_any_optimizer_update(tmp_path: pathlib.Path):
+    config = _step_zero_config(tmp_path, exp_name="step-zero")
+
+    train.main(config)
+
+    checkpoint = tmp_path / "checkpoint" / "debug" / "step-zero" / "0"
+    assert (checkpoint / "params").is_dir()
+    assert (checkpoint / "train_state").is_dir()
+
+
+def test_train_resumes_from_step_zero_without_overwriting_it(tmp_path: pathlib.Path):
+    config = _step_zero_config(tmp_path, exp_name="resume-step-zero")
+    checkpoint_dir = tmp_path / "checkpoint" / "debug" / "resume-step-zero"
+    train.main(config)
+
+    train.main(dataclasses.replace(config, resume=True, num_train_steps=2))
+
+    assert (checkpoint_dir / "0" / "params").is_dir()
+    assert (checkpoint_dir / "2" / "params").is_dir()
+    assert not (checkpoint_dir / "1").exists()
+
+
 def test_two_micro_batches_match_one_direct_batch_and_advance_state_once():
     config = _config._CONFIGS_DICT["debug"]  # noqa: SLF001
     accumulation_plan = train_planning.plan_gradient_accumulation(
