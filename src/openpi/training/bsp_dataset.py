@@ -52,8 +52,8 @@ class Dataset(Protocol[T_co]):
 def _episode_boundaries(dataset: Any) -> tuple[np.ndarray, np.ndarray]:
     try:
         episode_index = dataset.episode_data_index
-        starts = np.asarray(episode_index["from"], dtype=np.int64)
-        ends = np.asarray(episode_index["to"], dtype=np.int64)
+        starts = np.array(episode_index["from"], dtype=np.int64, copy=True)
+        ends = np.array(episode_index["to"], dtype=np.int64, copy=True)
     except (AttributeError, KeyError, TypeError, ValueError) as error:
         raise ValueError("LeRobot dataset has invalid episode_data_index boundaries") from error
     if starts.ndim != 1 or ends.ndim != 1 or starts.shape != ends.shape:

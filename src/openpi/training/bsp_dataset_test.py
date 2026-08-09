@@ -195,6 +195,21 @@ def test_wrapper_materializes_current_frame_knots_without_mutating_compact_cache
     assert not np.shares_memory(first_episode["actions"], cache.targets)
 
 
+def test_wrapper_snapshots_episode_boundaries_before_worker_serialization():
+    """Shared boundary storage lets data-loader workers corrupt relative knot offsets."""
+    dataset = TinyLeRobotDataset()
+    targets = np.zeros((1, 16, 8), dtype=np.float32)
+    targets[0, :, 7] = 9.0
+    wrapped = BspLeRobotDataset(
+        dataset,
+        BspCache(targets=targets, mapping=np.zeros(len(dataset), dtype=np.uint32)),
+    )
+
+    dataset.episode_data_index["from"][1] = 1_000_000
+
+    np.testing.assert_array_equal(wrapped[8]["actions"][:, 7], np.full(16, 9.0))
+
+
 def test_wrapper_normalizes_negative_indices_and_rejects_out_of_range_values():
     """Applying episode offsets to raw negative indices can silently use the wrong knot origin."""
     dataset = TinyLeRobotDataset()
