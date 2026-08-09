@@ -13,7 +13,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Validate and compare exactly ten phase-one LIBERO runs: "
-            "baseline/BSP at 0k, 5k, 10k, 20k, and 30k optimizer steps."
+            "baseline/BSP at 0k, 1k, 2k, 5k, and 10k optimizer steps."
         )
     )
     parser.add_argument(
@@ -57,7 +57,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except libero_report.ComparisonError as error:
         parser.error(str(error))
     print(
-        "Validated {} paired rollouts and wrote fixed 0k/5k/10k/20k/30k comparison artifacts to {}".format(
+        "Validated {} paired rollouts and wrote fixed 0k/1k/2k/5k/10k comparison artifacts to {}".format(
             comparison["protocol"]["total_episodes"], args.output_dir.expanduser().resolve()
         )
     )

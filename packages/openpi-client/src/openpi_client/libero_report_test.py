@@ -10,7 +10,7 @@ from openpi_client import libero_eval
 from openpi_client import libero_report
 
 
-_STEPS = (0, 5000, 10000, 20000, 30000)
+_STEPS = (0, 1000, 2000, 5000, 10000)
 _BASELINE_NORM = "b" * 64
 _BSP_NORM = "c" * 64
 _CACHE_SHA = "d" * 64
@@ -197,16 +197,16 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
             run_dirs = []
             # Deliberately shuffled and opaque: classification must come only from manifests.
             identities = [
-                ("bsp", 20000),
+                ("bsp", 2000),
                 ("baseline", 0),
-                ("bsp", 30000),
-                ("baseline", 30000),
                 ("bsp", 10000),
-                ("baseline", 20000),
-                ("bsp", 0),
-                ("baseline", 5000),
-                ("bsp", 5000),
                 ("baseline", 10000),
+                ("bsp", 5000),
+                ("baseline", 2000),
+                ("bsp", 0),
+                ("baseline", 1000),
+                ("bsp", 1000),
+                ("baseline", 5000),
             ]
             for index, (variant, step) in enumerate(identities):
                 path = root / "opaque-run-{}".format(index)
@@ -276,7 +276,7 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
         duplicate[-1] = copy.deepcopy(duplicate[-2])
         cases.append(duplicate)
         extra = copy.deepcopy(valid)
-        extra[-1]["checkpoint_step"] = 40000
+        extra[-1]["checkpoint_step"] = 20000
         cases.append(extra)
         wrong = copy.deepcopy(valid)
         wrong[0]["policy_protocol"] = "baseline_h10_calibration"

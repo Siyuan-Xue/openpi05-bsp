@@ -40,8 +40,10 @@ class CompareLiberoPhaseOneCliTest(unittest.TestCase):
 
         help_text = parser.format_help().lower()
         self.assertIn("ten", help_text)
-        for milestone in ("0k", "5k", "10k", "20k", "30k"):
+        for milestone in ("0k", "1k", "2k", "5k", "10k"):
             self.assertIn(milestone, help_text)
+        self.assertNotIn("20k", help_text)
+        self.assertNotIn("30k", help_text)
 
 
 if __name__ == "__main__":

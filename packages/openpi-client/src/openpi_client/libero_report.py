@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from openpi_client import libero_eval
 
 
-MILESTONES = (0, 5000, 10000, 20000, 30000)
+MILESTONES = (0, 1000, 2000, 5000, 10000)
 BOOTSTRAP_SEED = 42
 BOOTSTRAP_RESAMPLES = 10000
 TASKS_PER_SUITE = 10
@@ -900,7 +900,7 @@ def _render_markdown(milestones: Sequence[Mapping[str, Any]]) -> str:
         "# π0.5 + LIBERO BSP 第一阶段固定里程碑比较",
         "",
         (
-            "该报告只比较 0k、5k、10k、20k、30k 五个预先固定的 checkpoint；"
+            "该报告只比较 0k、1k、2k、5k、10k 五个预先固定的 checkpoint；"
             "主指标为四套件分层宏平均成功率。"
         ),
         "",
