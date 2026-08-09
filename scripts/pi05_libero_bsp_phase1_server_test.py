@@ -184,7 +184,10 @@ class PhaseOneServerRunbookContractTest(unittest.TestCase):
             '--norm-comparison "$NORM_COMPARISON"',
             "20,000 episodes",
             "permanent_checkpoint_steps",
-            "0k/5k/10k/20k/30k",
+            "0k/1k/2k/5k/10k",
+            "phase1-short10k-seed42-baseline",
+            "phase1-short10k-seed42-bsp",
+            "--num-train-steps 10000",
             "10,000 次",
             "seed 43/44",
             "modified_libero_rlds",
@@ -195,7 +198,7 @@ class PhaseOneServerRunbookContractTest(unittest.TestCase):
                 self.assertIn(fragment, self.runbook)
 
         for variant in ("baseline", "bsp"):
-            for step in (0, 5000, 10000, 20000, 30000):
+            for step in (0, 1000, 2000, 5000, 10000):
                 with self.subTest(variant=variant, step=step):
                     self.assertIn(f'"$EVAL_BASE/{variant}-step-{step}"', self.runbook)
 

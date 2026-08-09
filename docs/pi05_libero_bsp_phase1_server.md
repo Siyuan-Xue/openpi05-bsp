@@ -990,9 +990,9 @@ test -d "$PILOT_CHECKPOINT_BASE/pi05_libero_baseline_h16/pilot-seed42-baseline/1
 test -d "$PILOT_CHECKPOINT_BASE/pi05_libero_bsp_h16/pilot-seed42-bsp/100"
 ```
 
-成功判据：两个进程均返回 0，步数是 optimizer step 而不是 micro-step，各自生成准确标号的 `100` checkpoint，loss/grad norm 为有限值，且每个有效 batch 只更新一次 optimizer/EMA/state step。任一 pilot 失败就不开始 30k。
+成功判据：两个进程均返回 0，步数是 optimizer step 而不是 micro-step，各自生成准确标号的 `100` checkpoint，loss/grad norm 为有限值，且每个有效 batch 只更新一次 optimizer/EMA/state step。任一 pilot 失败就不开始正式 10k。
 
-## 12. 两次正式 30k 训练和十个固定评测
+## 12. 两次正式 10k 训练和十个固定评测
 
 ### 12.0 长任务重连后的身份恢复
 
@@ -1025,8 +1025,8 @@ export BASELINE_NORM_HASH="$(sha256sum "$BASELINE_NORM_DIR/norm_stats.json" | aw
 export BSP_NORM_HASH="$(sha256sum "$BSP_NORM_DIR/norm_stats.json" | awk '{print $1}')"
 export MICRO_BATCH="$(awk -F= '$1 == "micro_batch" {print $2}' "$LOG_BASE/selected-micro-batch.txt")"
 case "$MICRO_BATCH" in 1|2|4|8|16|32|64) ;; *) echo "STOP: invalid recovered MICRO_BATCH" >&2; exit 2 ;; esac
-export BASELINE_EXP=phase1-seed42-baseline
-export BSP_EXP=phase1-seed42-bsp
+export BASELINE_EXP=phase1-short10k-seed42-baseline
+export BSP_EXP=phase1-short10k-seed42-bsp
 export BASELINE_RUN="$CHECKPOINT_BASE/$BASELINE_CONFIG/$BASELINE_EXP"
 export BSP_RUN="$CHECKPOINT_BASE/$BSP_CONFIG/$BSP_EXP"
 
@@ -1064,8 +1064,8 @@ git diff --quiet
 git diff --cached --quiet
 nvidia-smi
 
-export BASELINE_EXP=phase1-seed42-baseline
-export BSP_EXP=phase1-seed42-bsp
+export BASELINE_EXP=phase1-short10k-seed42-baseline
+export BSP_EXP=phase1-short10k-seed42-bsp
 export BASELINE_RUN="$CHECKPOINT_BASE/$BASELINE_CONFIG/$BASELINE_EXP"
 export BSP_RUN="$CHECKPOINT_BASE/$BSP_CONFIG/$BSP_EXP"
 test ! -e "$BASELINE_RUN"
@@ -1075,12 +1075,12 @@ test ! -e "$BSP_RUN"
 import sys
 from openpi.training import config as train_config
 
-expected = (0, 5_000, 10_000, 20_000, 30_000)
+expected = (0, 1_000, 2_000, 5_000, 10_000)
 for name in sys.argv[1:]:
     config = train_config.get_config(name)
     assert config.permanent_checkpoint_steps == expected
     assert config.keep_period == 10_000
-print("permanent_checkpoint_steps=0k/5k/10k/20k/30k")
+print("permanent_checkpoint_steps=0k/1k/2k/5k/10k")
 PY
 
 "$OPENPI_PY" scripts/train.py "$BASELINE_CONFIG" \
@@ -1088,30 +1088,30 @@ PY
   --seed 42 \
   --batch-size 256 \
   --micro-batch-size "$MICRO_BATCH" \
-  --num-train-steps 30000 \
+  --num-train-steps 10000 \
   --save-interval 1000 \
   --ema-decay None \
   --assets-base-dir "$ASSETS_BASE" \
   --checkpoint-base-dir "$CHECKPOINT_BASE" \
   --data.lerobot-root "$LIBERO_DATASET_DIR" \
-  2>&1 | tee "$LOG_BASE/train-phase1-seed42-baseline.log"
+  2>&1 | tee "$LOG_BASE/train-phase1-short10k-seed42-baseline.log"
 
 "$OPENPI_PY" scripts/train.py "$BSP_CONFIG" \
   --exp-name "$BSP_EXP" \
   --seed 42 \
   --batch-size 256 \
   --micro-batch-size "$MICRO_BATCH" \
-  --num-train-steps 30000 \
+  --num-train-steps 10000 \
   --save-interval 1000 \
   --ema-decay None \
   --assets-base-dir "$ASSETS_BASE" \
   --checkpoint-base-dir "$CHECKPOINT_BASE" \
   --data.lerobot-root "$LIBERO_DATASET_DIR" \
   --data.bsp-cache-path "$BSP_CACHE" \
-  2>&1 | tee "$LOG_BASE/train-phase1-seed42-bsp.log"
+  2>&1 | tee "$LOG_BASE/train-phase1-short10k-seed42-bsp.log"
 ```
 
-命令不使用 `--overwrite`。如服务器中断，先检查已保存目录是完成 optimizer-step 边界，再在原命令末尾加 `--resume`；不删除、改名或覆盖原运行。每 1,000 optimizer steps 保存当时最新恢复点。配置中的 `permanent_checkpoint_steps=(0, 5000, 10000, 20000, 30000)` 与 `keep_period=10000` 取并集，精确保留 0k/5k/10k/20k/30k，不永久保留 15k/25k。
+命令不使用 `--overwrite`。如服务器中断，先检查已保存目录是完成 optimizer-step 边界，再在原命令末尾加 `--resume`；不删除、改名或覆盖原运行。每 1,000 optimizer steps 保存当时最新恢复点。配置中的 `permanent_checkpoint_steps=(0, 1000, 2000, 5000, 10000)` 与 `keep_period=10000` 取并集，精确保留 0k/1k/2k/5k/10k。
 
 正式进程启动后，先在另一个 shell 验收尚未训练的 step 0；两个 variant 都必须在第一次正梯度更新前产生同结构的 `0/params` 与 `0/train_state`。step 0 使用各自 norm/推理协议，不能用官方 `pi05_libero` 代替：
 
@@ -1128,26 +1128,26 @@ echo "formal_step_zero_gate=PASS"
 
 ```bash
 for root in "$BASELINE_RUN" "$BSP_RUN"; do
-  for step in 0 5000 10000 20000 30000; do
+  for step in 0 1000 2000 5000 10000; do
     test -d "$root/$step/params"
     test -d "$root/$step/assets"
   done
 done
 
-for step in 0 5000 10000 20000 30000; do
+for step in 0 1000 2000 5000 10000; do
   test "$(sha256sum "$BASELINE_RUN/$step/assets/libero_baseline_h16/norm_stats.json" | awk '{print $1}')" = "$BASELINE_NORM_HASH"
   test "$(sha256sum "$BSP_RUN/$step/assets/libero_bsp_h16/norm_stats.json" | awk '{print $1}')" = "$BSP_NORM_HASH"
 done
 
 for variant in baseline bsp; do
   if test "$variant" = baseline; then root="$BASELINE_RUN"; else root="$BSP_RUN"; fi
-  for step in 0 5000 10000 20000 30000; do
+  for step in 0 1000 2000 5000 10000; do
     printf '%s %s %s\n' "$variant" "$step" "$(tree_sha256 "$root/$step")"
   done
 done | tee "$LOG_BASE/phase1-checkpoints.sha256"
 ```
 
-十个 checkpoint 的路径不得是 symlink 到同一目录，末级目录名必须分别为 `0`、`5000`、`10000`、`20000`、`30000`。
+十个 checkpoint 的路径不得是 symlink 到同一目录，末级目录名必须分别为 `0`、`1000`、`2000`、`5000`、`10000`。
 
 ### 12.2 Docker 路线的十次正式评测
 
@@ -1209,7 +1209,7 @@ run_phase1_eval() {
       ;;
     *) echo "STOP: unsupported variant $variant" >&2; return 2 ;;
   esac
-  case "$step" in 0|5000|10000|20000|30000) ;; *) echo "STOP: unsupported step $step" >&2; return 2 ;; esac
+  case "$step" in 0|1000|2000|5000|10000) ;; *) echo "STOP: unsupported step $step" >&2; return 2 ;; esac
 
   local host_checkpoint="$host_root/$step"
   local container_checkpoint="$container_root/$step"
@@ -1261,14 +1261,14 @@ $cache_args"
 cd "$BSP_REPO_DIR"
 run_phase1_eval baseline 0
 run_phase1_eval bsp 0
+run_phase1_eval baseline 1000
+run_phase1_eval bsp 1000
+run_phase1_eval baseline 2000
+run_phase1_eval bsp 2000
 run_phase1_eval baseline 5000
 run_phase1_eval bsp 5000
 run_phase1_eval baseline 10000
 run_phase1_eval bsp 10000
-run_phase1_eval baseline 20000
-run_phase1_eval bsp 20000
-run_phase1_eval baseline 30000
-run_phase1_eval bsp 30000
 ```
 
 评测器对 simulator/container/network 错误使用原种子最多重试两次。两次后仍失败的 episode 不混入成功率，且整个 run 的 `acceptance_complete=false`，本节随即停止。非法 shape/NaN/无效 BSP 解码是策略失败，正常计入失败 episode，不伪装为基础设施错误。
@@ -1315,7 +1315,7 @@ run_phase1_eval_host() {
       ;;
     *) echo "STOP: unsupported variant $variant" >&2; return 2 ;;
   esac
-  case "$step" in 0|5000|10000|20000|30000) ;; *) echo "STOP: unsupported step $step" >&2; return 2 ;; esac
+  case "$step" in 0|1000|2000|5000|10000) ;; *) echo "STOP: unsupported step $step" >&2; return 2 ;; esac
 
   local checkpoint="$host_root/$step"
   local output="$EVAL_BASE/${variant}-step-${step}"
@@ -1385,19 +1385,19 @@ run_phase1_eval_host() {
 cd "$BSP_REPO_DIR"
 run_phase1_eval_host baseline 0
 run_phase1_eval_host bsp 0
+run_phase1_eval_host baseline 1000
+run_phase1_eval_host bsp 1000
+run_phase1_eval_host baseline 2000
+run_phase1_eval_host bsp 2000
 run_phase1_eval_host baseline 5000
 run_phase1_eval_host bsp 5000
 run_phase1_eval_host baseline 10000
 run_phase1_eval_host bsp 10000
-run_phase1_eval_host baseline 20000
-run_phase1_eval_host bsp 20000
-run_phase1_eval_host baseline 30000
-run_phase1_eval_host bsp 30000
 ```
 
 ## 13. 严格生成第一阶段比较报告
 
-比较器只接受恰好十个 run，并且只根据 manifest 的 variant/step 识别它们。它会拒绝 official h10、缺失 0k/5k、重复/额外里程碑、混合全量/LoRA 训练家族、不完整 20,000 回合、非配对初始状态、截断/NaN JSON、summary 不一致、infrastructure/artifact error 或任何身份不一致。
+比较器只接受恰好十个 run，并且只根据 manifest 的 variant/step 识别它们。它会拒绝 official h10、缺失 0k/1k/2k/5k/10k、重复/额外里程碑、混合全量/LoRA 训练家族、不完整 20,000 回合、非配对初始状态、截断/NaN JSON、summary 不一致、infrastructure/artifact error 或任何身份不一致。
 
 直接传入第 8 节 prepare verify 生成的原始 `$BSP_VERIFY` 和第 9 节生成的原始 `$NORM_COMPARISON`：
 
@@ -1410,14 +1410,14 @@ PYTHONPATH="$BSP_REPO_DIR/packages/openpi-client/src" \
   "$OPENPI_PY" scripts/compare_libero_phase1.py \
   "$EVAL_BASE/baseline-step-0" \
   "$EVAL_BASE/bsp-step-0" \
+  "$EVAL_BASE/baseline-step-1000" \
+  "$EVAL_BASE/bsp-step-1000" \
+  "$EVAL_BASE/baseline-step-2000" \
+  "$EVAL_BASE/bsp-step-2000" \
   "$EVAL_BASE/baseline-step-5000" \
   "$EVAL_BASE/bsp-step-5000" \
   "$EVAL_BASE/baseline-step-10000" \
   "$EVAL_BASE/bsp-step-10000" \
-  "$EVAL_BASE/baseline-step-20000" \
-  "$EVAL_BASE/bsp-step-20000" \
-  "$EVAL_BASE/baseline-step-30000" \
-  "$EVAL_BASE/bsp-step-30000" \
   --bsp-verification "$BSP_VERIFY" \
   --norm-comparison "$NORM_COMPARISON" \
   --output-dir "$REPORT_DIR"
@@ -1444,7 +1444,7 @@ report.md
 learning_curve.svg
 ```
 
-报告固定显示 0k/5k/10k/20k/30k 五个点，不标记 best checkpoint。主指标是 task、suite 和四套件分层宏平均成功率；BSP-baseline 差值使用 seed 42、恰好 10,000 次的 task-stratified paired bootstrap 生成双侧 95% percentile CI。完成步数、推理延迟和 spline 重建误差只作诊断。
+报告固定显示 0k/1k/2k/5k/10k 五个点，不标记 best checkpoint。主指标是 task、suite 和四套件分层宏平均成功率；BSP-baseline 差值使用 seed 42、恰好 10,000 次的 task-stratified paired bootstrap 生成双侧 95% percentile CI。完成步数、推理延迟和 spline 重建误差只作诊断。
 
 ## 14. 最终审计清单
 
@@ -1457,8 +1457,8 @@ learning_curve.svg
 - BSP full verify 原始 JSON 通过，NPZ hash、manifest fingerprint、严格误差和所有 mapping/cache 不变量均有记录。
 - baseline/BSP norm 分离，state `mean/std/q01/q99` 一致，action stats 隔离。
 - `{1,2,4,8}` 在 A/B 中全部以独立进程探测，选择共同稳定且有余量的最大值；有效 batch 一直为 256。
-- A/B 各 100 optimizer-step pilot 通过，随后从同一 `pi05_base` 用 seed 42 分别完成 30k。
-- 十个不同 checkpoint 的 0k/5k/10k/20k/30k 评测各 2,000 回合，总计 20,000，且全部可审计/可配对。
+- A/B 各 100 optimizer-step pilot 通过，随后从同一 `pi05_base` 用 seed 42 分别完成 10k。
+- 十个不同 checkpoint 的 0k/1k/2k/5k/10k 评测各 2,000 回合，总计 20,000，且全部可审计/可配对。
 - 比较器直接读取原始 BSP/norm diagnostics，返回 0 并且只生成六个固定报告产物。
 - seed 43/44 只有预留目录，没有实际运行；没有评测 2×/4×，没有选择 best checkpoint。
 

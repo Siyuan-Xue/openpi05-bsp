@@ -969,3 +969,31 @@ python3 -m pip config list
    `008196e`，预定的 GREEN 日志不存在；因此同两项 GREEN 测试实际**未启动**，不能视为
    测试中断或测试通过。在隔离 worktree 快进到 `ad01abe` 并取得明确 PASS 终态前，不得据此
    合并 `main` 或开始正式训练。
+
+## 18. 2026-08-09 第一阶段缩短为 10k
+
+由于单组 30k 训练按实测速度预计约需十天，用户批准用预先固定的短周期协议替代原 30k
+协议。这个决定改变训练预算和验收横轴，但不改变模型、数据、优化器、有效 batch、seed、
+Baseline/BSP 配对方式或每个 checkpoint 的完整评测规模。
+
+1. 被替代的 Baseline LoRA 正式运行使用代码
+   `196651804f21d25f4b92f0f0d67801e42b140089`、配置
+   `pi05_libero_baseline_lora_h16` 和实验名 `phase1-seed42-baseline`。身份核对后向 PID
+   `1718659` 发送 `SIGTERM`，进程正常退出；最后观察到 `212 / 30,000`，日志异常匹配为 0，
+   GPU compute process 为 0，旧运行只存在 step 0。旧日志和 checkpoint 全部保留，不再恢复
+   或覆盖该实验。
+2. 终止审计文件为
+   `/root/openpi-bsp-work/experiments/logs/protocol-transition-30k-to-10k-20260809T120259Z-2211334.txt`，
+   SHA-256 为
+   `36f9ba560adbad8caf946ff30f30a60a7ef57d4a24864ff2820d22e69d7aa7a6`。
+3. 新协议的训练终点是 10,000 optimizer steps，固定永久里程碑是
+   `0k/1k/2k/5k/10k`。每 1,000 step 保存恢复点，`keep_period=10000`，四个 phase-one
+   full/LoRA Baseline/BSP 配置使用同一个里程碑集合。
+4. 新正式实验名固定为 `phase1-short10k-seed42-baseline` 和
+   `phase1-short10k-seed42-bsp`。它们必须从同一个 `pi05_base` 独立初始化，不能从旧 212-step
+   运行恢复。
+5. A/B 各评测五个 checkpoint，每次仍为四套件 × 10 tasks × 50 initial states = 2,000
+   episodes；比较器仍要求恰好十个 run、20,000 episodes，并生成原来的六种固定报告文件。
+6. 本节写入代码仓库时，新 10k 训练尚未启动。只有短周期配置、报告和 runbook 合同测试通过，
+   功能分支合并并推送、服务器 `main` 快进到最终 SHA 且启动前门禁通过后，才允许用新实验名
+   启动 Baseline。
