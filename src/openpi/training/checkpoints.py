@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures as futures
 import dataclasses
+import functools
 import logging
 from typing import Protocol
 
@@ -14,11 +15,17 @@ import orbax.checkpoint.future as future
 from openpi.shared import array_typing as at
 import openpi.shared.normalize as _normalize
 import openpi.training.data_loader as _data_loader
+import openpi.training.train_planning as train_planning
 import openpi.training.utils as training_utils
 
 
 def initialize_checkpoint_dir(
-    checkpoint_dir: epath.Path | str, *, keep_period: int | None, overwrite: bool, resume: bool
+    checkpoint_dir: epath.Path | str,
+    *,
+    keep_period: int | None,
+    permanent_checkpoint_steps: tuple[int, ...],
+    overwrite: bool,
+    resume: bool,
 ) -> tuple[ocp.CheckpointManager, bool]:
     checkpoint_dir = epath.Path(checkpoint_dir).resolve()
     resuming = False
@@ -37,6 +44,17 @@ def initialize_checkpoint_dir(
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    retention_options = (
+        {
+            "should_keep_fn": functools.partial(
+                train_planning.should_keep_checkpoint,
+                permanent_steps=permanent_checkpoint_steps,
+                keep_period=keep_period,
+            )
+        }
+        if permanent_checkpoint_steps
+        else {"keep_period": keep_period}
+    )
     mngr = ocp.CheckpointManager(
         checkpoint_dir,
         item_handlers={
@@ -46,16 +64,16 @@ def initialize_checkpoint_dir(
         },
         options=ocp.CheckpointManagerOptions(
             max_to_keep=1,
-            keep_period=keep_period,
             create=False,
             async_options=ocp.AsyncOptions(timeout_secs=7200),
+            **retention_options,
         ),
     )
 
     # Special case: the checkpoint directory exists and the user requests to resume training, but the training run did
     # not get to the first checkpoint saved. In this case, we don't actually want the train script to try and restore a
     # checkpoint, since it will fail.
-    if resuming and tuple(mngr.all_steps()) in [(), (0,)]:
+    if resuming and tuple(mngr.all_steps()) == ():
         logging.info("Checkpoint directory exists, but does not contain any checkpoints. Aborting resume.")
         resuming = False
 

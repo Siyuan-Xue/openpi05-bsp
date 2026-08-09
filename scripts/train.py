@@ -253,6 +253,7 @@ def main(config: _config.TrainConfig):
     checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
         config.checkpoint_dir,
         keep_period=config.keep_period,
+        permanent_checkpoint_steps=config.permanent_checkpoint_steps,
         overwrite=config.overwrite,
         resume=config.resume,
     )
@@ -280,6 +281,14 @@ def main(config: _config.TrainConfig):
 
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+    elif 0 in config.permanent_checkpoint_steps:
+        initial_step = int(train_state.step)
+        if initial_step != 0:
+            raise RuntimeError(
+                f"Initial checkpoint requires train state step 0 before optimization, got {initial_step}."
+            )
+        _checkpoints.save_state(checkpoint_manager, train_state, data_loader, 0)
+        checkpoint_manager.wait_until_finished()
 
     gradient_sharding = train_state_sharding.params.filter(config.trainable_filter)
     pmicrobatch_grad = jax.jit(
