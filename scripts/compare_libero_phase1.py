@@ -12,16 +12,16 @@ from openpi_client import libero_report
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Validate and compare exactly six phase-one LIBERO runs: "
-            "baseline/BSP at 10k, 20k, and 30k optimizer steps."
+            "Validate and compare exactly ten phase-one LIBERO runs: "
+            "baseline/BSP at 0k, 5k, 10k, 20k, and 30k optimizer steps."
         )
     )
     parser.add_argument(
         "run_dirs",
         metavar="RUN_DIR",
-        nargs=6,
+        nargs=10,
         type=Path,
-        help="Six run directories; manifest contents, never directory names, identify each run.",
+        help="Ten run directories; manifest contents, never directory names, identify each run.",
     )
     parser.add_argument(
         "--bsp-verification",
@@ -57,7 +57,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except libero_report.ComparisonError as error:
         parser.error(str(error))
     print(
-        "Validated {} paired rollouts and wrote fixed 10k/20k/30k comparison artifacts to {}".format(
+        "Validated {} paired rollouts and wrote fixed 0k/5k/10k/20k/30k comparison artifacts to {}".format(
             comparison["protocol"]["total_episodes"], args.output_dir.expanduser().resolve()
         )
     )

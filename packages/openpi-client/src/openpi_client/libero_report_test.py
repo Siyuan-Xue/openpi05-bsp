@@ -10,7 +10,7 @@ from openpi_client import libero_eval
 from openpi_client import libero_report
 
 
-_STEPS = (10000, 20000, 30000)
+_STEPS = (0, 5000, 10000, 20000, 30000)
 _BASELINE_NORM = "b" * 64
 _BSP_NORM = "c" * 64
 _CACHE_SHA = "d" * 64
@@ -34,15 +34,21 @@ _VERIFICATION_FLAGS = (
 )
 
 
-def _manifest(variant, step):
+def _manifest(variant, step, *, family="full"):
     baseline = variant == "baseline"
+    config_names = {
+        ("baseline", "full"): "pi05_libero_baseline_h16",
+        ("bsp", "full"): "pi05_libero_bsp_h16",
+        ("baseline", "lora"): "pi05_libero_baseline_lora_h16",
+        ("bsp", "lora"): "pi05_libero_bsp_lora_h16",
+    }
     return {
         "schema_version": 2,
         "native_control_hz": 10,
         "replan_steps": 8,
         "code_sha": _CODE_SHA,
         "dataset_revision": "v2.0",
-        "config_name": "pi05_libero_baseline_h16" if baseline else "pi05_libero_bsp_h16",
+        "config_name": config_names[(variant, family)],
         "checkpoint_step": step,
         "bsp_cache_hash": None if baseline else _CACHE_SHA,
         "bsp_cache_manifest_fingerprint": None if baseline else _CACHE_FINGERPRINT,
@@ -101,7 +107,7 @@ def _episode(suite, task_id, init_index, success):
     )
 
 
-def _write_run(path, variant, step):
+def _write_run(path, variant, step, *, family="full"):
     path.mkdir(parents=True)
     records = []
     for suite in libero_eval.SUPPORTED_SUITES:
@@ -109,7 +115,7 @@ def _write_run(path, variant, step):
             for init_index in range(50):
                 records.append(_episode(suite, task_id, init_index, variant == "bsp"))
     (path / "manifest.json").write_text(
-        json.dumps(_manifest(variant, step), allow_nan=False, sort_keys=True) + "\n",
+        json.dumps(_manifest(variant, step, family=family), allow_nan=False, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     with (path / "episodes.jsonl").open("w", encoding="utf-8") as output:
@@ -185,18 +191,22 @@ def _write_diagnostics(root):
 
 
 class LiberoPhaseOneReportTest(unittest.TestCase):
-    def test_full_12000_rollout_comparison_emits_exactly_six_fixed_milestone_artifacts(self):
+    def test_full_20000_rollout_comparison_emits_all_five_fixed_milestone_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             run_dirs = []
             # Deliberately shuffled and opaque: classification must come only from manifests.
             identities = [
                 ("bsp", 20000),
-                ("baseline", 10000),
+                ("baseline", 0),
                 ("bsp", 30000),
                 ("baseline", 30000),
                 ("bsp", 10000),
                 ("baseline", 20000),
+                ("bsp", 0),
+                ("baseline", 5000),
+                ("bsp", 5000),
+                ("baseline", 10000),
             ]
             for index, (variant, step) in enumerate(identities):
                 path = root / "opaque-run-{}".format(index)
@@ -224,18 +234,39 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
                 },
             )
             self.assertEqual([row["checkpoint_step"] for row in comparison["milestones"]], list(_STEPS))
+            self.assertEqual(comparison["protocol"]["milestones"], list(_STEPS))
+            self.assertEqual(comparison["protocol"]["total_episodes"], 20_000)
+            self.assertEqual(comparison["protocol"]["training_family"], "full")
             for row in comparison["milestones"]:
                 self.assertEqual(row["bsp_minus_baseline"], 1.0)
                 self.assertEqual(row["bootstrap_95_ci"], [1.0, 1.0])
                 self.assertEqual(row["bootstrap_resamples"], 10000)
                 self.assertEqual(row["bootstrap_seed"], 42)
             with (output_dir / "task_comparison.csv").open(newline="", encoding="utf-8") as input_file:
-                self.assertEqual(len(list(csv.DictReader(input_file))), 120)
+                self.assertEqual(len(list(csv.DictReader(input_file))), 200)
             with (output_dir / "suite_comparison.csv").open(newline="", encoding="utf-8") as input_file:
-                self.assertEqual(len(list(csv.DictReader(input_file))), 12)
+                self.assertEqual(len(list(csv.DictReader(input_file))), 20)
             with (output_dir / "learning_curve.csv").open(newline="", encoding="utf-8") as input_file:
-                self.assertEqual(len(list(csv.DictReader(input_file))), 3)
+                self.assertEqual(len(list(csv.DictReader(input_file))), 5)
             self.assertNotIn("best", (output_dir / "report.md").read_text(encoding="utf-8").lower())
+
+    def test_manifest_classifier_accepts_one_lora_family_and_rejects_mixed_families(self):
+        lora = [
+            _manifest(variant, step, family="lora")
+            for variant in ("baseline", "bsp")
+            for step in _STEPS
+        ]
+
+        classified = libero_report.classify_phase_one_manifests(lora)
+
+        self.assertEqual(
+            set(classified),
+            {(variant, step) for variant in ("baseline", "bsp") for step in _STEPS},
+        )
+        mixed = copy.deepcopy(lora)
+        mixed[0]["config_name"] = "pi05_libero_baseline_h16"
+        with self.assertRaisesRegex(libero_report.ComparisonError, "training family"):
+            libero_report.classify_phase_one_manifests(mixed)
 
     def test_manifest_classifier_rejects_missing_duplicate_extra_and_wrong_protocol(self):
         valid = [_manifest(variant, step) for variant in ("baseline", "bsp") for step in _STEPS]

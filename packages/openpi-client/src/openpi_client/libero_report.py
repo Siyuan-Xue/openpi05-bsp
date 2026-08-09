@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from openpi_client import libero_eval
 
 
-MILESTONES = (10000, 20000, 30000)
+MILESTONES = (0, 5000, 10000, 20000, 30000)
 BOOTSTRAP_SEED = 42
 BOOTSTRAP_RESAMPLES = 10000
 TASKS_PER_SUITE = 10
@@ -74,6 +74,12 @@ _SHARED_MANIFEST_FIELDS = (
     "connection_timeout_s",
     "inference_timeout_s",
 )
+_PHASE_ONE_CONFIGS = {
+    ("baseline", "full"): "pi05_libero_baseline_h16",
+    ("bsp", "full"): "pi05_libero_bsp_h16",
+    ("baseline", "lora"): "pi05_libero_baseline_lora_h16",
+    ("bsp", "lora"): "pi05_libero_bsp_lora_h16",
+}
 
 
 class ComparisonError(ValueError):
@@ -168,6 +174,21 @@ def _require_fields(payload: Mapping[str, Any], fields: Sequence[str], *, label:
         raise ComparisonError("{} is missing required fields: {}".format(label, missing))
 
 
+def _training_family(manifest: Mapping[str, Any]) -> str:
+    variant = manifest["policy_variant"]
+    config_name = manifest["config_name"]
+    matches = [
+        family
+        for (candidate_variant, family), candidate_config in _PHASE_ONE_CONFIGS.items()
+        if candidate_variant == variant and candidate_config == config_name
+    ]
+    if len(matches) != 1:
+        raise ComparisonError(
+            "{} manifest has unsupported phase-one config_name {}".format(variant, config_name)
+        )
+    return matches[0]
+
+
 def _validate_manifest(manifest: Mapping[str, Any]) -> Tuple[str, int]:
     required = (
         "schema_version",
@@ -211,15 +232,12 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> Tuple[str, int]:
         raise ComparisonError("Evaluation manifest checkpoint_step must be an integer")
     if step not in MILESTONES:
         raise ComparisonError("Unexpected phase-one checkpoint_step {}".format(step))
+    _training_family(manifest)
     expected = {
-        "baseline": ("pi05_libero_baseline_h16", "baseline_h16", 16),
-        "bsp": ("pi05_libero_bsp_h16", "bsp_decoded_h8", 8),
+        "baseline": ("baseline_h16", 16),
+        "bsp": ("bsp_decoded_h8", 8),
     }[variant]
-    actual = (
-        manifest["config_name"],
-        manifest["policy_protocol"],
-        manifest["expected_action_horizon"],
-    )
+    actual = (manifest["policy_protocol"], manifest["expected_action_horizon"])
     if actual != expected:
         raise ComparisonError(
             "{}@{} has config/protocol/horizon {}, expected {}".format(variant, step, actual, expected)
@@ -270,9 +288,12 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> Tuple[str, int]:
 def classify_phase_one_manifests(
     manifests: Sequence[Mapping[str, Any]],
 ) -> Dict[Tuple[str, int], Mapping[str, Any]]:
-    """Identify exactly baseline/BSP at 10k/20k/30k using manifest contents only."""
-    if len(manifests) != 6:
-        raise ComparisonError("Phase-one comparison requires exactly six run manifests")
+    """Identify baseline/BSP at all five fixed milestones using manifest contents only."""
+    required_run_count = 2 * len(MILESTONES)
+    if len(manifests) != required_run_count:
+        raise ComparisonError(
+            "Phase-one comparison requires exactly {} run manifests".format(required_run_count)
+        )
     classified: Dict[Tuple[str, int], Mapping[str, Any]] = {}
     for manifest in manifests:
         key = _validate_manifest(manifest)
@@ -285,9 +306,17 @@ def classify_phase_one_manifests(
         extra = sorted(set(classified).difference(expected))
         raise ComparisonError("Phase-one run set mismatch; missing={}, extra={}".format(missing, extra))
 
+    training_families = {_training_family(manifest) for manifest in manifests}
+    if len(training_families) != 1:
+        raise ComparisonError(
+            "All phase-one runs must use one training family; found {}".format(
+                sorted(training_families)
+            )
+        )
+
     normalized_checkpoints = [manifest["checkpoint"].rstrip("/") for manifest in manifests]
     if len(set(normalized_checkpoints)) != len(normalized_checkpoints):
-        raise ComparisonError("All six normalized checkpoint identities must be globally unique")
+        raise ComparisonError("All normalized checkpoint identities must be globally unique")
 
     reference = next(iter(classified.values()))
     for key, manifest in classified.items():
@@ -720,7 +749,7 @@ def validate_diagnostics(
     bsp_diagnostics: Mapping[str, Any],
     norm_diagnostics: Mapping[str, Any],
 ) -> Mapping[str, float]:
-    """Validate Task-6 cache and normalization gates against all six manifests."""
+    """Validate cache and normalization gates against all fixed manifests."""
     classified = classify_phase_one_manifests(manifests)
     required_bsp = (
         *_BSP_VERIFICATION_FLAGS,
@@ -871,7 +900,7 @@ def _render_markdown(milestones: Sequence[Mapping[str, Any]]) -> str:
         "# π0.5 + LIBERO BSP 第一阶段固定里程碑比较",
         "",
         (
-            "该报告只比较 10k、20k、30k 三个预先固定的 checkpoint；"
+            "该报告只比较 0k、5k、10k、20k、30k 五个预先固定的 checkpoint；"
             "主指标为四套件分层宏平均成功率。"
         ),
         "",
@@ -906,7 +935,8 @@ def _render_svg(milestones: Sequence[Mapping[str, Any]]) -> str:
     left, right, top, bottom = 80, 30, 35, 65
     plot_width = width - left - right
     plot_height = height - top - bottom
-    x_values = [left + index * plot_width / 2 for index in range(3)]
+    denominator = max(1, len(milestones) - 1)
+    x_values = [left + index * plot_width / denominator for index in range(len(milestones))]
 
     def y(value: float) -> float:
         return top + (1.0 - value) * plot_height
@@ -998,11 +1028,12 @@ def compare_phase_one(
     norm_comparison_path: Path,
     output_dir: Path,
 ) -> Mapping[str, Any]:
-    """Validate six fixed runs and emit the complete phase-one comparison."""
-    if len(run_dirs) != 6:
-        raise ComparisonError("Exactly six run directories are required")
+    """Validate ten fixed runs and emit the complete phase-one comparison."""
+    required_run_count = 2 * len(MILESTONES)
+    if len(run_dirs) != required_run_count:
+        raise ComparisonError("Exactly {} run directories are required".format(required_run_count))
     resolved_runs = [Path(path).expanduser().resolve() for path in run_dirs]
-    if len(set(resolved_runs)) != 6:
+    if len(set(resolved_runs)) != required_run_count:
         raise ComparisonError("Run directories must be unique")
     output = Path(output_dir).expanduser().resolve()
     if output.exists() and any(output.iterdir()):
@@ -1095,6 +1126,7 @@ def compare_phase_one(
         "schema_version": 1,
         "protocol": {
             "milestones": list(MILESTONES),
+            "training_family": _training_family(next(iter(classified_manifests.values()))),
             "suites": list(libero_eval.SUPPORTED_SUITES),
             "tasks_per_suite": TASKS_PER_SUITE,
             "trials_per_task": TRIALS_PER_TASK,
