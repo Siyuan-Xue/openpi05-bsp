@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import dataclasses
 from collections.abc import Callable
+import dataclasses
 from typing import TypeVar
-
 
 Tree = TypeVar("Tree")
 

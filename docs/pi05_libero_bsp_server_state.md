@@ -947,3 +947,25 @@ python3 -m pip config list
 6. 截至写入本节时，上述改动仍需完成整套测试、合并到 `main`、推送并由服务器
    `pull --ff-only` 后才会生效；服务器上尚未产生正式 0k/5k checkpoint，也未开始正式
    30k 训练。
+
+## 17. 2026-08-09 实施与服务器门禁增量
+
+本节按终端已观察证据记录；未取得终态的项目明确标为未确认：
+
+1. Baseline LoRA、micro-batch 64、无 EMA 的 100-step pilot 已正常退出；10–100 step 的
+   十组 `loss/grad_norm/param_norm` 均为有限值，`100/params` 与 `100/train_state` 存在，
+   日志无 OOM/RESOURCE_EXHAUSTED/Traceback，未发现 Orbax 临时目录。
+2. BSP LoRA 100-step 的首次启动命令因手工抄写的完整 code SHA 不匹配而在前置门禁停止，
+   没有创建日志、PID 或 checkpoint。改用服务器实际 SHA 后进程进入启动，但在训练状态和
+   数据初始化前因新 shell 没有显式设置 `WANDB_MODE=offline` 而退出，日志报
+   `api_key not configured (no-tty)`。这不是 OOM，也不能作为 BSP 稳定性结论。
+3. 按异常停止规则，没有删除上述失败日志，也没有自动用同名或新名称重试 BSP pilot；
+   下一次合法启动必须使用唯一实验名并在进程环境中显式传入 `WANDB_MODE=offline`。
+4. 为 0k/5k 改动创建了本地功能分支 `feat/phase1-zero-five-k`；服务器主工作区仍停留在
+   `b8f88bb...`，另建 detached 隔离 worktree 读取功能分支，不修改服务器 `main`。
+5. 服务器锁定的 JAX/Orbax 环境对两个新 step-0 集成测试给出预期 RED：两项均失败，
+   `2 failed, 2 deselected`，耗时约 75 秒；GPU 为空。失败分支日志保存在项目 logs 目录。
+6. 随后已推送 step-0 生产实现，但重新登录后的终端证据显示隔离 worktree 仍停在
+   `008196e`，预定的 GREEN 日志不存在；因此同两项 GREEN 测试实际**未启动**，不能视为
+   测试中断或测试通过。在隔离 worktree 快进到 `ad01abe` 并取得明确 PASS 终态前，不得据此
+   合并 `main` 或开始正式训练。

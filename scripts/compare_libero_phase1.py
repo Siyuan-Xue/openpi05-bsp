@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Optional, Sequence
 
 from openpi_client import libero_report
 
@@ -39,12 +39,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         required=True,
         type=Path,
-        help="New or empty destination for the six fixed report artifacts.",
+        help="New or empty destination for the fixed set of six report artifacts.",
     )
     return parser
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
