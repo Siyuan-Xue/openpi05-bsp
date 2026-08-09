@@ -24,6 +24,9 @@ import openpi.transforms as transforms
 _STATE_STATS_RTOL = 1e-7
 _STATE_STATS_ATOL = 1e-8
 _STATE_FIELDS = ("mean", "std", "q01", "q99")
+_BSP_ACTION_DIM = 8
+_BSP_KNOT_CHANNEL = 7
+_MIN_BSP_KNOT_QUANTILE_SPAN = 1e-6
 
 
 class RemoveStrings(transforms.DataTransformFn):
@@ -64,6 +67,25 @@ def _stats_sha256(stats: normalize.NormStats) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _validate_bsp_action_stats(stats: normalize.NormStats) -> None:
+    """Reject knot statistics that would make BSP quantile normalization unstable."""
+    q01 = np.asarray(stats.q01)
+    q99 = np.asarray(stats.q99)
+    if q01.shape != (_BSP_ACTION_DIM,) or q99.shape != (_BSP_ACTION_DIM,):
+        raise ValueError(
+            "BSP action normalization statistics must contain exactly "
+            f"{_BSP_ACTION_DIM} channels, got q01={q01.shape} and q99={q99.shape}"
+        )
+    knot_q01 = float(q01[_BSP_KNOT_CHANNEL])
+    knot_q99 = float(q99[_BSP_KNOT_CHANNEL])
+    knot_span = knot_q99 - knot_q01
+    if not np.isfinite(knot_span) or knot_span <= _MIN_BSP_KNOT_QUANTILE_SPAN:
+        raise ValueError(
+            "BSP knot quantile interval is degenerate: "
+            f"q01={knot_q01}, q99={knot_q99}, span={knot_span}"
+        )
+
+
 def compare_norm_stats_assets(
     baseline_dir: Path,
     bsp_dir: Path,
@@ -87,6 +109,7 @@ def compare_norm_stats_assets(
         missing = {"state", "actions"}.difference(stats)
         if missing:
             raise ValueError(f"{name} normalization stats are missing keys: {sorted(missing)}")
+    _validate_bsp_action_stats(bsp["actions"])
 
     state_fields = {}
     for field in _STATE_FIELDS:
@@ -251,6 +274,8 @@ def main(
             stats[key].update(np.asarray(batch[key]))
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
+    if data_config.use_bsp:
+        _validate_bsp_action_stats(norm_stats["actions"])
 
     # Model transforms are intentionally absent above: BSP stats therefore see compact [16, 8]
     # targets, while baseline stats see raw [16, 7] actions, before either representation is padded.

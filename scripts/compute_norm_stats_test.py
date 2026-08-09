@@ -84,6 +84,22 @@ def test_norm_comparison_flags_state_mismatch_without_numpy_object_equality(tmp_
     assert comparison["state_fields"]["std"]["equal"] is True
 
 
+def test_norm_comparison_rejects_collapsed_bsp_knot_quantiles(tmp_path: Path):
+    """A zero-width knot interval explodes quantile normalization even when every value is finite."""
+    baseline_dir = tmp_path / "baseline"
+    bsp_dir = tmp_path / "bsp"
+    baseline = _stats(action_dim=7)
+    bsp = _stats(action_dim=8)
+    bsp["actions"].mean[7] = -273360.0
+    bsp["actions"].q01[7] = -273360.0
+    bsp["actions"].q99[7] = -273360.0
+    normalize.save(baseline_dir, baseline)
+    normalize.save(bsp_dir, bsp)
+
+    with pytest.raises(ValueError, match="knot quantile interval"):
+        compare_norm_stats_assets(baseline_dir, bsp_dir)
+
+
 def test_norm_comparison_rejects_shared_asset_directory(tmp_path: Path):
     """A shared output directory can overwrite one experiment even when state values match."""
     shared = tmp_path / "shared"
