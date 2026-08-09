@@ -117,3 +117,24 @@ def should_save_checkpoint(completed_step: int, *, num_train_steps: int, save_in
             f"Completed optimizer step {completed_step} exceeds requested training steps {num_train_steps}."
         )
     return completed_step % save_interval == 0 or completed_step == num_train_steps
+
+
+def should_keep_checkpoint(
+    step: int,
+    *,
+    permanent_steps: tuple[int, ...],
+    keep_period: int | None,
+) -> bool:
+    """Return whether Orbax must preserve a checkpoint beyond ``max_to_keep``."""
+    if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+        raise ValueError(f"step must be a nonnegative integer, got {step!r}")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in permanent_steps
+    ):
+        raise ValueError("permanent_steps must be unique nonnegative integers in ascending order")
+    if tuple(sorted(permanent_steps)) != permanent_steps or len(set(permanent_steps)) != len(permanent_steps):
+        raise ValueError("permanent_steps must be unique nonnegative integers in ascending order")
+    if keep_period is not None:
+        _require_positive_integer("keep_period", keep_period)
+    return step in permanent_steps or (keep_period is not None and step % keep_period == 0)

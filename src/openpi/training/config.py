@@ -536,6 +536,8 @@ class TrainConfig:
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
+    # Exact optimizer steps that must survive normal max-to-keep cleanup.
+    permanent_checkpoint_steps: tuple[int, ...] = ()
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
@@ -574,6 +576,16 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if any(
+            isinstance(step, bool) or not isinstance(step, int) or step < 0
+            for step in self.permanent_checkpoint_steps
+        ):
+            raise ValueError("permanent_checkpoint_steps must contain only nonnegative integers")
+        if (
+            tuple(sorted(self.permanent_checkpoint_steps)) != self.permanent_checkpoint_steps
+            or len(set(self.permanent_checkpoint_steps)) != len(self.permanent_checkpoint_steps)
+        ):
+            raise ValueError("permanent_checkpoint_steps must be unique and in ascending order")
 
 
 # Shared immutable model config keeps the LoRA freeze filter exactly aligned with both phase-one variants.
@@ -817,6 +829,7 @@ _CONFIGS = [
         num_train_steps=30_000,
         save_interval=1_000,
         keep_period=10_000,
+        permanent_checkpoint_steps=(0, 5_000, 10_000, 20_000, 30_000),
     ),
     TrainConfig(
         name="pi05_libero_bsp_h16",
@@ -846,6 +859,7 @@ _CONFIGS = [
         num_train_steps=30_000,
         save_interval=1_000,
         keep_period=10_000,
+        permanent_checkpoint_steps=(0, 5_000, 10_000, 20_000, 30_000),
     ),
     TrainConfig(
         name="pi05_libero_baseline_lora_h16",
@@ -873,6 +887,7 @@ _CONFIGS = [
         num_train_steps=30_000,
         save_interval=1_000,
         keep_period=10_000,
+        permanent_checkpoint_steps=(0, 5_000, 10_000, 20_000, 30_000),
     ),
     TrainConfig(
         name="pi05_libero_bsp_lora_h16",
@@ -903,6 +918,7 @@ _CONFIGS = [
         num_train_steps=30_000,
         save_interval=1_000,
         keep_period=10_000,
+        permanent_checkpoint_steps=(0, 5_000, 10_000, 20_000, 30_000),
     ),
     #
     # Fine-tuning Aloha configs.

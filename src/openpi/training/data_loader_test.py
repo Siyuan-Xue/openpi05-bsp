@@ -125,6 +125,7 @@ def test_libero_h16_configs_keep_baseline_and_bsp_assets_separate():
 
 
 def test_libero_h16_configs_use_the_same_jax_full_finetuning_recipe():
+    expected_milestones = (0, 5_000, 10_000, 20_000, 30_000)
     for name in ("pi05_libero_baseline_h16", "pi05_libero_bsp_h16"):
         config = _config.get_config(name)
 
@@ -134,6 +135,7 @@ def test_libero_h16_configs_use_the_same_jax_full_finetuning_recipe():
         assert config.num_train_steps == 30_000
         assert config.save_interval == 1_000
         assert config.keep_period == 10_000
+        assert config.permanent_checkpoint_steps == expected_milestones
         assert config.weight_loader.params_path == "gs://openpi-assets/checkpoints/pi05_base/params"
         assert config.pytorch_weight_path is None
         assert config.lr_schedule.warmup_steps == 10_000
@@ -171,6 +173,7 @@ def test_libero_h16_lora_configs_preserve_the_phase_one_recipe():
             "num_train_steps",
             "save_interval",
             "keep_period",
+            "permanent_checkpoint_steps",
         ):
             assert getattr(lora_config, field) == getattr(full_config, field)
         assert lora_config.weight_loader == full_config.weight_loader

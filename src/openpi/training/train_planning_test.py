@@ -2,6 +2,7 @@
 
 import unittest
 
+from openpi.training import train_planning as train_planning_module
 from openpi.training.train_planning import add_trees
 from openpi.training.train_planning import average_tree_sum
 from openpi.training.train_planning import optimizer_step_numbers
@@ -142,6 +143,46 @@ class OptimizerStepAndCheckpointTest(unittest.TestCase):
         self.assertEqual(resumed_steps.start, 10_001)
         self.assertEqual(resumed_steps.stop, 30_001)
         self.assertEqual(len(resumed_steps), 20_000)
+
+
+class CheckpointPreservationTest(unittest.TestCase):
+    def test_exact_phase_one_milestones_are_preserved_without_15k_or_25k(self):
+        self.assertTrue(
+            hasattr(train_planning_module, "should_keep_checkpoint"),
+            "train planning must expose the exact checkpoint preservation predicate",
+        )
+        permanent = (0, 5_000, 10_000, 20_000, 30_000)
+
+        kept = [
+            step
+            for step in (0, 1_000, 5_000, 10_000, 15_000, 20_000, 25_000, 30_000)
+            if train_planning_module.should_keep_checkpoint(
+                step,
+                permanent_steps=permanent,
+                keep_period=10_000,
+            )
+        ]
+
+        self.assertEqual(kept, [0, 5_000, 10_000, 20_000, 30_000])
+
+    def test_checkpoint_preservation_rejects_malformed_steps_and_periods(self):
+        self.assertTrue(
+            hasattr(train_planning_module, "should_keep_checkpoint"),
+            "train planning must expose the exact checkpoint preservation predicate",
+        )
+        cases = (
+            {"step": -1, "permanent_steps": (), "keep_period": None},
+            {"step": False, "permanent_steps": (), "keep_period": None},
+            {"step": 0, "permanent_steps": (-1,), "keep_period": None},
+            {"step": 0, "permanent_steps": (False,), "keep_period": None},
+            {"step": 0, "permanent_steps": (0, 0), "keep_period": None},
+            {"step": 0, "permanent_steps": (5_000, 0), "keep_period": None},
+            {"step": 0, "permanent_steps": (), "keep_period": 0},
+        )
+
+        for case in cases:
+            with self.subTest(case=case), self.assertRaises(ValueError):
+                train_planning_module.should_keep_checkpoint(**case)
 
 
 if __name__ == "__main__":
