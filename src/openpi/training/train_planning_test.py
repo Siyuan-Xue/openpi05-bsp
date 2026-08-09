@@ -146,16 +146,16 @@ class OptimizerStepAndCheckpointTest(unittest.TestCase):
 
 
 class CheckpointPreservationTest(unittest.TestCase):
-    def test_exact_phase_one_milestones_are_preserved_without_15k_or_25k(self):
+    def test_exact_phase_one_short10k_milestones_are_preserved(self):
         self.assertTrue(
             hasattr(train_planning_module, "should_keep_checkpoint"),
             "train planning must expose the exact checkpoint preservation predicate",
         )
-        permanent = (0, 5_000, 10_000, 20_000, 30_000)
+        permanent = (0, 1_000, 2_000, 5_000, 10_000)
 
         kept = [
             step
-            for step in (0, 1_000, 5_000, 10_000, 15_000, 20_000, 25_000, 30_000)
+            for step in (0, 1_000, 2_000, 3_000, 5_000, 9_000, 10_000)
             if train_planning_module.should_keep_checkpoint(
                 step,
                 permanent_steps=permanent,
@@ -163,7 +163,7 @@ class CheckpointPreservationTest(unittest.TestCase):
             )
         ]
 
-        self.assertEqual(kept, [0, 5_000, 10_000, 20_000, 30_000])
+        self.assertEqual(kept, [0, 1_000, 2_000, 5_000, 10_000])
 
     def test_checkpoint_preservation_rejects_malformed_steps_and_periods(self):
         self.assertTrue(

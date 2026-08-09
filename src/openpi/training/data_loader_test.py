@@ -125,14 +125,14 @@ def test_libero_h16_configs_keep_baseline_and_bsp_assets_separate():
 
 
 def test_libero_h16_configs_use_the_same_jax_full_finetuning_recipe():
-    expected_milestones = (0, 5_000, 10_000, 20_000, 30_000)
+    expected_milestones = (0, 1_000, 2_000, 5_000, 10_000)
     for name in ("pi05_libero_baseline_h16", "pi05_libero_bsp_h16"):
         config = _config.get_config(name)
 
         assert config.seed == 42
         assert config.batch_size == 256
         assert config.micro_batch_size == 1
-        assert config.num_train_steps == 30_000
+        assert config.num_train_steps == 10_000
         assert config.save_interval == 1_000
         assert config.keep_period == 10_000
         assert config.permanent_checkpoint_steps == expected_milestones
