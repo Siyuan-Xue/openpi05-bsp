@@ -89,7 +89,13 @@ export OPENPI_VENV="$BSP_WORK/venvs/openpi"
 export OPENPI_PY="$OPENPI_VENV/bin/python"
 export LIBERO_VENV="$BSP_WORK/venvs/libero-py38"
 export LIBERO_PY="$LIBERO_VENV/bin/python"
-export UV_BIN="$BSP_WORK/venvs/uv-0.11.32-bin/uv"
+export UV_VERSION=0.11.32
+export UV_BIN_DIR="$BSP_WORK/venvs/uv-$UV_VERSION-bin"
+export UV_BIN="$UV_BIN_DIR/uv"
+export UV_ARCHIVE_NAME=uv-x86_64-unknown-linux-gnu.tar.gz
+export UV_ARCHIVE="$BSP_WORK/staging/$UV_ARCHIVE_NAME"
+export UV_CHECKSUM_FILE="$UV_ARCHIVE.sha256"
+export UV_RELEASE_BASE="https://releases.astral.sh/github/uv/releases/download/$UV_VERSION"
 
 export OPENPI_DATA_HOME="$BSP_WORK/cache/openpi"
 export HF_HOME="$BSP_WORK/cache/huggingface"
@@ -152,15 +158,57 @@ test "$(git -C "$BSP_REPO_DIR/third_party/libero" rev-parse HEAD)" = \
 `-c http.version=HTTP/1.1` 重试；不能切换到未知 mirror 或浮动子模块 HEAD。
 
 环境版本是：uv 0.11.32、OpenPI CPython 3.11.9、LIBERO CPython 3.8.20、
-SciPy 1.15.3。uv 是后续所有环境命令的显式 bootstrap 前提：必须先通过组织批准的下载通道，
-把已核对 release checksum 的 uv 0.11.32 独立二进制解包到 `$UV_BIN`。本文不使用未经审计的
-远程脚本管道代替该供应链门禁。继续前先验证实际文件和版本：
+SciPy 1.15.3。uv 是后续所有环境命令的显式 bootstrap 前提。下面直接下载 Astral
+[immutable 0.11.32 release](https://github.com/astral-sh/uv/releases/tag/0.11.32) 的 x86-64
+Linux 归档和官方 checksum；同时把官方 checksum 的预期值固定在 runbook 中，避免只信任同一次
+下载。先在独立 staging 目录核验，再只抽取 `uv` 到项目目录；不执行远程安装脚本，也不修改
+shell profile 或系统 Python：
 
 ```bash
+export EXPECTED_UV_SHA256=aab924fd522efd06f1c5f3b93a243864fc453132c94b2dc49f1371b528a4b967
+
+test "$UV_VERSION" = 0.11.32
+test "$UV_BIN_DIR" = /root/openpi-bsp-work/venvs/uv-0.11.32-bin
+test "$UV_ARCHIVE" = \
+  /root/openpi-bsp-work/staging/uv-x86_64-unknown-linux-gnu.tar.gz
+test ! -e "$UV_BIN_DIR"
+test ! -e "$UV_ARCHIVE"
+test ! -e "$UV_CHECKSUM_FILE"
+mkdir -p "$BSP_WORK/staging" "$BSP_WORK/venvs" "$LOG_BASE"
+
+curl --proto '=https' --tlsv1.2 -fL \
+  --connect-timeout 15 --max-time 600 \
+  "$UV_RELEASE_BASE/$UV_ARCHIVE_NAME" \
+  -o "$UV_ARCHIVE"
+curl --proto '=https' --tlsv1.2 -fL \
+  --connect-timeout 15 --max-time 60 \
+  "$UV_RELEASE_BASE/$UV_ARCHIVE_NAME.sha256" \
+  -o "$UV_CHECKSUM_FILE"
+
+test "$(awk '{print $1}' "$UV_CHECKSUM_FILE")" = "$EXPECTED_UV_SHA256"
+test "$(awk '{print $2}' "$UV_CHECKSUM_FILE")" = "$UV_ARCHIVE_NAME"
+(
+  cd "$(dirname "$UV_ARCHIVE")"
+  sha256sum -c "$(basename "$UV_CHECKSUM_FILE")"
+)
+printf '%s  %s\n' "$EXPECTED_UV_SHA256" "$UV_ARCHIVE_NAME" \
+  | tee "$LOG_BASE/uv-$UV_VERSION-archive.sha256"
+
+mkdir "$UV_BIN_DIR"
+tar -xzf "$UV_ARCHIVE" \
+  -C "$UV_BIN_DIR" \
+  --strip-components=1 \
+  uv-x86_64-unknown-linux-gnu/uv
+
 test -x "$UV_BIN"
-test "$("$UV_BIN" --version | awk '{print $2}')" = 0.11.32
+test "$("$UV_BIN" --version | awk '{print $2}')" = "$UV_VERSION"
 printf 'uv_bootstrap=PASS %s\n' "$("$UV_BIN" --version)"
 ```
+
+若组织网络禁止 `releases.astral.sh`，先在可信联网机器下载这两个同名文件并核验上述硬编码
+SHA256，再原样上传到 `$BSP_WORK/staging`，从 checksum 校验块继续；不要改用浮动 `latest`、
+未知镜像或全局 `pip install`。若 `$UV_BIN_DIR` 已存在，则跳过创建/抽取，只执行最后三行版本
+门禁；路径中出现半成品时停止人工检查，不覆盖。
 
 首次创建两个 Python 环境时：
 

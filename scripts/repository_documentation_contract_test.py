@@ -120,6 +120,21 @@ class RepositoryDocumentationContractTest(unittest.TestCase):
         ):
             self.assertIn(required, runbook)
 
+    def test_host_runbook_bootstraps_pinned_uv_without_remote_script_execution(self):
+        runbook = _read(_ROOT / "docs/pi05_libero_bsp_phase1_server.md")
+        for required in (
+            "UV_VERSION=0.11.32",
+            "https://releases.astral.sh/github/uv/releases/download/$UV_VERSION",
+            "uv-x86_64-unknown-linux-gnu.tar.gz",
+            "aab924fd522efd06f1c5f3b93a243864fc453132c94b2dc49f1371b528a4b967",
+            '"$UV_RELEASE_BASE/$UV_ARCHIVE_NAME.sha256"',
+            'sha256sum -c "$(basename "$UV_CHECKSUM_FILE")"',
+            "--strip-components=1",
+            'test -x "$UV_BIN"',
+        ):
+            self.assertIn(required, runbook)
+        self.assertNotRegex(runbook, r"curl[^\n]*\|\s*sh\b")
+
     def test_architecture_deletion_patterns_cover_every_removed_path(self):
         architecture = _read(_ARCHITECTURE)
         patterns = _DELETION_PATTERN.findall(architecture)
