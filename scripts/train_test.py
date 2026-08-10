@@ -11,6 +11,7 @@ import numpy as np
 import optax
 
 from openpi.models import model as _model
+from openpi.shared import array_typing as at
 from openpi.training import config as _config
 from openpi.training import train_planning
 from openpi.training import utils as training_utils
@@ -30,11 +31,12 @@ class _DeterministicLinearModelConfig(_model.BaseModelConfig):
         return _DeterministicLinearModel()
 
     def inputs_spec(self, *, batch_size=1):
-        observation = _model.Observation(
-            images={"debug": jax.ShapeDtypeStruct((batch_size, 1, 1, 3), jnp.float32)},
-            image_masks={"debug": jax.ShapeDtypeStruct((batch_size,), jnp.bool_)},
-            state=jax.ShapeDtypeStruct((batch_size, 2), jnp.float32),
-        )
+        with at.disable_typechecking():
+            observation = _model.Observation(
+                images={"debug": jax.ShapeDtypeStruct((batch_size, 1, 1, 3), jnp.float32)},
+                image_masks={"debug": jax.ShapeDtypeStruct((batch_size,), jnp.bool_)},
+                state=jax.ShapeDtypeStruct((batch_size, 2), jnp.float32),
+            )
         actions = jax.ShapeDtypeStruct((batch_size, self.action_horizon, self.action_dim), jnp.float32)
         return observation, actions
 
