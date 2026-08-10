@@ -11,12 +11,32 @@ import numpy as np
 import optax
 
 from openpi.models import model as _model
-from openpi.models import pi0_config
 from openpi.training import config as _config
 from openpi.training import train_planning
 from openpi.training import utils as training_utils
 
 from . import train
+
+
+class _DeterministicLinearModelConfig(_model.BaseModelConfig):
+    """Bounded model and input shapes for CPU training smoke tests."""
+
+    @property
+    def model_type(self):
+        return _model.ModelType.PI0
+
+    def create(self, rng):
+        del rng
+        return _DeterministicLinearModel()
+
+    def inputs_spec(self, *, batch_size=1):
+        observation = _model.Observation(
+            images={"debug": jax.ShapeDtypeStruct((batch_size, 1, 1, 3), jnp.float32)},
+            image_masks={"debug": jax.ShapeDtypeStruct((batch_size,), jnp.bool_)},
+            state=jax.ShapeDtypeStruct((batch_size, 2), jnp.float32),
+        )
+        actions = jax.ShapeDtypeStruct((batch_size, self.action_horizon, self.action_dim), jnp.float32)
+        return observation, actions
 
 
 def _debug_config() -> _config.TrainConfig:
@@ -25,7 +45,8 @@ def _debug_config() -> _config.TrainConfig:
         name="debug",
         data=_config.FakeDataConfig(),
         batch_size=2,
-        model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
+        model=_DeterministicLinearModelConfig(action_dim=1, action_horizon=1, max_token_len=1),
+        num_workers=0,
         save_interval=100,
         overwrite=True,
         exp_name="debug",
