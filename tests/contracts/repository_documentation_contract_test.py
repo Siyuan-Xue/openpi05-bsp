@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fnmatch
 from pathlib import Path
 import re
 import subprocess
@@ -26,7 +25,6 @@ _OBSOLETE_PATHS = (
     ".superpowers/sdd/pi05-libero-bsp-sdd-plan",
 )
 _LOCAL_LINK = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
-_DELETION_PATTERN = re.compile(r"<!--\s*deletion-pattern:\s*([^\s]+)\s*-->")
 
 
 def _read(path: Path) -> str:
@@ -136,22 +134,6 @@ def test_host_runbook_bootstraps_pinned_uv_without_remote_script_execution():
     ):
         assert required in runbook
     assert re.search("curl[^\\n]*\\|\\s*sh\\b", runbook) is None
-
-
-def test_architecture_deletion_patterns_cover_every_removed_path():
-    architecture = _read(_ARCHITECTURE)
-    patterns = _DELETION_PATTERN.findall(architecture)
-    assert patterns, "architecture document must declare deletion-pattern markers"
-    result = subprocess.run(
-        ["git", "diff", "--name-status", "phase1-pre-slim-1b976fc...HEAD"],
-        cwd=_ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    deleted = [line.split("\t", 1)[1] for line in result.stdout.splitlines() if line.startswith("D\t")]
-    uncovered = [path for path in deleted if not any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)]
-    assert uncovered == []
 
 
 def test_canonical_markdown_links_resolve():

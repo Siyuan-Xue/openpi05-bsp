@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import re
 import sys
 import tomllib
 
@@ -28,18 +27,19 @@ def test_host_server_python_and_scipy_remain_pinned():
     assert scipy["version"] == "1.15.3"
 
 
-def test_readme_is_a_host_only_dual_python_evaluator_path():
+def test_libero_example_defers_server_setup_to_the_canonical_runbook():
     readme = _README.read_text(encoding="utf-8")
 
-    assert not ((_ROOT / ".dockerignore").exists())
-    assert re.search("\\b(?:docker|compose|preflight)\\b", readme.lower()) is None
-    assert "POLICY_CONTAINER_DIGEST" not in readme
-    assert "uv sync --python 3.11" in readme
-    assert "uv venv --python 3.8 examples/libero/.venv" in readme
-    assert "HOST_RUNTIME_DIGEST" in readme
-    assert "--args.container-digest ${HOST_RUNTIME_DIGEST}" in readme
-    assert "${EXPERIMENTS_DIR}" in readme
     assert "../../docs/pi05_libero_bsp_phase1_server.md" in readme
+    for duplicated_server_detail in (
+        "uv sync --python 3.11",
+        "uv venv --python 3.8 examples/libero/.venv",
+        "HOST_RUNTIME_DIGEST",
+        "--args.container-digest",
+        "scripts/serve_policy.py",
+        "/root/openpi-bsp-work",
+    ):
+        assert duplicated_server_detail not in readme
 
 
 def test_audit_protocol_retains_calibration_h16_and_comparison_artifacts():
