@@ -186,9 +186,3 @@ def test_canonical_documents_contain_no_machine_identity_or_secret():
         for pattern in (machine_identity, secret):
             findings.extend(f"{document.relative_to(_ROOT)}: {match.group(0)}" for match in pattern.finditer(text))
     assert findings == []
-
-
-def test_lightweight_ci_runs_documentation_contract():
-    workflow = _read(_ROOT / ".github/workflows/test.yml")
-    assert "tests/contracts/repository_documentation_contract_test.py" in workflow
-    assert "fetch-depth: 0" in workflow

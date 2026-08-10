@@ -151,9 +151,9 @@ def test_resume_begins_after_the_completed_checkpoint_boundary():
 
 
 def test_exact_phase_one_short10k_milestones_are_preserved():
-    assert hasattr(
-        train_planning_module, "should_keep_checkpoint"
-    ), "train planning must expose the exact checkpoint preservation predicate"
+    assert hasattr(train_planning_module, "should_keep_checkpoint"), (
+        "train planning must expose the exact checkpoint preservation predicate"
+    )
     permanent = (0, 1_000, 2_000, 5_000, 10_000)
 
     kept = [
@@ -194,9 +194,9 @@ def test_exact_phase_one_short10k_milestones_are_preserved():
     ],
 )
 def test_checkpoint_preservation_rejects_malformed_steps_and_periods(case, expected_match):
-    assert hasattr(
-        train_planning_module, "should_keep_checkpoint"
-    ), "train planning must expose the exact checkpoint preservation predicate"
+    assert hasattr(train_planning_module, "should_keep_checkpoint"), (
+        "train planning must expose the exact checkpoint preservation predicate"
+    )
 
     with pytest.raises(ValueError, match=expected_match):
         train_planning_module.should_keep_checkpoint(**case)

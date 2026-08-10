@@ -874,7 +874,7 @@ def _render_markdown(milestones: Sequence[Mapping[str, Any]]) -> str:
     lines = [
         "# π0.5 + LIBERO BSP 第一阶段固定里程碑比较",
         "",
-        ("该报告只比较 0k、1k、2k、5k、10k 五个预先固定的 checkpoint；" "主指标为四套件分层宏平均成功率。"),
+        ("该报告只比较 0k、1k、2k、5k、10k 五个预先固定的 checkpoint；主指标为四套件分层宏平均成功率。"),
         "",
         "| optimizer step | baseline | BSP | BSP-baseline | paired bootstrap 95% CI |",
         "|---:|---:|---:|---:|:---|",
@@ -972,8 +972,7 @@ def _render_svg(milestones: Sequence[Mapping[str, Any]]) -> str:
                 width - 100, 20
             ),
             (
-                '<text x="{}" y="{}" text-anchor="middle" font-family="sans-serif" '
-                'font-size="12">optimizer step</text>'
+                '<text x="{}" y="{}" text-anchor="middle" font-family="sans-serif" font-size="12">optimizer step</text>'
             ).format(left + plot_width / 2, height - 10),
             "</svg>",
         ]

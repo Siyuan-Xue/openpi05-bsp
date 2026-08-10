@@ -258,7 +258,7 @@ def _fit_full_episode(actions: np.ndarray, settings: BspSettings) -> tuple[np.nd
     if last_error is None:
         raise ValueError("FITPACK did not produce a candidate BSP knot vector")
     raise ValueError(
-        "BSP fitting exceeded max_abs_error " f"{settings.max_abs_error}: best candidate error was {last_error}"
+        f"BSP fitting exceeded max_abs_error {settings.max_abs_error}: best candidate error was {last_error}"
     )
 
 

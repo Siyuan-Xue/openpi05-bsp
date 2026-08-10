@@ -79,9 +79,7 @@ def _validate_bsp_action_stats(stats: normalize.NormStats) -> None:
     knot_q99 = float(q99[_BSP_KNOT_CHANNEL])
     knot_span = knot_q99 - knot_q01
     if not np.isfinite(knot_span) or knot_span <= _MIN_BSP_KNOT_QUANTILE_SPAN:
-        raise ValueError(
-            "BSP knot quantile interval is degenerate: " f"q01={knot_q01}, q99={knot_q99}, span={knot_span}"
-        )
+        raise ValueError(f"BSP knot quantile interval is degenerate: q01={knot_q01}, q99={knot_q99}, span={knot_span}")
 
 
 def compare_norm_stats_assets(

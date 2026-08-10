@@ -188,8 +188,7 @@ def _episode_actions(dataset: Any, start: int, end: int, action_key: str) -> np.
         raise ValueError(f"LeRobot hf_dataset does not contain usable raw '{action_key}' actions") from error
     if actions.shape != (end - start, BspSettings().action_dim):
         raise ValueError(
-            f"LeRobot episode actions must have shape ({end - start}, {BspSettings().action_dim}), "
-            f"got {actions.shape}"
+            f"LeRobot episode actions must have shape ({end - start}, {BspSettings().action_dim}), got {actions.shape}"
         )
     return actions
 
