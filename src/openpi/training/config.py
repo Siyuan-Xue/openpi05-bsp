@@ -230,14 +230,12 @@ class TrainConfig:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
         if any(
-            isinstance(step, bool) or not isinstance(step, int) or step < 0
-            for step in self.permanent_checkpoint_steps
+            isinstance(step, bool) or not isinstance(step, int) or step < 0 for step in self.permanent_checkpoint_steps
         ):
             raise ValueError("permanent_checkpoint_steps must contain only nonnegative integers")
-        if (
-            tuple(sorted(self.permanent_checkpoint_steps)) != self.permanent_checkpoint_steps
-            or len(set(self.permanent_checkpoint_steps)) != len(self.permanent_checkpoint_steps)
-        ):
+        if tuple(sorted(self.permanent_checkpoint_steps)) != self.permanent_checkpoint_steps or len(
+            set(self.permanent_checkpoint_steps)
+        ) != len(self.permanent_checkpoint_steps):
             raise ValueError("permanent_checkpoint_steps must be unique and in ascending order")
 
 

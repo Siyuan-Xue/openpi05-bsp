@@ -7,9 +7,9 @@ import pytest
 
 from openpi.models import pi0_config
 from openpi.policies import libero_policy
-from openpi.training.bsp import BspCache
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
+from openpi.training.bsp import BspCache
 
 
 def test_torch_data_loader():

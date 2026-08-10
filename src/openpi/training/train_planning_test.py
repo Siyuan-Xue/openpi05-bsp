@@ -74,19 +74,21 @@ class GradientAccumulationPlanTest(unittest.TestCase):
         ]
 
         for batch_size, micro_batch_size, process_count, device_count in cases:
-            with self.subTest(
-                batch_size=batch_size,
-                micro_batch_size=micro_batch_size,
-                process_count=process_count,
-                device_count=device_count,
+            with (
+                self.subTest(
+                    batch_size=batch_size,
+                    micro_batch_size=micro_batch_size,
+                    process_count=process_count,
+                    device_count=device_count,
+                ),
+                self.assertRaises(ValueError),
             ):
-                with self.assertRaises(ValueError):
-                    plan_gradient_accumulation(
-                        batch_size=batch_size,
-                        micro_batch_size=micro_batch_size,
-                        process_count=process_count,
-                        device_count=device_count,
-                    )
+                plan_gradient_accumulation(
+                    batch_size=batch_size,
+                    micro_batch_size=micro_batch_size,
+                    process_count=process_count,
+                    device_count=device_count,
+                )
 
 
 class GradientTreeTest(unittest.TestCase):

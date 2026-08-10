@@ -25,14 +25,13 @@ import tyro
 
 from openpi.training.bsp import load_sidecar_cache
 from openpi.training.bsp import write_sidecar_cache
-from openpi.training.bsp_dataset import BspLeRobotDataset
 from openpi.training.bsp_dataset import LIBERO_REPO_ID
 from openpi.training.bsp_dataset import LIBERO_REVISION
+from openpi.training.bsp_dataset import BspLeRobotDataset
 from openpi.training.bsp_dataset import build_lerobot_bsp_cache
 from openpi.training.bsp_dataset import make_lerobot_cache_manifest
 from openpi.training.bsp_dataset import validate_lerobot_dataset
 from openpi.training.bsp_dataset import verify_lerobot_bsp_cache
-
 
 _REQUIRED_SCIPY_VERSION = "1.15.3"
 _VERIFICATION_FLAGS = (
@@ -155,9 +154,7 @@ def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     """Publish one JSON artifact atomically beside its persistent cache."""
     output_path = path.expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{output_path.name}.", suffix=".tmp", dir=output_path.parent
-    )
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{output_path.name}.", suffix=".tmp", dir=output_path.parent)
     temporary_path = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as output:

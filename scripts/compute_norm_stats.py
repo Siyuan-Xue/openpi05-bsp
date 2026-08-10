@@ -20,7 +20,6 @@ import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.transforms as transforms
 
-
 _STATE_STATS_RTOL = 1e-7
 _STATE_STATS_ATOL = 1e-8
 _STATE_FIELDS = ("mean", "std", "q01", "q99")
@@ -81,8 +80,7 @@ def _validate_bsp_action_stats(stats: normalize.NormStats) -> None:
     knot_span = knot_q99 - knot_q01
     if not np.isfinite(knot_span) or knot_span <= _MIN_BSP_KNOT_QUANTILE_SPAN:
         raise ValueError(
-            "BSP knot quantile interval is degenerate: "
-            f"q01={knot_q01}, q99={knot_q99}, span={knot_span}"
+            "BSP knot quantile interval is degenerate: " f"q01={knot_q01}, q99={knot_q99}, span={knot_span}"
         )
 
 

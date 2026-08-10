@@ -38,9 +38,9 @@ def test_settings_are_fixed_to_the_libero_bsp_protocol():
         settings.degree = 2
 
     shared_manifest_parameters = dict(libero_eval.BSP_PARAMETERS)
-    assert {
-        key: shared_manifest_parameters[key] for key in dataclasses.asdict(settings)
-    } == dataclasses.asdict(settings)
+    assert {key: shared_manifest_parameters[key] for key in dataclasses.asdict(settings)} == dataclasses.asdict(
+        settings
+    )
     assert shared_manifest_parameters["projection_epsilon"] == 1e-6
     assert shared_manifest_parameters["model_action_dim"] == 32
     assert shared_manifest_parameters["model_action_horizon"] == 16
@@ -61,9 +61,7 @@ def test_cache_protocol_and_evaluation_manifest_share_fixed_knot_semantics():
         "projection_epsilon",
     )
 
-    assert {key: libero_eval.BSP_PARAMETERS[key] for key in shared_keys} == {
-        key: protocol[key] for key in shared_keys
-    }
+    assert {key: libero_eval.BSP_PARAMETERS[key] for key in shared_keys} == {key: protocol[key] for key in shared_keys}
 
 
 def test_fit_requires_error_strictly_below_the_threshold(monkeypatch):
@@ -145,7 +143,7 @@ def test_knot_projection_repairs_only_descending_values():
 )
 def test_decode_rejects_invalid_target_parameters(target):
     """Invalid learned parameters must fail rather than extrapolate an action."""
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"(?:BSP target|Invalid B-spline)"):
         decode_actions(target)
 
 
@@ -159,7 +157,7 @@ def test_decode_rejects_invalid_target_parameters(target):
 )
 def test_episode_build_rejects_short_malformed_and_nonfinite_actions(actions):
     """Bad episodes must be rejected before FITPACK sees ambiguous input."""
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"BSP (?:episode actions|cubic fitting)"):
         build_episode_targets(actions)
 
 

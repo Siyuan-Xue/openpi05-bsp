@@ -6,7 +6,6 @@ import ast
 from pathlib import Path
 import unittest
 
-
 _REPOSITORY = Path(__file__).resolve().parents[1]
 _EXPECTED_REVISION = "v2.0"
 _PHASE_ONE_CONFIG_NAMES = {
@@ -20,7 +19,7 @@ _PHASE_ONE_CONFIG_NAMES = {
 def _module_assignment(path: Path, name: str):
     module = ast.parse(path.read_text())
     for node in module.body:
-        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+        if isinstance(node, ast.Assign | ast.AnnAssign):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             if any(isinstance(target, ast.Name) and target.id == name for target in targets):
                 return ast.literal_eval(node.value)
@@ -84,6 +83,7 @@ class LiberoRevisionContractTest(unittest.TestCase):
             f"export LIBERO_DATASET_REVISION={_EXPECTED_REVISION}",
             (_REPOSITORY / "examples/libero/README.md").read_text(),
         )
+
 
 if __name__ == "__main__":
     unittest.main()

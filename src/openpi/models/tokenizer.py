@@ -32,9 +32,7 @@ class PaligemmaTokenizer:
             tokens += padding
         else:
             if tokens_len > self._max_len:
-                logging.warning(
-                    "Token length (%d) exceeds max length (%d), truncating. ", tokens_len, self._max_len
-                )
+                logging.warning("Token length (%d) exceeds max length (%d), truncating. ", tokens_len, self._max_len)
             tokens = tokens[: self._max_len]
             mask = [True] * self._max_len
         return np.asarray(tokens), np.asarray(mask)

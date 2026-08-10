@@ -8,13 +8,13 @@ import pytest
 
 from openpi.training.bsp import BspCache
 import openpi.training.bsp_dataset as bsp_dataset
-from openpi.training.bsp_dataset import BspLeRobotDataset
 from openpi.training.bsp_dataset import LIBERO_REVISION
+from openpi.training.bsp_dataset import BspLeRobotDataset
 from openpi.training.bsp_dataset import LeRobotDatasetMetadata
 from openpi.training.bsp_dataset import build_lerobot_bsp_cache
 from openpi.training.bsp_dataset import make_lerobot_cache_manifest
-from openpi.training.bsp_dataset import verify_lerobot_bsp_cache
 from openpi.training.bsp_dataset import validate_lerobot_dataset
+from openpi.training.bsp_dataset import verify_lerobot_bsp_cache
 
 
 class TinyHfDataset:
@@ -59,11 +59,7 @@ class TensorLikeActionRows(list):
 class TensorFormattedTinyHfDataset(TinyHfDataset):
     def __getitem__(self, index):
         if isinstance(index, slice):
-            return {
-                "actions": TensorLikeActionRows(
-                    TensorLikeActionRow(row) for row in self._actions[index]
-                )
-            }
+            return {"actions": TensorLikeActionRows(TensorLikeActionRow(row) for row in self._actions[index])}
         return {"actions": TensorLikeActionRow(self._actions[index])}
 
 
@@ -148,9 +144,7 @@ def test_cache_build_rejects_nonfinite_tensor_like_episode_actions():
 def test_wrapper_preserves_standard_sample_and_replaces_only_mapped_actions():
     """Copying observations or using the frame index as a target index breaks the wrapper contract."""
     dataset = TinyLeRobotDataset()
-    targets = np.stack(
-        [np.full((16, 8), target_index, dtype=np.float32) for target_index in range(3)]
-    )
+    targets = np.stack([np.full((16, 8), target_index, dtype=np.float32) for target_index in range(3)])
     cache = BspCache(
         targets=targets,
         mapping=np.asarray([2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2], dtype=np.uint32),

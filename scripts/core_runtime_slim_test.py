@@ -4,7 +4,6 @@ import ast
 import pathlib
 import unittest
 
-
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CONFIG = _ROOT / "src/openpi/training/config.py"
 
@@ -45,7 +44,7 @@ def _call_keyword(call: ast.Call, name: str) -> ast.expr:
 
 def _train_configs() -> dict[str, ast.Call]:
     value = _assignment(_tree(_CONFIG), "_CONFIGS")
-    if not isinstance(value, (ast.List, ast.Tuple)):
+    if not isinstance(value, ast.List | ast.Tuple):
         raise AssertionError("_CONFIGS must be a literal sequence")
     configs = {}
     for element in value.elts:
@@ -163,7 +162,7 @@ class CoreRuntimeSlimContractTest(unittest.TestCase):
 
     def test_data_loader_supports_only_lerobot_and_bsp_paths(self):
         loader_tree = _tree(_ROOT / "src/openpi/training/data_loader.py")
-        names = {node.name for node in ast.walk(loader_tree) if isinstance(node, (ast.ClassDef, ast.FunctionDef))}
+        names = {node.name for node in ast.walk(loader_tree) if isinstance(node, ast.ClassDef | ast.FunctionDef)}
         self.assertIn("create_torch_dataset", names)
         self.assertIn("BspLeRobotDataset", (_ROOT / "src/openpi/training/data_loader.py").read_text())
         self.assertNotIn("create_rlds_dataset", names)

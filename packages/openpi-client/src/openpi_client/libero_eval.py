@@ -380,9 +380,7 @@ def run_episode_with_retries(
                 infrastructure_history=infrastructure_history,
             )
         except InfrastructureFailure as error:
-            infrastructure_history.append(
-                {"attempt": attempt_number, "kind": error.kind, "error": str(error)}
-            )
+            infrastructure_history.append({"attempt": attempt_number, "kind": error.kind, "error": str(error)})
             if attempt_number <= infrastructure_retries:
                 continue
             return EpisodeRecord.infrastructure_incomplete(
@@ -451,9 +449,7 @@ def aggregate_records(
                 "eligible_episodes": eligible,
                 "successes": successes,
                 "failures": eligible - successes,
-                "incomplete_infrastructure_count": sum(
-                    not record.include_in_success_rate for record in suite_records
-                ),
+                "incomplete_infrastructure_count": sum(not record.include_in_success_rate for record in suite_records),
                 "success_rate": _rate(successes, eligible),
                 "task_macro_success_rate": sum(task_rates) / len(task_rates) if task_rates else None,
             }
@@ -522,15 +518,14 @@ class EvaluationManifest:
         missing = sorted(key for key, value in required.items() if not value)
         if missing:
             raise ValueError(f"Evaluation manifest is missing required identities: {missing}")
-        if not isinstance(self.code_sha, str) or re.fullmatch(
-            r"(?:[0-9a-f]{40}|[0-9a-f]{64})", self.code_sha
-        ) is None:
+        if not isinstance(self.code_sha, str) or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", self.code_sha) is None:
             raise ValueError("Evaluation code_sha must be a lowercase 40- or 64-character Git SHA")
         if self.dataset_revision != "v2.0":
             raise ValueError("Physical Intelligence LIBERO evaluation requires dataset revision v2.0")
-        if not isinstance(self.container_digest, str) or re.fullmatch(
-            r"sha256:[0-9a-f]{64}", self.container_digest
-        ) is None:
+        if (
+            not isinstance(self.container_digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", self.container_digest) is None
+        ):
             raise ValueError("Evaluation container_digest must be a lowercase sha256 digest")
         if isinstance(self.checkpoint_step, bool) or not isinstance(self.checkpoint_step, int):
             raise ValueError("Evaluation checkpoint_step must be an integer")
@@ -550,10 +545,7 @@ class EvaluationManifest:
             raise ValueError("bsp_cache_hash must be the lowercase SHA256 of the actual sidecar NPZ")
         if self.bsp_cache_manifest_fingerprint is not None and (
             len(self.bsp_cache_manifest_fingerprint) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in self.bsp_cache_manifest_fingerprint
-            )
+            or any(character not in "0123456789abcdef" for character in self.bsp_cache_manifest_fingerprint)
         ):
             raise ValueError("bsp_cache_manifest_fingerprint must be a lowercase SHA256")
         if not self.bsp_parameters:

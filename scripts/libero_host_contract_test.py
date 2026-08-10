@@ -9,7 +9,6 @@ import sys
 import tomllib
 import unittest
 
-
 _ROOT = Path(__file__).resolve().parents[1]
 _README = _ROOT / "examples" / "libero" / "README.md"
 sys.path.insert(0, str(_ROOT / "packages" / "openpi-client" / "src"))
@@ -33,7 +32,7 @@ def _function_parameters(path: Path, function_name: str) -> set[str]:
     function = next(
         node
         for node in module.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function_name
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == function_name
     )
     arguments = [*function.args.posonlyargs, *function.args.args, *function.args.kwonlyargs]
     return {argument.arg.replace("_", "-") for argument in arguments}
@@ -271,11 +270,7 @@ class LiberoHostContractTest(unittest.TestCase):
 
         train_tree = ast.parse((_ROOT / "scripts" / "train.py").read_text(encoding="utf-8"))
         calls = [node for node in ast.walk(train_tree) if isinstance(node, ast.Call)]
-        call_names = {
-            node.func.attr
-            for node in calls
-            if isinstance(node.func, ast.Attribute)
-        }
+        call_names = {node.func.attr for node in calls if isinstance(node.func, ast.Attribute)}
         self.assertTrue({"initialize_checkpoint_dir", "save_state", "should_save_checkpoint"}.issubset(call_names))
         initialize = next(
             call
@@ -283,7 +278,9 @@ class LiberoHostContractTest(unittest.TestCase):
             if isinstance(call.func, ast.Attribute) and call.func.attr == "initialize_checkpoint_dir"
         )
         initialize_keywords = {keyword.arg for keyword in initialize.keywords}
-        self.assertTrue({"keep_period", "permanent_checkpoint_steps", "overwrite", "resume"}.issubset(initialize_keywords))
+        self.assertTrue(
+            {"keep_period", "permanent_checkpoint_steps", "overwrite", "resume"}.issubset(initialize_keywords)
+        )
         should_save = next(
             call
             for call in calls

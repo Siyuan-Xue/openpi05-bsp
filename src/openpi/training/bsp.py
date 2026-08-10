@@ -33,6 +33,7 @@ dependency.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import dataclasses
 import hashlib
 import json
@@ -40,10 +41,8 @@ import os
 from pathlib import Path
 import tempfile
 from typing import Any
-from typing import Mapping
 
 import numpy as np
-
 
 _CACHE_FORMAT_VERSION = 2
 _KNOT_PROJECTION_EPSILON = 1e-6
@@ -86,9 +85,7 @@ class BspSettings:
             "decoded_actions": 8,
         }
         actual = dataclasses.asdict(self)
-        mismatches = {
-            key: (actual[key], value) for key, value in expected.items() if actual[key] != value
-        }
+        mismatches = {key: (actual[key], value) for key, value in expected.items() if actual[key] != value}
         if mismatches:
             raise ValueError(f"BSP protocol settings are fixed; received incompatible values: {mismatches}")
         if self.target_rows != self.chunk_size + 2 * self.degree:
@@ -164,9 +161,7 @@ class BspCacheManifest:
 
 
 def _fingerprint_manifest(source_json: str, protocol_json: str) -> str:
-    return hashlib.sha256(
-        f"bsp-cache-v{_CACHE_FORMAT_VERSION}\n{protocol_json}\n{source_json}".encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256(f"bsp-cache-v{_CACHE_FORMAT_VERSION}\n{protocol_json}\n{source_json}".encode()).hexdigest()
 
 
 def make_cache_manifest(source: Mapping[str, Any], settings: BspSettings | None = None) -> BspCacheManifest:
@@ -232,9 +227,7 @@ def project_knots(knots: np.ndarray) -> np.ndarray:
 def _validate_episode_actions(actions: np.ndarray, settings: BspSettings) -> np.ndarray:
     array = np.asarray(actions, dtype=np.float64)
     if array.ndim != 2 or array.shape[1] != settings.action_dim:
-        raise ValueError(
-            f"BSP episode actions must have shape (frames, {settings.action_dim}), got {array.shape}"
-        )
+        raise ValueError(f"BSP episode actions must have shape (frames, {settings.action_dim}), got {array.shape}")
     if array.shape[0] < settings.degree + 1:
         raise ValueError(f"BSP cubic fitting requires at least {settings.degree + 1} action frames")
     if not np.isfinite(array).all():
@@ -242,9 +235,7 @@ def _validate_episode_actions(actions: np.ndarray, settings: BspSettings) -> np.
     return array
 
 
-def _fit_full_episode(
-    actions: np.ndarray, settings: BspSettings
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _fit_full_episode(actions: np.ndarray, settings: BspSettings) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Fit the entire episode with FITPACK's adaptive knot generator."""
     # Import lazily so static tooling can inspect this module without SciPy installed.
     from scipy.interpolate import generate_knots
@@ -267,8 +258,7 @@ def _fit_full_episode(
     if last_error is None:
         raise ValueError("FITPACK did not produce a candidate BSP knot vector")
     raise ValueError(
-        "BSP fitting exceeded max_abs_error "
-        f"{settings.max_abs_error}: best candidate error was {last_error}"
+        "BSP fitting exceeded max_abs_error " f"{settings.max_abs_error}: best candidate error was {last_error}"
     )
 
 
@@ -291,9 +281,7 @@ def build_episode_targets_with_artifacts(
     targets: list[np.ndarray] = []
     starts: list[float] = []
     for start_index in range(0, unique_knots.size - 1, settings.stride):
-        knot_rows = pad_segment_rows(
-            full_knots[start_index : start_index + settings.target_rows], settings.target_rows
-        )
+        knot_rows = pad_segment_rows(full_knots[start_index : start_index + settings.target_rows], settings.target_rows)
         control_rows = pad_segment_rows(
             controls[start_index : start_index + settings.target_rows], settings.target_rows
         )

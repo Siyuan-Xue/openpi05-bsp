@@ -2,8 +2,8 @@
 
 import datetime as dt
 import json
-import types
 from pathlib import Path
+import types
 
 import pytest
 import tyro

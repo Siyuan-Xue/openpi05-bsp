@@ -48,9 +48,7 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
         while True:
             try:
                 headers = {"Authorization": f"Api-Key {self._api_key}"} if self._api_key else None
-                timeout_kwargs = (
-                    {} if deadline is None else {"open_timeout": max(0.001, deadline - time.monotonic())}
-                )
+                timeout_kwargs = {} if deadline is None else {"open_timeout": max(0.001, deadline - time.monotonic())}
                 conn = websockets.sync.client.connect(
                     self._uri,
                     compression=None,
@@ -60,9 +58,7 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
                 )
                 try:
                     metadata_response = (
-                        conn.recv()
-                        if deadline is None
-                        else conn.recv(timeout=max(0.001, deadline - time.monotonic()))
+                        conn.recv() if deadline is None else conn.recv(timeout=max(0.001, deadline - time.monotonic()))
                     )
                     metadata = msgpack_numpy.unpackb(metadata_response)
                 except Exception:
@@ -81,9 +77,7 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
         data = self._packer.pack(obs)
         self._ws.send(data)
         response = (
-            self._ws.recv()
-            if self._inference_timeout is None
-            else self._ws.recv(timeout=self._inference_timeout)
+            self._ws.recv() if self._inference_timeout is None else self._ws.recv(timeout=self._inference_timeout)
         )
         if isinstance(response, str):
             # we're expecting bytes; if the server sends a string, it's an error.

@@ -47,9 +47,7 @@ def plan_gradient_accumulation(
     _require_positive_integer("process_count", process_count)
     _require_positive_integer("device_count", device_count)
     if device_count % process_count != 0:
-        raise ValueError(
-            f"Device count {device_count} must be divisible by process count {process_count}."
-        )
+        raise ValueError(f"Device count {device_count} must be divisible by process count {process_count}.")
 
     resolved_micro_batch_size = batch_size if micro_batch_size is None else micro_batch_size
     _require_positive_integer("micro_batch_size", resolved_micro_batch_size)
@@ -62,9 +60,7 @@ def plan_gradient_accumulation(
     if batch_size % process_count != 0:
         raise ValueError(f"Batch size {batch_size} must be divisible by process count {process_count}.")
     if batch_size % resolved_micro_batch_size != 0:
-        raise ValueError(
-            f"Batch size {batch_size} must be divisible by micro-batch size {resolved_micro_batch_size}."
-        )
+        raise ValueError(f"Batch size {batch_size} must be divisible by micro-batch size {resolved_micro_batch_size}.")
     if resolved_micro_batch_size % device_count != 0:
         raise ValueError(
             f"Micro-batch size {resolved_micro_batch_size} must be divisible by device count {device_count}."
@@ -100,9 +96,7 @@ def optimizer_step_numbers(start_step: int, num_train_steps: int) -> range:
     if isinstance(num_train_steps, bool) or not isinstance(num_train_steps, int) or num_train_steps < 0:
         raise ValueError(f"num_train_steps must be a nonnegative integer, got {num_train_steps!r}")
     if start_step > num_train_steps:
-        raise ValueError(
-            f"Restored optimizer step {start_step} exceeds requested training steps {num_train_steps}."
-        )
+        raise ValueError(f"Restored optimizer step {start_step} exceeds requested training steps {num_train_steps}.")
     return range(start_step + 1, num_train_steps + 1)
 
 
@@ -127,10 +121,7 @@ def should_keep_checkpoint(
     """Return whether Orbax must preserve a checkpoint beyond ``max_to_keep``."""
     if isinstance(step, bool) or not isinstance(step, int) or step < 0:
         raise ValueError(f"step must be a nonnegative integer, got {step!r}")
-    if any(
-        isinstance(value, bool) or not isinstance(value, int) or value < 0
-        for value in permanent_steps
-    ):
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in permanent_steps):
         raise ValueError("permanent_steps must be unique nonnegative integers in ascending order")
     if tuple(sorted(permanent_steps)) != permanent_steps or len(set(permanent_steps)) != len(permanent_steps):
         raise ValueError("permanent_steps must be unique nonnegative integers in ascending order")

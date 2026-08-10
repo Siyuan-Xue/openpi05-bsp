@@ -161,11 +161,7 @@ def _file_sha256(path: Path) -> str:
 
 
 def _is_sha256(value: Any) -> bool:
-    return (
-        isinstance(value, str)
-        and len(value) == 64
-        and all(character in "0123456789abcdef" for character in value)
-    )
+    return isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
 
 
 def _require_fields(payload: Mapping[str, Any], fields: Sequence[str], *, label: str) -> None:
@@ -183,9 +179,7 @@ def _training_family(manifest: Mapping[str, Any]) -> str:
         if candidate_variant == variant and candidate_config == config_name
     ]
     if len(matches) != 1:
-        raise ComparisonError(
-            "{} manifest has unsupported phase-one config_name {}".format(variant, config_name)
-        )
+        raise ComparisonError("{} manifest has unsupported phase-one config_name {}".format(variant, config_name))
     return matches[0]
 
 
@@ -291,9 +285,7 @@ def classify_phase_one_manifests(
     """Identify baseline/BSP at all five fixed milestones using manifest contents only."""
     required_run_count = 2 * len(MILESTONES)
     if len(manifests) != required_run_count:
-        raise ComparisonError(
-            "Phase-one comparison requires exactly {} run manifests".format(required_run_count)
-        )
+        raise ComparisonError("Phase-one comparison requires exactly {} run manifests".format(required_run_count))
     classified: Dict[Tuple[str, int], Mapping[str, Any]] = {}
     for manifest in manifests:
         key = _validate_manifest(manifest)
@@ -309,9 +301,7 @@ def classify_phase_one_manifests(
     training_families = {_training_family(manifest) for manifest in manifests}
     if len(training_families) != 1:
         raise ComparisonError(
-            "All phase-one runs must use one training family; found {}".format(
-                sorted(training_families)
-            )
+            "All phase-one runs must use one training family; found {}".format(sorted(training_families))
         )
 
     normalized_checkpoints = [manifest["checkpoint"].rstrip("/") for manifest in manifests]
@@ -335,17 +325,11 @@ def classify_phase_one_manifests(
     return classified
 
 
-def _finite_number(
-    value: Any, *, label: str, nonnegative: bool = False, strictly_positive: bool = False
-) -> float:
+def _finite_number(value: Any, *, label: str, nonnegative: bool = False, strictly_positive: bool = False) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ComparisonError("{} must be numeric".format(label))
     number = float(value)
-    if (
-        not math.isfinite(number)
-        or (nonnegative and number < 0.0)
-        or (strictly_positive and number <= 0.0)
-    ):
+    if not math.isfinite(number) or (nonnegative and number < 0.0) or (strictly_positive and number <= 0.0):
         qualifier = " and positive" if strictly_positive else " and non-negative" if nonnegative else ""
         raise ComparisonError("{} must be finite{}".format(label, qualifier))
     return number
@@ -438,9 +422,7 @@ def _validate_episode(record: Mapping[str, Any], manifest: Mapping[str, Any]) ->
     if len(finite_timings) != record["replans"]:
         raise ComparisonError("Episode inference_ms length must equal replans")
     if finite_timings:
-        recorded_mean = _finite_number(
-            record["mean_inference_ms"], label="mean_inference_ms", nonnegative=True
-        )
+        recorded_mean = _finite_number(record["mean_inference_ms"], label="mean_inference_ms", nonnegative=True)
         expected_mean = sum(finite_timings) / len(finite_timings)
         if not math.isclose(recorded_mean, expected_mean, rel_tol=1e-12, abs_tol=1e-12):
             raise ComparisonError("Episode mean_inference_ms is inconsistent with inference_ms")
@@ -498,8 +480,7 @@ def _derive_summary(records: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
                 "failures": len(suite_records) - successes,
                 "incomplete_infrastructure_count": 0,
                 "success_rate": successes / len(suite_records),
-                "task_macro_success_rate": sum(row["success_rate"] for row in suite_tasks)
-                / len(suite_tasks),
+                "task_macro_success_rate": sum(row["success_rate"] for row in suite_tasks) / len(suite_tasks),
             }
         )
     suite_rates = [row["success_rate"] for row in suites]
@@ -795,9 +776,7 @@ def validate_diagnostics(
     p95 = _finite_number(
         bsp_diagnostics["p95_reconstruction_error"], label="p95 reconstruction error", nonnegative=True
     )
-    threshold = _finite_number(
-        bsp_diagnostics["max_error_threshold"], label="max error threshold", nonnegative=True
-    )
+    threshold = _finite_number(bsp_diagnostics["max_error_threshold"], label="max error threshold", nonnegative=True)
     if threshold != 0.002 or not maximum < 0.002 or mean > maximum or p95 > maximum:
         raise ComparisonError("BSP reconstruction requires the strict maximum error < 0.002")
     contents_sha = bsp_diagnostics["cache_contents_sha256"]
@@ -840,11 +819,7 @@ def validate_diagnostics(
             raise ComparisonError("Normalization state field {} must be equal".format(field))
     baseline_action_sha = norm_diagnostics["baseline_action_stats_sha256"]
     bsp_action_sha = norm_diagnostics["bsp_action_stats_sha256"]
-    if (
-        not _is_sha256(baseline_action_sha)
-        or not _is_sha256(bsp_action_sha)
-        or baseline_action_sha == bsp_action_sha
-    ):
+    if not _is_sha256(baseline_action_sha) or not _is_sha256(bsp_action_sha) or baseline_action_sha == bsp_action_sha:
         raise ComparisonError("Baseline/BSP action-stat SHA256 values must be valid and distinct")
     baseline_asset_dir = norm_diagnostics["baseline_asset_dir"]
     bsp_asset_dir = norm_diagnostics["bsp_asset_dir"]
@@ -899,10 +874,7 @@ def _render_markdown(milestones: Sequence[Mapping[str, Any]]) -> str:
     lines = [
         "# π0.5 + LIBERO BSP 第一阶段固定里程碑比较",
         "",
-        (
-            "该报告只比较 0k、1k、2k、5k、10k 五个预先固定的 checkpoint；"
-            "主指标为四套件分层宏平均成功率。"
-        ),
+        ("该报告只比较 0k、1k、2k、5k、10k 五个预先固定的 checkpoint；" "主指标为四套件分层宏平均成功率。"),
         "",
         "| optimizer step | baseline | BSP | BSP-baseline | paired bootstrap 95% CI |",
         "|---:|---:|---:|---:|:---|",
@@ -911,9 +883,7 @@ def _render_markdown(milestones: Sequence[Mapping[str, Any]]) -> str:
         lines.append(
             "| {checkpoint_step} | {baseline_four_suite_macro_success_rate:.6f} | "
             "{bsp_four_suite_macro_success_rate:.6f} | {bsp_minus_baseline:.6f} | "
-            "[{low:.6f}, {high:.6f}] |".format(
-                low=row["bootstrap_95_ci"][0], high=row["bootstrap_95_ci"][1], **row
-            )
+            "[{low:.6f}, {high:.6f}] |".format(low=row["bootstrap_95_ci"][0], high=row["bootstrap_95_ci"][1], **row)
         )
     lines.extend(
         [
@@ -962,9 +932,7 @@ def _render_svg(milestones: Sequence[Mapping[str, Any]]) -> str:
         value = tick / 5
         y_pos = y(value)
         elements.append(
-            '<line x1="{}" y1="{:.2f}" x2="{}" y2="{:.2f}" stroke="#dddddd"/>'.format(
-                left, y_pos, width - right, y_pos
-            )
+            '<line x1="{}" y1="{:.2f}" x2="{}" y2="{:.2f}" stroke="#dddddd"/>'.format(left, y_pos, width - right, y_pos)
         )
         elements.append(
             '<text x="{}" y="{:.2f}" text-anchor="end" font-family="sans-serif" font-size="12">{:.1f}</text>'.format(
@@ -976,15 +944,11 @@ def _render_svg(milestones: Sequence[Mapping[str, Any]]) -> str:
             '<line x1="{}" y1="{}" x2="{}" y2="{}" stroke="#222"/>'.format(
                 left, top + plot_height, width - right, top + plot_height
             ),
-            '<line x1="{}" y1="{}" x2="{}" y2="{}" stroke="#222"/>'.format(
-                left, top, left, top + plot_height
-            ),
+            '<line x1="{}" y1="{}" x2="{}" y2="{}" stroke="#222"/>'.format(left, top, left, top + plot_height),
             '<polyline points="{}" fill="none" stroke="#3b82f6" stroke-width="3"/>'.format(
                 html.escape(baseline_points)
             ),
-            '<polyline points="{}" fill="none" stroke="#ef4444" stroke-width="3"/>'.format(
-                html.escape(bsp_points)
-            ),
+            '<polyline points="{}" fill="none" stroke="#ef4444" stroke-width="3"/>'.format(html.escape(bsp_points)),
         ]
     )
     for index, row in enumerate(milestones):
@@ -998,9 +962,7 @@ def _render_svg(milestones: Sequence[Mapping[str, Any]]) -> str:
             (row["baseline_four_suite_macro_success_rate"], "#3b82f6"),
             (row["bsp_four_suite_macro_success_rate"], "#ef4444"),
         ):
-            elements.append(
-                '<circle cx="{:.2f}" cy="{:.2f}" r="4" fill="{}"/>'.format(x_pos, y(value), color)
-            )
+            elements.append('<circle cx="{:.2f}" cy="{:.2f}" r="4" fill="{}"/>'.format(x_pos, y(value), color))
     elements.extend(
         [
             '<text x="{}" y="{}" font-family="sans-serif" font-size="12" fill="#3b82f6">baseline</text>'.format(
@@ -1012,9 +974,7 @@ def _render_svg(milestones: Sequence[Mapping[str, Any]]) -> str:
             (
                 '<text x="{}" y="{}" text-anchor="middle" font-family="sans-serif" '
                 'font-size="12">optimizer step</text>'
-            ).format(
-                left + plot_width / 2, height - 10
-            ),
+            ).format(left + plot_width / 2, height - 10),
             "</svg>",
         ]
     )
@@ -1053,9 +1013,7 @@ def compare_phase_one(
     norm_comparison_file = Path(norm_comparison_path).expanduser().resolve()
     bsp_diagnostics = load_strict_json(bsp_diagnostics_file)
     norm_diagnostics = load_strict_json(norm_comparison_file)
-    reconstruction = validate_diagnostics(
-        [run.manifest for run in runs], bsp_diagnostics, norm_diagnostics
-    )
+    reconstruction = validate_diagnostics([run.manifest for run in runs], bsp_diagnostics, norm_diagnostics)
 
     all_task_rows: List[Mapping[str, Any]] = []
     all_suite_rows: List[Mapping[str, Any]] = []

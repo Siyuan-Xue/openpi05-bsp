@@ -21,7 +21,6 @@ from openpi_client import websocket_client_policy as _websocket_client_policy
 import tqdm
 import tyro
 
-
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256
 LIBERO_NATIVE_HZ = 10
@@ -47,7 +46,7 @@ class Args:
     # Benchmark protocol. `task_suite_name` retains the official example's CLI name.
     task_suite_name: str = "libero_spatial"
     # Omit for all ten tasks. A singleton such as `(0,)` enables the real EGL smoke run.
-    task_ids: Optional[Tuple[int, ...]] = None  # noqa: UP045 -- simulator client runs Python 3.8.
+    task_ids: Optional[Tuple[int, ...]] = None
     num_steps_wait: int = 10
     num_trials_per_task: int = 50
     eval_seed: int = 42
@@ -57,13 +56,13 @@ class Args:
 
     # Audit manifest identities. `code_sha=auto` reads the current checkout.
     policy_variant: str = "baseline"
-    expected_action_horizon: Optional[int] = None  # noqa: UP045 -- simulator client runs Python 3.8.
+    expected_action_horizon: Optional[int] = None
     config_name: str = ""
     checkpoint_step: int = 0
     code_sha: str = "auto"
     dataset_revision: str = "v2.0"
-    bsp_cache_hash: Optional[str] = None  # noqa: UP045 -- simulator client runs Python 3.8.
-    bsp_cache_manifest_fingerprint: Optional[str] = None  # noqa: UP045 -- Python 3.8.
+    bsp_cache_hash: Optional[str] = None
+    bsp_cache_manifest_fingerprint: Optional[str] = None
     norm_hash: str = ""
     checkpoint: str = ""
     container_digest: str = ""
@@ -215,9 +214,7 @@ def _make_manifest(
 def _ensure_new_run_directory(output_dir: Path) -> None:
     collisions = sorted(path.name for path in output_dir.iterdir()) if output_dir.is_dir() else []
     if collisions:
-        raise FileExistsError(
-            f"Evaluation output directory is not empty ({collisions}); use a unique output_dir"
-        )
+        raise FileExistsError(f"Evaluation output directory is not empty ({collisions}); use a unique output_dir")
 
 
 def _initial_state_fingerprint(initial_state) -> str:
@@ -230,9 +227,7 @@ def _prepare_observation(obs, task_description: str, resize_size: int) -> tuple[
     image = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
     wrist_image = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
     image = image_tools.convert_to_uint8(image_tools.resize_with_pad(image, resize_size, resize_size))
-    wrist_image = image_tools.convert_to_uint8(
-        image_tools.resize_with_pad(wrist_image, resize_size, resize_size)
-    )
+    wrist_image = image_tools.convert_to_uint8(image_tools.resize_with_pad(wrist_image, resize_size, resize_size))
     request = {
         "observation/image": image,
         "observation/wrist_image": wrist_image,
@@ -421,9 +416,7 @@ def eval_libero(args: Args) -> dict:
         for suite_name in suites:
             task_suite = _get_benchmark_suite(suite_name)
             if task_suite.n_tasks != EXPECTED_TASKS_PER_SUITE:
-                raise ValueError(
-                    f"Expected {EXPECTED_TASKS_PER_SUITE} tasks in {suite_name}, got {task_suite.n_tasks}"
-                )
+                raise ValueError(f"Expected {EXPECTED_TASKS_PER_SUITE} tasks in {suite_name}, got {task_suite.n_tasks}")
             logging.info("Evaluating suite %s", suite_name)
 
             for task_id in tqdm.tqdm(task_ids, desc=suite_name):
@@ -451,7 +444,14 @@ def eval_libero(args: Args) -> dict:
                             init_state_fingerprint=_initial_state_fingerprint(initial_state),
                         )
 
-                        def attempt(_attempt_number):
+                        def attempt(
+                            _attempt_number,
+                            environment=environment,
+                            initial_state=initial_state,
+                            identity=identity,
+                            task_description=task_description,
+                            max_steps=MAX_STEPS_BY_SUITE[suite_name],
+                        ):
                             return _run_attempt(
                                 environment=environment,
                                 client_holder=client_holder,
@@ -459,7 +459,7 @@ def eval_libero(args: Args) -> dict:
                                 identity=identity,
                                 task_description=task_description,
                                 args=args,
-                                max_steps=MAX_STEPS_BY_SUITE[suite_name],
+                                max_steps=max_steps,
                             )
 
                         record = _eval.run_episode_with_retries(

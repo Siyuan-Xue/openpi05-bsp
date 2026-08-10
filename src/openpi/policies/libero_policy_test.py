@@ -31,5 +31,5 @@ def test_bsp_libero_outputs_ignore_only_inactive_controls_and_reject_invalid_par
         np.zeros((16, 9)),
         np.zeros((16, 31)),
     ):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match=r"BSP policy output (?:must have padded shape|contains non-finite)"):
             libero_policy.BspLiberoOutputs()({"actions": invalid})

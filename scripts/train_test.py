@@ -4,11 +4,11 @@ import pathlib
 
 os.environ["JAX_PLATFORMS"] = "cpu"
 
+from flax import nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-from flax import nnx
 
 from openpi.models import model as _model
 from openpi.models import pi0_config

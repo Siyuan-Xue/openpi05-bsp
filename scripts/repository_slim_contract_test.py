@@ -11,7 +11,6 @@ import sys
 import tomllib
 import unittest
 
-
 _ROOT = Path(__file__).resolve().parents[1]
 _REMOVED_DISTRIBUTIONS = {
     "chex",

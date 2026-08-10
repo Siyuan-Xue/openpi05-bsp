@@ -8,10 +8,7 @@ import hashlib
 import importlib.metadata
 import json
 import operator
-from typing import Any
-from typing import Protocol
-from typing import SupportsIndex
-from typing import TypeVar
+from typing import Any, Protocol, SupportsIndex, TypeVar
 
 import numpy as np
 
@@ -21,7 +18,6 @@ from openpi.training.bsp import BspSettings
 from openpi.training.bsp import build_episode_targets
 from openpi.training.bsp import build_episode_targets_with_artifacts
 from openpi.training.bsp import make_cache_manifest
-
 
 LIBERO_REPO_ID = "physical-intelligence/libero"
 LIBERO_REVISION = "v2.0"
@@ -115,7 +111,7 @@ def make_lerobot_cache_manifest(
     """Fingerprint the concrete HF table and its requested Hub revision."""
     observed = validate_lerobot_dataset(dataset, expected_metadata)
     try:
-        hf_fingerprint = str(dataset.hf_dataset._fingerprint)
+        hf_fingerprint = str(dataset.hf_dataset._fingerprint)  # noqa: SLF001 -- HF snapshot identity field.
     except AttributeError as error:
         raise ValueError("LeRobot hf_dataset does not expose its snapshot fingerprint") from error
     if not hf_fingerprint:
@@ -129,9 +125,7 @@ def make_lerobot_cache_manifest(
     if hasattr(features, "to_dict"):
         features = features.to_dict()
     try:
-        feature_schema = json.loads(
-            json.dumps(features, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-        )
+        feature_schema = json.loads(json.dumps(features, sort_keys=True, separators=(",", ":"), ensure_ascii=True))
     except (TypeError, ValueError) as error:
         raise ValueError("LeRobot hf_dataset feature schema is not canonically JSON serializable") from error
     try:
@@ -214,7 +208,7 @@ def build_lerobot_bsp_cache(
     target_parts: list[np.ndarray] = []
     mapping_parts: list[np.ndarray] = []
     target_offset = 0
-    for start, end in zip(starts, ends):
+    for start, end in zip(starts, ends, strict=True):
         episode = build_episode_targets(
             _episode_actions(dataset, int(start), int(end), action_key),
             settings,
@@ -330,17 +324,13 @@ def verify_lerobot_bsp_cache(
             if knot_rows < settings.target_rows:
                 tail_padding_observed = True
                 tail_padding_valid &= bool(
-                    np.all(
-                        target[knot_rows:, settings.action_dim]
-                        == target[knot_rows - 1, settings.action_dim]
-                    )
+                    np.all(target[knot_rows:, settings.action_dim] == target[knot_rows - 1, settings.action_dim])
                 )
             if control_rows < settings.target_rows:
                 tail_padding_observed = True
                 tail_padding_valid &= bool(
                     np.all(
-                        target[control_rows:, : settings.action_dim]
-                        == target[control_rows - 1, : settings.action_dim]
+                        target[control_rows:, : settings.action_dim] == target[control_rows - 1, : settings.action_dim]
                     )
                 )
 
@@ -350,8 +340,7 @@ def verify_lerobot_bsp_cache(
 
         cached_episode_mapping = np.asarray(cache.mapping[start:end])
         target_index_bounds_valid &= bool(
-            cached_episode_mapping.shape == (end - start,)
-            and np.all(cached_episode_mapping < cache.targets.shape[0])
+            cached_episode_mapping.shape == (end - start,) and np.all(cached_episode_mapping < cache.targets.shape[0])
         )
         no_cross_episode_mapping &= bool(
             cached_episode_mapping.shape == (end - start,)

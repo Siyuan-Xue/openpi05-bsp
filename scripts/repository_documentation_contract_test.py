@@ -9,7 +9,6 @@ import subprocess
 import unittest
 from urllib.parse import unquote
 
-
 _ROOT = Path(__file__).resolve().parents[1]
 _ARCHITECTURE = _ROOT / "docs/repository_architecture.md"
 _CANONICAL_DOCUMENTS = (
@@ -178,9 +177,7 @@ class RepositoryDocumentationContractTest(unittest.TestCase):
         for document in _CANONICAL_DOCUMENTS:
             text = _read(document)
             for pattern in (machine_identity, secret):
-                findings.extend(
-                    f"{document.relative_to(_ROOT)}: {match.group(0)}" for match in pattern.finditer(text)
-                )
+                findings.extend(f"{document.relative_to(_ROOT)}: {match.group(0)}" for match in pattern.finditer(text))
         self.assertEqual(findings, [])
 
     def test_lightweight_ci_runs_documentation_contract(self):

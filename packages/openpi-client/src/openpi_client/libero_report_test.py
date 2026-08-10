@@ -79,9 +79,7 @@ def _manifest(variant, step, *, family="full"):
 
 
 def _episode(suite, task_id, init_index, success):
-    fingerprint = hashlib.sha256(
-        "state-{}-{}-{}".format(suite, task_id, init_index).encode("utf-8")
-    ).hexdigest()
+    fingerprint = hashlib.sha256("state-{}-{}-{}".format(suite, task_id, init_index).encode("utf-8")).hexdigest()
     identity = libero_eval.EpisodeIdentity(
         suite=suite,
         task_id=task_id,
@@ -251,11 +249,7 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
             self.assertNotIn("best", (output_dir / "report.md").read_text(encoding="utf-8").lower())
 
     def test_manifest_classifier_accepts_one_lora_family_and_rejects_mixed_families(self):
-        lora = [
-            _manifest(variant, step, family="lora")
-            for variant in ("baseline", "bsp")
-            for step in _STEPS
-        ]
+        lora = [_manifest(variant, step, family="lora") for variant in ("baseline", "bsp") for step in _STEPS]
 
         classified = libero_report.classify_phase_one_manifests(lora)
 
@@ -366,11 +360,7 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
         self.assertAlmostEqual(observed, 1.0 / 40.0)
 
     def test_bootstrap_is_reproducible_and_constant_one_has_exact_unit_interval(self):
-        paired = {
-            (suite, task_id): [1.0] * 50
-            for suite in libero_eval.SUPPORTED_SUITES
-            for task_id in range(10)
-        }
+        paired = {(suite, task_id): [1.0] * 50 for suite in libero_eval.SUPPORTED_SUITES for task_id in range(10)}
 
         first = libero_report.stratified_paired_bootstrap(paired)
         second = libero_report.stratified_paired_bootstrap(paired)
@@ -379,11 +369,7 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
         self.assertEqual(first, (1.0, 1.0))
 
     def test_bootstrap_is_reproducible_for_nonconstant_paired_deltas(self):
-        paired = {
-            (suite, task_id): [0.0] * 50
-            for suite in libero_eval.SUPPORTED_SUITES
-            for task_id in range(10)
-        }
+        paired = {(suite, task_id): [0.0] * 50 for suite in libero_eval.SUPPORTED_SUITES for task_id in range(10)}
         paired[("libero_spatial", 0)] = [-1.0, 1.0] * 25
 
         first = libero_report.stratified_paired_bootstrap(paired)
@@ -399,9 +385,7 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
 
             artifact_run = root / "artifact"
             _write_run(artifact_run, "baseline", 10000)
-            (artifact_run / "artifact_errors.jsonl").write_text(
-                '{"error": "ffmpeg failed"}\n', encoding="utf-8"
-            )
+            (artifact_run / "artifact_errors.jsonl").write_text('{"error": "ffmpeg failed"}\n', encoding="utf-8")
             with self.assertRaises(libero_report.ComparisonError):
                 libero_report.load_run(artifact_run)
 

@@ -1,9 +1,8 @@
 import dataclasses
 
-import pytest
-
 from openpi_client import inference
 from openpi_client import libero_eval
+import pytest
 
 from examples.libero import main as libero_main
 
@@ -124,7 +123,7 @@ def test_single_task_smoke_filter_is_canonical_and_recorded_in_manifest():
 
 @pytest.mark.parametrize("task_ids", [(), (0, 0), (-1,), (10,)])
 def test_invalid_task_filters_are_rejected(task_ids):
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="LIBERO task id"):
         libero_main._validate_args(dataclasses.replace(_args(), task_ids=task_ids))
 
 
@@ -147,9 +146,7 @@ def test_run_attempt_sends_reserved_seed_and_uses_exact_initial_state(monkeypatc
 
     assert result.success
     assert environment.reset_states == [initial_state]
-    assert holder.client.requests[0][inference.INFERENCE_SEED_KEY] == libero_eval.stable_replan_seed(
-        42, identity, 0
-    )
+    assert holder.client.requests[0][inference.INFERENCE_SEED_KEY] == libero_eval.stable_replan_seed(42, identity, 0)
     assert environment.actions == [_actions()[0]]
 
 
@@ -207,9 +204,7 @@ def test_episode_is_persisted_before_video_error_is_audited(tmp_path):
         replans=1,
         replay_frames=("frame",),
     )
-    record = libero_eval.EpisodeRecord.from_attempt(
-        _identity(), 42, 1, success=True, result=attempt
-    )
+    record = libero_eval.EpisodeRecord.from_attempt(_identity(), 42, 1, success=True, result=attempt)
 
     persisted, artifact_error = libero_main._persist_episode_artifacts(
         record,
