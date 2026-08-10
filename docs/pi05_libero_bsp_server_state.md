@@ -1,6 +1,6 @@
 # π0.5 + LIBERO BSP 服务器实际状态与使用手册
 
-> 状态快照：2026-08-08（Asia/Shanghai）
+> 状态快照：2026-08-10（Asia/Shanghai）
 > 适用项目：`Siyuan-Xue/openpi05-bsp` 第一阶段 BSP 复现
 > 性质：实际执行记录，不替代[第一阶段服务器 Runbook](pi05_libero_bsp_phase1_server.md)
 
@@ -50,7 +50,7 @@
 
 | 路径 | 文件系统和容量 | 本项目用途 | 风险或限制 |
 | --- | --- | --- | --- |
-| `/root` | 容器 overlay，约 383 GiB；mb8 失败后最后观察已用约 191 GiB、可用约 173 GiB | 仓库、Python 环境、工具、本地 cache、日志和临时探针 checkpoint | 没有证明在 DSW 容器重建后仍然存在，不能直接视为持久盘 |
+| `/root` | 容器 overlay，约 383 GiB；正式 short10k 训练到 869 step 时最后确认约 108 GiB 可用 | 仓库、Python 环境、工具、本地 cache、日志和本地 Orbax checkpoint | 没有证明在 DSW 容器重建后仍然存在，不能直接视为持久盘；训练期间不得为了腾空间删除或移动 checkpoint |
 | `/mnt/workspace` | `/dev/vda` 上约 30 GiB ext4 | 不作为当前项目根目录 | 容量过小，禁止存大模型、LIBERO 数据和正式训练 checkpoint |
 | `/mnt/data` | 512 TiB `fuse.ossfs2` | 对象存储挂载入口 | 不是完整的本地 POSIX 块盘；文件锁、原子 rename 和随机 I/O 需要单独验证 |
 | `/mnt/data/siyuanxue` | 位于上述 `ossfs2` | 本项目唯一允许写入的数据命名空间 | 所有数据盘写操作必须限制在此路径内 |
@@ -217,6 +217,9 @@ VPC NAT Gateway/EIP/SNAT。不得把网络配置建议记成服务器现状。
     checkpoints/
       probes/                        # [已确认] 一步显存探针；部分旧探针已清理
       pilots/                        # [已确认] 10/100-step pilot 路径；失败运行无有效 checkpoint
+      pi05_libero_baseline_lora_h16/
+        phase1-short10k-seed42-baseline/
+                                      # [进行中] 正式 Baseline LoRA short10k checkpoint
     eval/                             # [已确认] EGL 冒烟与官方 200-rollout 校准结果
     wandb/                            # [已确认] 离线 W&B 运行日志
 ```
@@ -249,7 +252,8 @@ VPC NAT Gateway/EIP/SNAT。不得把网络配置建议记成服务器现状。
 - `cache/openpi`：可重新下载、可跨 baseline/BSP 复用的官方模型和 tokenizer，不是训练产物。
 - `tools/google-cloud-cli-578.0.0`：为 GCS 大文件并行下载部署的隔离工具，不是系统安装。
 - `experiments/assets`：已生成 baseline/BSP 独立 norm stats 和状态一致性比较结果。
-- `experiments/checkpoints`：探针/pilot 产物；正式训练前仍必须解决显存协议以及容量和持久性问题。
+- `experiments/checkpoints`：探针、pilot 和正在运行的正式 Baseline LoRA short10k 产物；
+  容量和跨容器持久性风险仍未解决。
 - `experiments/eval`：已生成逐回合 JSONL、CSV、汇总 JSON 和选定视频。
 - `/mnt/data/siyuanxue/openpi-bsp/data`：持久训练数据、BSP sidecar 和 verification；不在这里放仓库或 Python 环境。
 
@@ -260,8 +264,9 @@ VPC NAT Gateway/EIP/SNAT。不得把网络配置建议记成服务器现状。
 | 资源 | 已确认身份 |
 | --- | --- |
 | 主仓库 | `https://github.com/Siyuan-Xue/openpi05-bsp.git` |
-| 当前主仓库 commit | `904715355b396715781fc3aa3d1cebbee0890273` |
-| 分支状态 | `main` 跟踪 `origin/main`；最后确认工作区干净 |
+| 当前服务器训练 commit | `2c098404a3cce0c86f0b863dcd8d3aeb18a55d94` |
+| 本文档交接前的本地/远端 commit | `2c098404a3cce0c86f0b863dcd8d3aeb18a55d94`；交接提交后的新 SHA 见最终交接消息 |
+| 分支状态 | 本次编辑前 `main` 跟踪 `origin/main` 且工作区干净；当前训练期间不得据文档提交更新服务器仓库 |
 | LIBERO 子模块 commit | `f78abd68ee283de9f9be3c8f7e2a9ad60246e95c` |
 
 只初始化了 `third_party/libero`。`third_party/aloha` 不属于本阶段，不应初始化。
@@ -393,9 +398,10 @@ tar 完整性、内部版本以及官方远端 MD5 四项证据确认归档有�
   max absolute error 0.002、smoothing `1e-12`、stride 1、frame-index 时间轴、
   episode-start 缓存 knot、materialize 时转为当前 episode-local frame、解码 8 动作。
 
-两套 quantile norm stats 已分别扫描 1,068 个 batch，各耗时约 40 分钟：
+两套 quantile norm stats 最初分别扫描 1,068 个 batch，各耗时约 40 分钟。下表是首次构建的
+历史身份，不再全部代表当前 BSP 训练资产：
 
-| 产物 | SHA-256 |
+| 首次构建产物 | 历史 SHA-256 |
 | --- | --- |
 | baseline `norm_stats.json` | `2c37ee75029e8d01f36210e187ed567ec8860961c795b60522e12c82e86d7635` |
 | BSP `norm_stats.json` | `00e1477be94d3106ff2803acf244eee6a623c96bb0ef91a3be43af6e92671a32` |
@@ -408,12 +414,20 @@ baseline/BSP action stats 摘要不同。审计归档
 及其 `.sha256` 最终由用户确认全部通过。首次归档因新 shell 中 `ASSETS_BASE` 为空而
 生成 0-byte 非法 tar；该失败被识别，没有把它当作有效归档。
 
+后续在 commit `b8f88bb` 修复多 worker 读取 BSP episode 边界的隔离问题后，已重新完成完整 BSP
+norm 扫描、有限值与 knot 范围门禁，并把新结果发布到全量和 LoRA BSP assets 目录。新门禁要求
+actions 为 8 维、state/action 的 mean/std/q01/q99 全部有限、knot `q01 < q99` 且位于
+`[-14, 27]`，Baseline/BSP state stats 相同而 action hash 不同；真实 transformed batch 也必须
+通过。上表旧 BSP hash 和旧 comparison hash 已被取代，不能用于当前 BSP 身份核对。由于本轮
+交接时 Web 会话已经过期，当前发布文件的精确 SHA-256 没有重新读取；启动正式 BSP 前必须从
+服务器现有 assets 和审计日志补录，禁止退回旧 hash 对应文件。
+
 ### 6.9 尚未完成的核心实验资源
 
-- 可连续运行的 baseline/BSP 100-step pilot；当前全量微调即使无 EMA、micro-batch 8
-  仍在第二个 optimizer step OOM。
-- 两组 30k 正式训练和 0k/5k/10k/20k/30k 十个固定 checkpoint。
-- 十个 checkpoint 的四套件 × 50 rollouts（合计 20,000 回合）及 bootstrap 统计报告。
+- 正式 Baseline LoRA short10k 的 1k/2k/5k/10k checkpoint 与训练终态；最后可见进度为 869。
+- 正式 BSP LoRA short10k 尚未启动；自动化也明确禁止在 Baseline 完成后自行启动 BSP。
+- 两组 `0k/1k/2k/5k/10k` 十个固定 checkpoint 的四套件 × 50 rollouts（合计 20,000
+  回合）及 bootstrap 统计报告。
 - 正式 checkpoint 的可靠持久化方案；`/root` 仍未证明跨 DSW 重建持久，直接写
   `ossfs2` 的 Orbax 语义也未验证。
 
@@ -741,7 +755,8 @@ python3 -m pip config list
 ### 11.3 存储和 checkpoint
 
 - 禁止把大数据、模型或正式 checkpoint 写入只有约 30 GiB 的 `/mnt/workspace`。
-- 禁止把 `/root` 当作已证明持久盘；正式训练前必须解决训练 checkpoint 的持久性和容量门禁。
+- 禁止把 `/root` 当作已证明持久盘。正式 Baseline 已经在 `/root` 运行并不等于持久性门禁
+  通过；在启动 BSP、迁移产物或依赖容器重建恢复之前仍必须解决该风险。
 - 禁止未经验证就把 Orbax/JAX checkpoint 直接写到 `ossfs2`。必须先证明文件锁、原子 rename、目录语义和随机 I/O 满足要求。
 - 训练 checkpoint、评测结果和身份 manifest 是不可重新下载的实验产物，不能和可重建 cache 混为一谈。
 
@@ -767,36 +782,34 @@ python3 -m pip config list
 
 ### 11.6 实验公平性
 
-- 第一阶段固定 seed 42、有效 batch 256、30,000 optimizer steps 和同一 `pi05_base` 初始化。
+- 第一阶段当前固定 seed 42、有效 batch 256、10,000 optimizer steps 和同一 `pi05_base`
+  初始化；30k 协议已由第 18 节记录的 short10k 协议正式取代。
 - micro-batch 只用于梯度累积，不得改变有效 batch。
-- 全量 baseline 或 BSP 在共同 micro-batch 2 的持续训练门禁仍失败时，必须停止全量路线并报告；只允许切换到仓库中独立注册、经过合同测试的官方 JAX LoRA 配置，禁止临时改模型或降低有效 batch。
-- 当前 pilot 经用户明确选择使用 `ema_decay=None`；正式报告必须标明它与原计划 EMA 协议
-  不同，不能把“可运行”解释成“效果等价”。
-- 禁止挑选“最好 checkpoint”；固定评测 0k、5k、10k、20k、30k。
+- 全量路线已经因持续 OOM 停止；正式实验使用仓库中独立注册、经过合同测试的官方 JAX
+  LoRA 配置。禁止在正式 A/B 中混入全量 checkpoint、临时改模型或降低有效 batch。
+- 正式训练固定 `micro_batch_size=64`、`ema_decay=None`；报告必须披露无 EMA 和 LoRA，不能把
+  “可运行”解释成与原始全量 + EMA 协议效果等价。
+- 禁止挑选“最好 checkpoint”；固定评测 `0k/1k/2k/5k/10k`。
 - 禁止在第一阶段增加额外 reconstruction、smoothness、monotonicity loss 或 2×/4× 加速。
 
 ## 12. 当前下一步
 
-仿真、官方 checkpoint 校准、sidecar、verification 和两套 norm stats 已完成。当前唯一
-阻止进入正式训练的直接技术门禁是：全量微调在单张 H20 上无法连续稳定运行既定协议。
+仿真、官方 checkpoint 校准、sidecar、verification、两套 norm stats、LoRA 配置和短周期
+训练协议均已完成准备。正式 Baseline LoRA short10k 已在服务器运行，当前必须保持单作业：
 
-下一轮已经由用户批准，必须严格按以下顺序进行：
+1. 不拉取服务器仓库、不重启、不恢复同名实验、不发送信号、不启动 BSP，也不运行其他 GPU
+   作业；当前只允许只读监控 Baseline。
+2. 登录恢复后先补查最新进度。到达 1k、2k、5k、10k 时，分别确认 `params/`、
+   `train_state/`、`assets/` 完整并且没有残留 Orbax 临时目录。
+3. Baseline 完成后验收 `0/1000/2000/5000/10000` 五个里程碑、日志终态、有限 metrics、
+   GPU 释放和剩余空间；当前自动化明确禁止自动启动 BSP。
+4. 后续是否启动 `phase1-short10k-seed42-bsp` 由新的接管任务在 Baseline 完整验收后决定，
+   不得因为 Web 会话过期而推断训练失败或另起同名作业。
+5. `/root` 仍未证明跨 DSW 重建持久，`ossfs2` 仍未证明满足 Orbax POSIX 语义；正式
+   checkpoint 的持久化方案在移动任何产物前仍需单独门禁。
 
-1. 保留现有失败日志和路径，不重试同名实验、不删除 checkpoint。全量路线依次运行
-   baseline/BSP 的 micro-batch 4、10-step 和 100-step 门禁；四项全部通过就选择 4，
-   不再为了寻找更小数值而运行 2。
-2. 任一 micro-batch 4 阶段失败时，baseline/BSP 都从同一 `pi05_base` 重新按完整
-   10/100-step 序列验证 micro-batch 2，不能只补跑失败的一组。有效 batch 始终为 256。
-3. micro-batch 2 仍失败时，全量路线判为当前 H20 硬件阻塞，正式候选切换为独立的
-   `pi05_libero_baseline_lora_h16` 和 `pi05_libero_bsp_lora_h16`。LoRA 候选从 64 开始，
-   按 64/32/16/8/4/2/1 递减并选择 A/B 共同稳定的最大值。
-4. baseline 与 BSP 不得并行；每项都必须检查有限 metrics、目标 checkpoint、Orbax
-   临时目录、GPU 释放和磁盘余量。单步成功不能替代 10/100-step 稳定性门禁。
-5. 任一路线的两组 100-step pilot 通过后暂停，不自动启动 30k。正式训练前先复核
-   checkpoint 容量和持久性：`/root` 未证明跨 DSW 重建持久，`ossfs2` 也未证明满足
-   Orbax POSIX 语义。
-
-自动监控 `0-5-libero-pilot` 已因 mb8 OOM 暂停；在用户批准新的显存方案前不得自动恢复。
+当前每小时自动监控 ID 为 `0-5-libero`。其服务器读操作从 2026-08-09 21:47 UTC 起因
+阿里云 RAM/Console 会话过期而暂停；需要用户在 Google Chrome 中重新登录后才能继续。
 
 ## 13. 本批增量工作纪要（截至 2026-08-08）
 
@@ -910,7 +923,8 @@ python3 -m pip config list
   Pod ID、GPU UUID、token 或 credential。
 - 自动化只允许串行启动一项 GPU 作业；每阶段要求无 GPU compute process、路径无碰撞、
   `/root` 至少 80 GiB 可用，并在异常时暂停。
-- 本轮文档整理只修改本地仓库中的本 Markdown，不对服务器执行命令，也不提交或推送。
+- 第 14 节对应的当批整理当时只修改本地 Markdown，未对服务器执行命令、提交或推送；该历史
+  状态不约束本次第 19 节交接文档的提交和推送。
 
 ## 15. 2026-08-09 LoRA 扩展决策
 
@@ -920,8 +934,8 @@ python3 -m pip config list
 2. 两个 LoRA 配置均使用 OpenPI 官方 JAX LoRA 变体：PaliGemma `gemma_2b_lora`、action
    expert `gemma_300m_lora`，并使用与该模型配置严格匹配的 `get_freeze_filter()`。
 3. LoRA 仍沿用第一阶段的 π0.5、horizon 16、action dim 32、LIBERO v2.0、seed 42、
-   effective batch 256、阶段一学习率/AdamW、30k 和固定 checkpoint 周期。它只改变
-   可训练参数集合。
+   effective batch 256 和阶段一学习率/AdamW。该条最初采用 30k，现已由第 18 节的 10k
+   终点和 `0k/1k/2k/5k/10k` 里程碑取代；LoRA 本身只改变可训练参数集合。
 4. `ema_decay=None` 与 OpenPI 官方 LoRA 示例一致，不把全量模型 EMA 副本重新引入显存。
    全量路线当前也由用户选择无 EMA，但两条路线仍必须在 manifest 中分别标注训练配置。
 5. LoRA 不改变数据分布或 BSP 表示，因此复用已经验收的 baseline/BSP norm stats；在
@@ -930,6 +944,9 @@ python3 -m pip config list
    失败时才启动 LoRA GPU pilot。任一路线通过 A/B 100-step 后都暂停，等待正式训练复核。
 
 ## 16. 2026-08-09 固定验收扩展：0k 与 5k
+
+本节是 30k 协议下的历史决定；其里程碑集合随后被第 18 节的 short10k 协议取代。保留本节
+是为了说明 step 0 保存、固定点比较和报告约束的来源，不能再把其中的 20k/30k 当作当前任务。
 
 用户已确认将第一阶段固定里程碑从 `10k/20k/30k` 扩展为
 `0k/5k/10k/20k/30k`。本节记录协议决定和代码能力，不把尚未发生的服务器产物写成已完成：
@@ -969,6 +986,13 @@ python3 -m pip config list
    `008196e`，预定的 GREEN 日志不存在；因此同两项 GREEN 测试实际**未启动**，不能视为
    测试中断或测试通过。在隔离 worktree 快进到 `ad01abe` 并取得明确 PASS 终态前，不得据此
    合并 `main` 或开始正式训练。
+7. 后续已经完成上述 GREEN、合并和服务器快进；否则第 19 节记录的正式 short10k 训练不可能
+   合法启动。该条只更新阶段终态，不抹除第 4–6 条当时的真实阻塞证据。
+8. BSP norm 在 `b8f88bb` 修复后重新扫描并发布；随后使用显式 `WANDB_MODE=offline` 的唯一
+   实验名完成 BSP LoRA 10-step 和 100-step 稳定性门禁。100-step 正式验收运行名为
+   `pilot-bsp-lora-mb64-noema-100steps-1966518-r1`，未复用前两次失败路径。
+9. Baseline/BSP LoRA 100-step A/B 门禁完成后才进入 short10k 正式训练；正式阶段仍保持
+   micro-batch 64、有效 batch 256、无 EMA 和单 GPU 串行约束。
 
 ## 18. 2026-08-09 第一阶段缩短为 10k
 
@@ -994,6 +1018,124 @@ Baseline/BSP 配对方式或每个 checkpoint 的完整评测规模。
    运行恢复。
 5. A/B 各评测五个 checkpoint，每次仍为四套件 × 10 tasks × 50 initial states = 2,000
    episodes；比较器仍要求恰好十个 run、20,000 episodes，并生成原来的六种固定报告文件。
-6. 本节写入代码仓库时，新 10k 训练尚未启动。只有短周期配置、报告和 runbook 合同测试通过，
-   功能分支合并并推送、服务器 `main` 快进到最终 SHA 且启动前门禁通过后，才允许用新实验名
-   启动 Baseline。
+6. 本节最初写入代码仓库时，新 10k 训练尚未启动。该阶段性状态已被第 19 节覆盖；短周期
+   配置、报告和 runbook 合同测试后来完成，服务器 `main` 快进到最终训练代码后已启动 Baseline。
+
+## 19. 2026-08-10 正式 Baseline LoRA short10k 与任务交接
+
+本节是另一个克隆仓库或新任务接管时应优先阅读的当前状态。第 13–18 节保留决策历史；发生
+冲突时，以本节和第 12 节为准。
+
+### 19.1 运行身份与固定协议
+
+| 项目 | 当前已确认值 |
+| --- | --- |
+| 服务器训练代码 | `2c098404a3cce0c86f0b863dcd8d3aeb18a55d94` |
+| 配置 | `pi05_libero_baseline_lora_h16` |
+| 实验名 | `phase1-short10k-seed42-baseline` |
+| PID 记录 | `/root/openpi-bsp-work/experiments/logs/train-phase1-short10k-seed42-baseline.pid` |
+| 日志 | `/root/openpi-bsp-work/experiments/logs/train-phase1-short10k-seed42-baseline.log` |
+| checkpoint 根 | `/root/openpi-bsp-work/experiments/checkpoints/pi05_libero_baseline_lora_h16/phase1-short10k-seed42-baseline` |
+| 训练协议 | seed 42、有效 batch 256、micro-batch 64、LoRA、`ema_decay=None` |
+| 终点与保存 | 10,000 optimizer steps；每 1,000 step 保存；永久里程碑 `0/1000/2000/5000/10000` |
+| 运行环境 | W&B offline；`XLA_PYTHON_CLIENT_MEM_FRACTION=0.95`；单 H20 |
+
+服务器训练应继续绑定上述 `2c09840...` 代码身份。本次文档交接提交会使远端 `main` 获得一个
+新的纯文档 commit；在当前训练结束前，**不要**因此在服务器运行 `git pull`、重启训练或修改
+运行身份。另一个本地克隆可以正常拉取最新文档，远端新 SHA 与运行中服务器 SHA 不相等是预期
+现象，不是训练污染。
+
+### 19.2 最后一次成功读取的训练状态
+
+截至 2026-08-09 20:48:05 UTC（2026-08-10 04:48:05 Asia/Shanghai），只读门禁确认：
+
+- PID `2438713` 对应训练进程仍在运行；代码 SHA 与上表一致。
+- 最新进度约为 `869 / 10000`，实测约 `29.6 s/step`。
+- `step 0` 的 `params/`、`train_state/`、`assets/` 全部存在。
+- 日志中的 OOM、`RESOURCE_EXHAUSTED`、Traceback、NaN/Inf 匹配数为 0。
+- GPU compute process 数为 1，训练进程使用约 92,846 MiB 显存；没有并行 GPU 作业证据。
+- 未发现 Orbax 临时 checkpoint 目录；`/root` 可用空间约 108 GiB。
+
+逐小时可复核的有限 metrics 如下；时间均为 UTC，`step` 为最后一条 metrics 的 optimizer step：
+
+| 检查时间 | 总进度 | step | loss | grad_norm | param_norm |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 2026-08-09 15:48:02 | 261 | 260 | 0.0527 | 0.0765 | 1803.8632 |
+| 2026-08-09 16:44:16 | 375 | 370 | 0.0457 | 0.0710 | 1803.8632 |
+| 2026-08-09 17:45:06 | 498 | 490 | 0.0402 | 0.0699 | 1803.8641 |
+| 2026-08-09 18:45:39 | 621 | 620 | 0.0351 | 0.0882 | 1803.8651 |
+| 2026-08-09 19:46:37 | 745 | 740 | 0.0322 | 0.0804 | 1803.8661 |
+| 2026-08-09 20:48:05 | 869 | 860 | 0.0317 | 0.0956 | 1803.8671 |
+
+这些记录证明最后一次可见状态正常，不证明训练在 Web 会话过期后的最新进度。2026-08-09
+21:47 UTC、22:48 UTC 和 23:49 UTC 的检查都只看到“会话过期，请重新登录”；这属于管理界面
+认证阻塞，不是训练进程退出证据。1k checkpoint 是否已经完成目前必须标为**未确认**。
+
+### 19.3 新任务的无副作用监控命令
+
+用户在 Google Chrome 中恢复阿里云登录后，在现有 Web VS Code 终端执行以下只读命令。命令
+不包含 `kill`、信号、删除、移动、拉取、恢复或训练启动操作：
+
+```bash
+REPO=/root/openpi-bsp-work/repo/openpi05-bsp
+LOG=/root/openpi-bsp-work/experiments/logs/train-phase1-short10k-seed42-baseline.log
+PID_FILE=/root/openpi-bsp-work/experiments/logs/train-phase1-short10k-seed42-baseline.pid
+RUN=/root/openpi-bsp-work/experiments/checkpoints/pi05_libero_baseline_lora_h16/phase1-short10k-seed42-baseline
+
+PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+date -u
+git -C "$REPO" rev-parse HEAD
+printf 'pid=%s\n' "$PID"
+if test -n "$PID"; then
+  ps -p "$PID" -o pid=,etime=,%cpu=,%mem=,rss=,stat=,args= || true
+else
+  echo 'process=PID_FILE_MISSING_OR_EMPTY'
+fi
+nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader
+df -hT /root
+
+ERROR_MATCHES="$(
+  grep -Eic \
+    'out of memory|resource_exhausted|traceback|(^|[^[:alpha:]])(nan|inf)([^[:alpha:]]|$)' \
+    "$LOG" || true
+)"
+printf 'error_matches=%s\n' "$ERROR_MATCHES"
+
+grep 'Progress on:' "$LOG" | tail -n 1
+grep -E 'Step [0-9]+: grad_norm=' "$LOG" | tail -n 3
+
+for step in 0 1000 2000 5000 10000; do
+  if test -d "$RUN/$step"; then
+    printf 'milestone=%s\n' "$step"
+    for part in params train_state assets; do
+      test -e "$RUN/$step/$part" \
+        && printf '  %s=PASS\n' "$part" \
+        || printf '  %s=MISSING\n' "$part"
+    done
+  fi
+done
+
+printf 'orbax_tmp_dirs='
+find "$RUN" -type d -name '*.orbax-checkpoint-tmp-*' 2>/dev/null | wc -l
+```
+
+判读规则：
+
+1. `ps` 无输出时先按异常暂停处理并读取日志终态，禁止直接重启或复用同名实验。
+2. `error_matches` 必须为 0；metrics 的三项数值必须全部有限。
+3. checkpoint 刚好处于写入窗口时可能短暂出现 Orbax 临时目录；等待保存完成后再验收，不能
+   在临时目录存在时移动、打包、删除或启动下一项作业。
+4. 1k/2k/5k/10k 每个出现的目录都必须同时包含 `params`、`train_state` 和 `assets`。
+5. Baseline 正常运行时继续保持单 GPU 作业。完成 10k 后也只做完整验收，**不要自动启动 BSP**。
+
+### 19.4 接管边界
+
+- 当前自动化 ID 是 `0-5-libero`，原计划每小时检查一次；认证过期期间自动化无法读取服务器。
+- Chrome 登录、RAM/Console 会话和 MFA 由用户本人完成；助手不得填写或读取账号、密码、MFA、
+  token、cookie 或凭据文件。
+- 新克隆应先执行 `git pull --ff-only` 获取本交接文档，并用最终交接消息给出的文档 commit
+  SHA 核对；不要把新克隆的 HEAD 当作正在训练的服务器代码 SHA。
+- 不得向 `/mnt/data` 下除 `/mnt/data/siyuanxue` 外的路径写入；不得把 Orbax checkpoint 直接
+  移到 `ossfs2`，除非先完成文件锁、原子 rename 和随机 I/O 语义门禁。
+- 当前未知项只有 Web 会话过期后的实时进度、1k 及以后里程碑和最终训练终态。恢复登录后的
+  第一项工作就是运行第 19.3 节的只读检查，并把新证据追加到本文件或独立审计记录。
