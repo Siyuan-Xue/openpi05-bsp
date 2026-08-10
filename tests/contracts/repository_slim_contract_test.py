@@ -467,10 +467,10 @@ def test_generated_experiment_and_tool_artifacts_are_ignored(relative_path: str)
 
 def test_pr_workflows_are_read_only_bounded_and_commit_pinned():
     expected_actions = {
-        "actions/checkout": "11d5960a326750d5838078e36cf38b85af677262",
-        "actions/setup-python": "a26af69be951a213d495a4c3e4e4022e16d87065",
-        "astral-sh/setup-uv": "d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86",
-        "pre-commit/action": "2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd",
+        "actions/checkout": ("11d5960a326750d5838078e36cf38b85af677262", "v4.4.0"),
+        "actions/setup-python": ("a26af69be951a213d495a4c3e4e4022e16d87065", "v5.6.0"),
+        "astral-sh/setup-uv": ("d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86", "v5.4.2"),
+        "pre-commit/action": ("2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd", "v3.0.1"),
     }
     for workflow in sorted((_ROOT / ".github/workflows").glob("*.yml")):
         scalars = _yaml_scalars(workflow)
@@ -482,11 +482,11 @@ def test_pr_workflows_are_read_only_bounded_and_commit_pinned():
         assert ("concurrency", "group") in scalars
         assert all(int(scalars[("jobs", job, "timeout-minutes")]) > 0 for job in jobs)
         for step in steps:
-            match = re.search(r"(?m)^\s*- uses:\s*([^\s#]+)", step)
+            match = re.search(r"(?m)^[ \t]*- uses:[ \t]*([^\s#]+)(?:[ \t]+#[ \t]*(\S.*?))?[ \t]*$", step)
             if match is None:
                 continue
             action, commit = match.group(1).split("@", 1)
-            assert commit == expected_actions[action]
+            assert (commit, match.group(2)) == expected_actions[action]
             if action == "actions/checkout":
                 assert re.search(r"(?m)^\s+persist-credentials:\s*false\s*$", step)
 
