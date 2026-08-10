@@ -33,7 +33,7 @@ class _DeterministicLinearModelConfig(_model.BaseModelConfig):
     def inputs_spec(self, *, batch_size=1):
         with at.disable_typechecking():
             observation = _model.Observation(
-                images={"debug": jax.ShapeDtypeStruct((batch_size, 1, 1, 3), jnp.float32)},
+                images={"debug": jax.ShapeDtypeStruct((batch_size, 4, 4, 3), jnp.float32)},
                 image_masks={"debug": jax.ShapeDtypeStruct((batch_size,), jnp.bool_)},
                 state=jax.ShapeDtypeStruct((batch_size, 2), jnp.float32),
             )
