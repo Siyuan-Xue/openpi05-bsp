@@ -1,31 +1,51 @@
-name: Test
+name: Lightweight CPU CI
 on:
+  push:
   pull_request:
-    branches:
-      - "*"
 
 jobs:
-  run_tests:
-    name: Run Tests
-    runs-on: openpi-verylarge
+  repository-contracts:
+    name: Ruff and repository contracts
+    runs-on: ubuntu-latest
     env:
       GIT_LFS_SKIP_SMUDGE: true
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install FFmpeg dependencies
+        with:
+          lfs: false
+          submodules: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Ruff lint
+        run: uvx --from ruff==0.8.6 ruff check .
+      - name: Ruff format
+        run: uvx --from ruff==0.8.6 ruff format --check .
+      - name: Run dependency-free repository contracts
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg libavcodec-dev libavformat-dev libavutil-dev
+          python -m unittest \
+            scripts.repository_slim_contract_test \
+            scripts.core_runtime_slim_test \
+            scripts.libero_revision_contract_test \
+            scripts.libero_host_contract_test
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-
-      - name: Set up Python
-        run: uv python install
-
-      - name: Install the project
-        run: uv sync --all-extras --dev
-
-      - name: Run tests
-        run: uv run pytest --strict-markers -m "not manual"
+  openpi-client:
+    name: Isolated openpi-client tests (Python 3.8)
+    runs-on: ubuntu-latest
+    env:
+      GIT_LFS_SKIP_SMUDGE: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+          submodules: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+      - name: Install only openpi-client and its test runner
+        run: python -m pip install --disable-pip-version-check pytest ./packages/openpi-client
+      - name: Run isolated openpi-client tests
+        run: python -m pytest packages/openpi-client/src/openpi_client -q

@@ -1,8 +1,14 @@
 # Data directories.
 assets/
+artifacts/
 checkpoints/
 data/
+reports/
 wandb/
+
+# Repository-local tool caches.
+.ruff_cache/
+.uv-cache/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

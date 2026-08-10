@@ -1,14 +1,18 @@
 [project]
 name = "openpi-client"
 version = "0.1.0"
+description = "Lightweight WebSocket client and LIBERO evaluation utilities for openpi05-bsp"
 requires-python = ">=3.8"
 dependencies = [
-    "dm-tree>=0.1.8",
     "msgpack>=1.0.5",
     "numpy>=1.22.4,<2.0.0",
     "pillow>=9.0.0",
+    "typing-extensions>=4.12.2",
     "websockets>=11.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/Siyuan-Xue/openpi05-bsp"
 
 [build-system]
 requires = ["hatchling"]
