@@ -6,6 +6,8 @@ from openpi.models import pi0_config
 from openpi.shared import download
 from openpi.shared import nnx_utils
 
+pytestmark = pytest.mark.gpu
+
 
 def test_pi0_model():
     key = jax.random.key(0)
@@ -38,6 +40,8 @@ def test_pi0_lora_model():
 
 
 @pytest.mark.manual
+@pytest.mark.network
+@pytest.mark.data
 def test_model_restore():
     key = jax.random.key(0)
     config = pi0_config.Pi0Config()

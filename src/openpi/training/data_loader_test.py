@@ -84,6 +84,35 @@ def test_jax_data_loader_emits_the_global_micro_batch():
     assert all(x.shape[0] == 2 for x in jax.tree.leaves(batch))
 
 
+def test_training_cli_exposes_only_the_five_retained_config_objects(monkeypatch):
+    captured = {}
+
+    def capture(configs):
+        captured.update(configs)
+        return "selected"
+
+    monkeypatch.setattr(_config.tyro.extras, "overridable_config_cli", capture)
+
+    assert _config.cli() == "selected"
+    assert tuple(captured) == (
+        "pi05_libero",
+        "pi05_libero_baseline_h16",
+        "pi05_libero_bsp_h16",
+        "pi05_libero_baseline_lora_h16",
+        "pi05_libero_bsp_lora_h16",
+    )
+    for name, (description, config) in captured.items():
+        assert description == name
+        assert config.name == name
+
+    calibration = _config.get_config("pi05_libero")
+    assert calibration.model.pi05 is True
+    assert calibration.model.action_horizon == 10
+    assert calibration.num_train_steps == 30_000
+
+
+@pytest.mark.network
+@pytest.mark.data
 def test_with_real_dataset():
     config = _config.get_config("pi05_libero")
     config = dataclasses.replace(config, batch_size=4)

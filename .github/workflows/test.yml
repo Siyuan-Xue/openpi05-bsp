@@ -29,11 +29,10 @@ jobs:
       - name: Run stdlib-only repository contracts with pytest
         run: |
           uvx --from pytest==9.0.3 pytest -q --noconftest \
-            scripts/repository_slim_contract_test.py \
-            scripts/repository_documentation_contract_test.py \
-            scripts/core_runtime_slim_test.py \
-            scripts/libero_revision_contract_test.py \
-            scripts/libero_host_contract_test.py \
+            tests/contracts/repository_slim_contract_test.py \
+            tests/contracts/repository_documentation_contract_test.py \
+            tests/contracts/core_runtime_slim_test.py \
+            tests/contracts/libero_host_contract_test.py \
             src/openpi/training/runtime_paths_test.py \
             src/openpi/training/train_planning_test.py \
             scripts/compare_libero_phase1_test.py

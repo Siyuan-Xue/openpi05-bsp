@@ -15,6 +15,24 @@ from scripts.prepare_libero_bsp import require_preparation_paths
 from scripts.prepare_libero_bsp import write_json_atomic
 
 
+def test_cli_help_preserves_preparation_arguments_and_success_exit(capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        tyro.cli(prepare_libero_bsp.main, args=["--help"])
+
+    assert exit_info.value.code == 0
+    help_text = capsys.readouterr().out
+    for argument in (
+        "--mode",
+        "--dataset-root",
+        "--cache-path",
+        "--diagnostics-path",
+        "--repo-id",
+        "--revision",
+        "--action-key",
+    ):
+        assert argument in help_text
+
+
 def test_cli_accepts_documented_lowercase_mode_values(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

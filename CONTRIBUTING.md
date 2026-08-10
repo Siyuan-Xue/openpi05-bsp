@@ -49,6 +49,16 @@ job-private GitHub runner directory to contain the affected tmpdir surface docum
 [GHSA-6w46-j5rx-g56g](https://github.com/advisories/GHSA-6w46-j5rx-g56g). Remove this compatibility pin when the
 LIBERO client moves to Python 3.10+.
 
+The repository default is the offline CPU suite:
+
+```bash
+pytest -q
+```
+
+Pytest strictly validates configuration and marker names. Tests marked `manual`, `network`, `data`, or `gpu` are
+excluded by default; select one of those categories explicitly only in a prepared environment, for example with
+`pytest -q -m network src/openpi/shared/download_test.py`.
+
 Write tests as native pytest functions or `Test*` classes with plain `assert`, `pytest.raises`, fixtures, and
 parametrization. Do not introduce `unittest.TestCase`, `self.assert*`, `subTest`, or `python -m unittest`; a
 repository contract and Ruff's pytest-style rules enforce this boundary.

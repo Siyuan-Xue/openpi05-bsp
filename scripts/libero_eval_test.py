@@ -77,6 +77,28 @@ def _actions(horizon=16):
     return [[float(row + column) for column in range(7)] for row in range(horizon)]
 
 
+def test_cli_help_preserves_evaluator_arguments_and_success_exit(capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        libero_main.tyro.cli(libero_main.eval_libero, args=["--help"])
+
+    assert exit_info.value.code == 0
+    help_text = capsys.readouterr().out
+    for argument in (
+        "--args.host",
+        "--args.port",
+        "--args.task-suite-name",
+        "--args.task-ids",
+        "--args.output-dir",
+        "--args.policy-variant",
+        "--args.expected-action-horizon",
+        "--args.config-name",
+        "--args.checkpoint-step",
+        "--args.dataset-revision",
+        "--args.checkpoint",
+    ):
+        assert argument in help_text
+
+
 def test_evaluator_defaults_to_the_real_official_dataset_revision():
     assert libero_main.Args().dataset_revision == "v2.0"
 

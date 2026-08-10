@@ -6,6 +6,7 @@
     "python.testing.pytestArgs": [
         "src/openpi",
         "scripts",
+        "tests/contracts",
         "packages/openpi-client/src/openpi_client"
     ],
     "python.testing.unittestEnabled": false,

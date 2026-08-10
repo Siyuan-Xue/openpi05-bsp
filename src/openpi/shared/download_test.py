@@ -24,6 +24,7 @@ def test_download_local(tmp_path: pathlib.Path):
         download.maybe_download("bogus")
 
 
+@pytest.mark.network
 def test_download_gs_dir():
     remote_path = "gs://openpi-assets/testdata/random"
 
@@ -34,6 +35,7 @@ def test_download_gs_dir():
     assert new_local_path == local_path
 
 
+@pytest.mark.network
 def test_download_gs():
     remote_path = "gs://openpi-assets/testdata/random/random_512kb.bin"
 
@@ -44,6 +46,7 @@ def test_download_gs():
     assert new_local_path == local_path
 
 
+@pytest.mark.network
 def test_download_fsspec():
     remote_path = "gs://big_vision/paligemma_tokenizer.model"
 

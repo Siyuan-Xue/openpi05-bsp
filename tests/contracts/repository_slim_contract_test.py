@@ -12,7 +12,7 @@ import tomllib
 
 import pytest
 
-_ROOT = Path(__file__).resolve().parents[1]
+_ROOT = Path(__file__).resolve().parents[2]
 _REMOVED_DISTRIBUTIONS = {
     "chex",
     "dm-tree",
@@ -119,13 +119,40 @@ def _is_pytest_module(path: str | Path) -> bool:
 
 def _tracked_pytest_modules() -> tuple[Path, ...]:
     tracked_paths = subprocess.run(
-        ["git", "ls-files"],
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
         cwd=_ROOT,
         check=True,
         capture_output=True,
         text=True,
     ).stdout.splitlines()
-    return tuple(_ROOT / relative_path for relative_path in tracked_paths if _is_pytest_module(relative_path))
+    return tuple(
+        _ROOT / relative_path
+        for relative_path in tracked_paths
+        if _is_pytest_module(relative_path) and (_ROOT / relative_path).is_file()
+    )
+
+
+def _run_pytest_probe(tmp_path: Path, source: str, *arguments: str) -> subprocess.CompletedProcess[str]:
+    probe = tmp_path / "marker_probe_test.py"
+    probe.write_text(source, encoding="utf-8")
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "--rootdir",
+            str(_ROOT),
+            "-c",
+            str(_ROOT / "pyproject.toml"),
+            *arguments,
+            str(probe),
+            "-q",
+        ],
+        cwd=_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_surviving_production_imports_are_declared_directly():
@@ -155,6 +182,68 @@ def test_tracked_tests_use_only_native_pytest_style():
 
     assert tracked_tests
     assert _unittest_style_findings(tracked_tests) == []
+
+
+def test_external_test_markers_are_registered_under_strict_checking(tmp_path: Path):
+    result = _run_pytest_probe(
+        tmp_path,
+        """
+import pytest
+
+@pytest.mark.manual
+def test_manual():
+    pass
+
+@pytest.mark.network
+def test_network():
+    pass
+
+@pytest.mark.data
+def test_data():
+    pass
+
+@pytest.mark.gpu
+def test_gpu():
+    pass
+""",
+        "--strict-markers",
+        "-m",
+        "",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "4 passed" in result.stdout
+
+
+def test_default_pytest_selection_deselects_external_tests(tmp_path: Path):
+    result = _run_pytest_probe(
+        tmp_path,
+        """
+import pytest
+
+@pytest.mark.manual
+def test_manual():
+    raise AssertionError("manual probe ran")
+
+@pytest.mark.network
+def test_network():
+    raise AssertionError("network probe ran")
+
+@pytest.mark.data
+def test_data():
+    raise AssertionError("data probe ran")
+
+@pytest.mark.gpu
+def test_gpu():
+    raise AssertionError("GPU probe ran")
+
+def test_offline():
+    pass
+""",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed, 4 deselected" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -222,7 +311,12 @@ def test_metadata_ownership_and_test_discovery_target_the_specialized_fork():
     assert "libero" in project["project"]["description"].lower()
     assert project["project"]["urls"]["Repository"] == "https://github.com/Siyuan-Xue/openpi05-bsp"
     assert re.search("(?m)^\\*\\s+@Siyuan-Xue\\s*$", codeowners) is not None
-    assert vscode["python.testing.pytestArgs"] == ["src/openpi", "scripts", "packages/openpi-client/src/openpi_client"]
+    assert vscode["python.testing.pytestArgs"] == [
+        "src/openpi",
+        "scripts",
+        "tests/contracts",
+        "packages/openpi-client/src/openpi_client",
+    ]
     assert vscode["python.testing.pytestEnabled"] is True
     assert vscode["python.testing.unittestEnabled"] is False
 

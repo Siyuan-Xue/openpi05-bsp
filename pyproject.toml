@@ -118,9 +118,8 @@ known-third-party = ["wandb"]
 [tool.ruff.lint.per-file-ignores]
 # These focused contracts intentionally exercise private helpers.
 "scripts/libero_eval_test.py" = ["SLF001"]
-# This host contract installs import stubs before importing the module under test,
-# then checks private helpers at the host/client boundary.
-"scripts/libero_host_contract_test.py" = ["E402", "SLF001"]
+"scripts/serve_policy_test.py" = ["SLF001"]
+"tests/contracts/libero_host_contract_test.py" = ["E402", "SLF001"]
 "src/openpi/policies/policy_seed_test.py" = ["SLF001"]
 "src/openpi/training/bsp_dataset_test.py" = ["SLF001"]
 "src/openpi/training/bsp_test.py" = ["SLF001"]
@@ -134,5 +133,16 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
-markers = ["manual: should be run manually."]
-testpaths = ["src/openpi", "scripts", "packages/openpi-client/src/openpi_client"]
+addopts = [
+    "--strict-config",
+    "--strict-markers",
+    "-m",
+    "not manual and not network and not data and not gpu",
+]
+markers = [
+    "manual: requires explicitly supervised execution.",
+    "network: reaches an external network service.",
+    "data: reads a real dataset or checkpoint.",
+    "gpu: requires GPU infrastructure.",
+]
+testpaths = ["src/openpi", "scripts", "tests/contracts", "packages/openpi-client/src/openpi_client"]

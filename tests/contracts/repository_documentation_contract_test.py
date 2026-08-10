@@ -8,7 +8,7 @@ import re
 import subprocess
 from urllib.parse import unquote
 
-_ROOT = Path(__file__).resolve().parents[1]
+_ROOT = Path(__file__).resolve().parents[2]
 _ARCHITECTURE = _ROOT / "docs/repository_architecture.md"
 _CANONICAL_DOCUMENTS = (
     _ROOT / "README.md",
@@ -190,5 +190,5 @@ def test_canonical_documents_contain_no_machine_identity_or_secret():
 
 def test_lightweight_ci_runs_documentation_contract():
     workflow = _read(_ROOT / ".github/workflows/test.yml")
-    assert "scripts/repository_documentation_contract_test.py" in workflow
+    assert "tests/contracts/repository_documentation_contract_test.py" in workflow
     assert "fetch-depth: 0" in workflow

@@ -6,6 +6,9 @@ from openpi.training import config as _config
 
 
 @pytest.mark.manual
+@pytest.mark.network
+@pytest.mark.data
+@pytest.mark.gpu
 def test_infer():
     config = _config.get_config("pi05_libero")
     policy = _policy_config.create_trained_policy(config, "gs://openpi-assets/checkpoints/pi05_libero")

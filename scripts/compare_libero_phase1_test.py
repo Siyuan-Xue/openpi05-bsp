@@ -35,8 +35,9 @@ def test_parser_requires_exactly_ten_runs_and_three_explicit_artifact_paths():
     assert parsed.norm_comparison == Path("norm.json")
     assert parsed.output_dir == Path("report")
 
-    with contextlib.redirect_stderr(io.StringIO()), pytest.raises(SystemExit):
+    with contextlib.redirect_stderr(io.StringIO()), pytest.raises(SystemExit) as exit_info:
         parser.parse_args(arguments[1:])
+    assert exit_info.value.code == 2
 
     help_text = parser.format_help().lower()
     assert "ten" in help_text

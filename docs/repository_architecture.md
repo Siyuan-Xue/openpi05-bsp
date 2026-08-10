@@ -188,12 +188,12 @@ BSP 作者仓库和论文 PDF 是实现参考，不是服务器运行依赖，�
 ## 3. 删除审计
 
 下表按功能组覆盖从 `phase1-pre-slim-1b976fc` 到本分支 HEAD 的全部 `D` 项。隐藏的
-`deletion-pattern` 标记由 `scripts/repository_documentation_contract_test.py` 使用
+`deletion-pattern` 标记由 `tests/contracts/repository_documentation_contract_test.py` 使用
 `fnmatch` 与 `git diff --name-status phase1-pre-slim-1b976fc...HEAD` 自动对账。
 
 | 原路径 | 原始用途 | 删除原因 | 当前替代 | 损失能力 | 对目标闭环无影响的依据 |
 |---|---|---|---|---|---|
-| `.dockerignore`；`scripts/docker/**`；`examples/libero/Dockerfile`；`examples/libero/compose.yml`；`scripts/libero_compose_preflight.py`；`scripts/libero_compose_preflight_test.py` | 构建 policy/simulator 镜像、安装宿主组件、编排端口/挂载/GPU/EGL，并做容器前检 | 阿里云 DSW 托管环境没有可用 daemon/Compose/toolkit；实际验证路线是双 Python + WebSocket + 私有 EGL vendor JSON | [host-only runbook](pi05_libero_bsp_phase1_server.md) 与 `scripts/libero_host_contract_test.py` | 不再提供一键镜像构建、嵌套容器编排和容器 GPU 前检 | 训练仍由 Python 3.11/JAX 执行，LIBERO 仍由 Python 3.8 执行，通信协议未变 |
+| `.dockerignore`；`scripts/docker/**`；`examples/libero/Dockerfile`；`examples/libero/compose.yml`；`scripts/libero_compose_preflight.py`；`scripts/libero_compose_preflight_test.py` | 构建 policy/simulator 镜像、安装宿主组件、编排端口/挂载/GPU/EGL，并做容器前检 | 阿里云 DSW 托管环境没有可用 daemon/Compose/toolkit；实际验证路线是双 Python + WebSocket + 私有 EGL vendor JSON | [host-only runbook](pi05_libero_bsp_phase1_server.md) 与 `tests/contracts/libero_host_contract_test.py` | 不再提供一键镜像构建、嵌套容器编排和容器 GPU 前检 | 训练仍由 Python 3.11/JAX 执行，LIBERO 仍由 Python 3.8 执行，通信协议未变 |
 | `examples/aloha_real/**`；`examples/aloha_sim/**`；`third_party/aloha` | ALOHA 实机/仿真、数据转换、视频、依赖与 gitlink | 本实验只有 LIBERO | 锁定 `third_party/libero` 和 `examples/libero/main.py` | 不再支持 ALOHA 采集、转换、训练、推理或仿真 | 五个配置、数据 transforms 和 evaluator 均不引用 ALOHA |
 | `examples/droid/**`；`examples/ur5/**` | DROID 数据处理/机器人客户端及 UR5 使用说明 | 非 LIBERO 平台 | LIBERO evaluator | 不再提供 DROID/UR5 操作路径 | 生产配置和 policy 注册表只接受 LIBERO |
 | `examples/simple_client/**` | 无机器人随机输入客户端和独立镜像示例 | 通用示例会误导为受支持入口 | `openpi-client` + LIBERO evaluator | 不再提供随机 observation 的通用客户端演示 | 目标 observation schema 由真实 LIBERO evaluator 构造 |
@@ -419,7 +419,7 @@ micro-batch 和 base checkpoint。full 与 LoRA 是两个训练家族，报告�
 | 服务 | 加载 checkpoint 并监听 WebSocket | `scripts/serve_policy.py` | config、checkpoint、port | policy metadata/actions | policy_config、server |
 | Evaluator | 四套件、固定初始状态、错误重试、视频选择 | `examples/libero/main.py` | simulator obs + server actions | manifest、JSONL、CSV、JSON、视频 | LIBERO、openpi-client |
 | Reporter | 十个 checkpoint 的严格身份/配对比较 | `scripts/compare_libero_phase1.py` | 十个 eval dir + diagnostics | CSV/JSON/Markdown/SVG | `openpi_client.libero_report` |
-| 轻量合同 | 无模型/数据环境也能检查支持边界 | `scripts/*contract_test.py` | tracked tree/config/source | pytest pass/fail | Python stdlib、Git；pytest 仅作 runner |
+| 轻量合同 | 无模型/数据环境也能检查支持边界 | `tests/contracts/` | tracked tree/config/source | pytest pass/fail | Python stdlib、Git；pytest 仅作 runner |
 
 ## 5. 旧 Docker 路线的职责、删除原因和代价
 

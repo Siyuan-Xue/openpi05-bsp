@@ -5,11 +5,30 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import tyro
 
 import openpi.shared.normalize as normalize
+from scripts import compute_norm_stats
 from scripts.compute_norm_stats import compare_norm_stats_assets
 from scripts.compute_norm_stats import norm_stats_output_path
 from scripts.compute_norm_stats import write_norm_comparison
+
+
+def test_cli_help_preserves_norm_arguments_and_success_exit(capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        tyro.cli(compute_norm_stats.main, args=["--help"])
+
+    assert exit_info.value.code == 0
+    help_text = capsys.readouterr().out
+    for argument in (
+        "--config-name",
+        "--assets-dir",
+        "--bsp-cache-path",
+        "--dataset-root",
+        "--compare-state-stats-with",
+        "--norm-comparison-output",
+    ):
+        assert argument in help_text
 
 
 def test_norm_stats_output_uses_asset_id_instead_of_repo_id(tmp_path: Path):

@@ -1,4 +1,8 @@
+import pytest
+
 from openpi.models import tokenizer as _tokenizer
+
+pytestmark = [pytest.mark.network, pytest.mark.data]
 
 
 def test_tokenize():
