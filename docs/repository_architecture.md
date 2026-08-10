@@ -262,7 +262,7 @@ BSP 作者仓库和论文 PDF 是实现参考，不是服务器运行依赖，�
 | `rich`、`polars` | 富 CLI 与 dataframe/report 工具 | 当前 CLI 使用 Tyro/logging；报告使用 stdlib CSV/JSON | `tyro`、`tqdm`、stdlib `csv/json` |
 | `ml_collections` | 上游配置对象 | 五个生产配置由 dataclass + Tyro 注册，不再 import | `dataclasses`、`tyro` |
 | `transformers` | PyTorch/Transformers backend 及本地 patch | `models_pytorch` 和转换/训练脚本已删除；JAX π0.5 不依赖它 | `gemma.py`、`siglip.py`、`pi0.py` |
-| `chex` | 旧测试 assertion helper | 保留测试没有直接 import | `unittest`/pytest assertions 与 NumPy |
+| `chex` | 旧测试 assertion helper | 保留测试没有直接 import | pytest assertions 与 NumPy |
 | `rlds` group：`dlimp`、`tensorflow-cpu`、`tensorflow-datasets` | DROID/RLDS 数据读取 | 官方 LIBERO v2.0 已是 LeRobot；RLDS loader 和 converter 删除 | `lerobot` 和 `data_loader.py` |
 | root/client `dm-tree` | 通用 pytree 与 client 序列化测试 helper | 运行时无直接 import；`msgpack_numpy_test.py` 用 Python 3.8 兼容递归 helper 覆盖 dict/list/tuple/leaf | JAX tree（server）与 stdlib helper（client test） |
 | dev `ipykernel`、`ipywidgets`、`matplotlib` | notebook kernel、widget、绘图 | 两个 notebook 删除；正式报告用内建 SVG writer | Ruff、pytest、pre-commit；`learning_curve.svg` 由 reporter 生成 |
@@ -419,7 +419,7 @@ micro-batch 和 base checkpoint。full 与 LoRA 是两个训练家族，报告�
 | 服务 | 加载 checkpoint 并监听 WebSocket | `scripts/serve_policy.py` | config、checkpoint、port | policy metadata/actions | policy_config、server |
 | Evaluator | 四套件、固定初始状态、错误重试、视频选择 | `examples/libero/main.py` | simulator obs + server actions | manifest、JSONL、CSV、JSON、视频 | LIBERO、openpi-client |
 | Reporter | 十个 checkpoint 的严格身份/配对比较 | `scripts/compare_libero_phase1.py` | 十个 eval dir + diagnostics | CSV/JSON/Markdown/SVG | `openpi_client.libero_report` |
-| 轻量合同 | 无模型/数据环境也能检查支持边界 | `scripts/*contract_test.py` | tracked tree/config/source | unittest pass/fail | Python stdlib、Git |
+| 轻量合同 | 无模型/数据环境也能检查支持边界 | `scripts/*contract_test.py` | tracked tree/config/source | pytest pass/fail | Python stdlib、Git；pytest 仅作 runner |
 
 ## 5. 旧 Docker 路线的职责、删除原因和代价
 
@@ -448,13 +448,25 @@ GPU，因此会排队或失败。瘦身后 `.github/workflows/test.yml` 使用�
 `ubuntu-latest`，只运行：
 
 - Ruff lint 和 format；
-- 23 个既有 dependency-free repository/core/LIBERO host contracts；
+- pytest 驱动、仅使用标准库/Git 的 repository/core/LIBERO host contracts；
+- 不导入 JAX 的 runtime path、optimizer-step/checkpoint planning 与 phase-one CLI tests；
 - 本文的文档、链接和删除审计合同；
 - Python 3.8 隔离安装的 `openpi-client` 测试。
 
 它不会下载 `pi05_base` 或 LIBERO，不安装 CUDA，不启动 EGL/MuJoCo，不运行训练或 rollout。
 完整 GPU/数据/仿真门禁仍属于 H20 服务器。`uv.lock` 目前锁定 209 个 package；传递依赖仍可
 包含 LeRobot 所需的包，但 root project 已移除非目标直接依赖和 RLDS group。
+
+全仓测试统一采用原生 pytest 风格。仓库合同的业务逻辑仍只依赖 Python 标准库和 Git，
+“stdlib-only”不再意味着改用另一套测试框架；pytest 是该 job 唯一显式请求的第三方测试工具，
+其少量传递运行依赖由 uv 解析。
+Ruff 的 `PT` 规则和仓库合同共同禁止 `unittest.TestCase`、`self.assert*`、`subTest` 与
+`python -m unittest` 回流。这样本地、编辑器、CI 和 Python 3.8 client job 使用相同的收集与断言语义。
+
+Python 3.11 job 固定 pytest 9.0.3。LIBERO simulator 仍要求 Python 3.8，因此隔离 client job 暂时
+固定最后兼容该解释器的 pytest 8.3.5，并把 pytest 临时根和 `--basetemp` 定向到 GitHub job 私有
+`runner.temp`，以收敛 [GHSA-6w46-j5rx-g56g](https://github.com/advisories/GHSA-6w46-j5rx-g56g) 所述的
+本地 tmpdir 风险面。这是 Python 3.8 兼容债务；client 升级到 Python 3.10+ 后应删除旧版本 pin。
 
 ### 6.2 pre-commit
 

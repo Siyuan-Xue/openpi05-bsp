@@ -36,9 +36,22 @@ pre-commit install
 pre-commit run --all-files
 ```
 
-The public lightweight CI runs Ruff, 23 dependency-free repository/core/LIBERO contracts, documentation/link/
-deletion-audit contracts, and the isolated Python 3.8 `openpi-client` suite. It deliberately does not download
-models or data and does not run CUDA, EGL, training, or rollouts.
+The public lightweight CI uses one test style and one runner: pytest. It runs Ruff, stdlib-only
+repository/core/LIBERO contracts, lightweight training/checkpoint planning tests, documentation/link/deletion-audit
+contracts, and the isolated Python 3.8 `openpi-client` suite. “Stdlib-only” describes the code under test; the
+pytest runner is the only explicitly requested third-party test tool in that job; uv resolves its small transitive
+runtime dependencies. CI deliberately does not download models or data and does not run CUDA, EGL, training, or
+rollouts.
+
+The Python 3.11 job uses pytest 9.0.3. The simulator-compatible Python 3.8 client job must temporarily remain on
+pytest 8.3.5, because pytest 9 no longer supports Python 3.8; that job directs pytest temporary files to the
+job-private GitHub runner directory to contain the affected tmpdir surface documented in
+[GHSA-6w46-j5rx-g56g](https://github.com/advisories/GHSA-6w46-j5rx-g56g). Remove this compatibility pin when the
+LIBERO client moves to Python 3.10+.
+
+Write tests as native pytest functions or `Test*` classes with plain `assert`, `pytest.raises`, fixtures, and
+parametrization. Do not introduce `unittest.TestCase`, `self.assert*`, `subTest`, or `python -m unittest`; a
+repository contract and Ruff's pytest-style rules enforce this boundary.
 
 When dependencies change, regenerate `uv.lock` with the pinned uv workflow and explain direct dependency additions.
 Resolver-required transitive packages may remain; an unused package is not justification for hand-editing the lock.

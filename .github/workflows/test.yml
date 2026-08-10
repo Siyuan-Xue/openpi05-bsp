@@ -9,6 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GIT_LFS_SKIP_SMUDGE: true
+      PYTHONPATH: src:packages/openpi-client/src
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,20 +26,24 @@ jobs:
         run: uvx --from ruff==0.8.6 ruff check .
       - name: Ruff format
         run: uvx --from ruff==0.8.6 ruff format --check .
-      - name: Run dependency-free repository contracts
+      - name: Run stdlib-only repository contracts with pytest
         run: |
-          python -m unittest \
-            scripts.repository_slim_contract_test \
-            scripts.repository_documentation_contract_test \
-            scripts.core_runtime_slim_test \
-            scripts.libero_revision_contract_test \
-            scripts.libero_host_contract_test
+          uvx --from pytest==9.0.3 pytest -q --noconftest \
+            scripts/repository_slim_contract_test.py \
+            scripts/repository_documentation_contract_test.py \
+            scripts/core_runtime_slim_test.py \
+            scripts/libero_revision_contract_test.py \
+            scripts/libero_host_contract_test.py \
+            src/openpi/training/runtime_paths_test.py \
+            src/openpi/training/train_planning_test.py \
+            scripts/compare_libero_phase1_test.py
 
   openpi-client:
     name: Isolated openpi-client tests (Python 3.8)
     runs-on: ubuntu-latest
     env:
       GIT_LFS_SKIP_SMUDGE: true
+      PYTEST_DEBUG_TEMPROOT: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -47,7 +52,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.8"
-      - name: Install only openpi-client and its test runner
-        run: python -m pip install --disable-pip-version-check pytest ./packages/openpi-client
+      - name: Install only openpi-client and its pinned test runner
+        run: python -m pip install --disable-pip-version-check pytest==8.3.5 ./packages/openpi-client
       - name: Run isolated openpi-client tests
-        run: python -m pytest packages/openpi-client/src/openpi_client -q
+        run: >-
+          python -m pytest packages/openpi-client/src/openpi_client -q
+          --basetemp="$RUNNER_TEMP/openpi-client-pytest"

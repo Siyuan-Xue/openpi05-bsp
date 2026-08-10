@@ -41,7 +41,7 @@ Repository = "https://github.com/Siyuan-Xue/openpi05-bsp"
 
 [dependency-groups]
 dev = [
-    "pytest>=8.3.4",
+    "pytest==9.0.3",
     "ruff>=0.8.6",
     "pre-commit>=4.0.1",
     "pynvml>=12.0.0",
@@ -116,11 +116,16 @@ single-line-exclusions = ["collections.abc", "typing", "typing_extensions"]
 known-third-party = ["wandb"]
 
 [tool.ruff.lint.per-file-ignores]
-# The dependency-free contracts deliberately use the standard-library unittest API,
-# and several tests intentionally exercise private helpers as part of their contract.
-"**/*_test.py" = ["PT009", "PT027", "RUF012", "SLF001"]
-# This host contract installs import stubs before importing the module under test.
-"scripts/libero_host_contract_test.py" = ["E402"]
+# These focused contracts intentionally exercise private helpers.
+"scripts/libero_eval_test.py" = ["SLF001"]
+# This host contract installs import stubs before importing the module under test,
+# then checks private helpers at the host/client boundary.
+"scripts/libero_host_contract_test.py" = ["E402", "SLF001"]
+"src/openpi/policies/policy_seed_test.py" = ["SLF001"]
+"src/openpi/training/bsp_dataset_test.py" = ["SLF001"]
+"src/openpi/training/bsp_test.py" = ["SLF001"]
+# The loader stub mirrors class-level attributes from the external dataset API.
+"src/openpi/training/data_loader_test.py" = ["RUF012"]
 # The simulator entry point must remain valid syntax in the isolated Python 3.8 environment.
 "examples/libero/*.py" = ["UP006", "UP007", "UP035"]
 

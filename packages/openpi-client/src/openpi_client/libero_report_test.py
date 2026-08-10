@@ -4,7 +4,8 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
-import unittest
+
+import pytest
 
 from openpi_client import libero_eval
 from openpi_client import libero_report
@@ -188,7 +189,7 @@ def _write_diagnostics(root):
     return bsp, norm
 
 
-class LiberoPhaseOneReportTest(unittest.TestCase):
+class TestLiberoPhaseOneReport:
     def test_full_20000_rollout_comparison_emits_all_five_fixed_milestone_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -220,46 +221,40 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
                 output_dir=output_dir,
             )
 
-            self.assertEqual(
-                {path.name for path in output_dir.iterdir()},
-                {
-                    "task_comparison.csv",
-                    "suite_comparison.csv",
-                    "learning_curve.csv",
-                    "comparison.json",
-                    "report.md",
-                    "learning_curve.svg",
-                },
-            )
-            self.assertEqual([row["checkpoint_step"] for row in comparison["milestones"]], list(_STEPS))
-            self.assertEqual(comparison["protocol"]["milestones"], list(_STEPS))
-            self.assertEqual(comparison["protocol"]["total_episodes"], 20_000)
-            self.assertEqual(comparison["protocol"]["training_family"], "full")
+            assert {path.name for path in output_dir.iterdir()} == {
+                "task_comparison.csv",
+                "suite_comparison.csv",
+                "learning_curve.csv",
+                "comparison.json",
+                "report.md",
+                "learning_curve.svg",
+            }
+            assert [row["checkpoint_step"] for row in comparison["milestones"]] == list(_STEPS)
+            assert comparison["protocol"]["milestones"] == list(_STEPS)
+            assert comparison["protocol"]["total_episodes"] == 20000
+            assert comparison["protocol"]["training_family"] == "full"
             for row in comparison["milestones"]:
-                self.assertEqual(row["bsp_minus_baseline"], 1.0)
-                self.assertEqual(row["bootstrap_95_ci"], [1.0, 1.0])
-                self.assertEqual(row["bootstrap_resamples"], 10000)
-                self.assertEqual(row["bootstrap_seed"], 42)
+                assert row["bsp_minus_baseline"] == 1.0
+                assert row["bootstrap_95_ci"] == [1.0, 1.0]
+                assert row["bootstrap_resamples"] == 10000
+                assert row["bootstrap_seed"] == 42
             with (output_dir / "task_comparison.csv").open(newline="", encoding="utf-8") as input_file:
-                self.assertEqual(len(list(csv.DictReader(input_file))), 200)
+                assert len(list(csv.DictReader(input_file))) == 200
             with (output_dir / "suite_comparison.csv").open(newline="", encoding="utf-8") as input_file:
-                self.assertEqual(len(list(csv.DictReader(input_file))), 20)
+                assert len(list(csv.DictReader(input_file))) == 20
             with (output_dir / "learning_curve.csv").open(newline="", encoding="utf-8") as input_file:
-                self.assertEqual(len(list(csv.DictReader(input_file))), 5)
-            self.assertNotIn("best", (output_dir / "report.md").read_text(encoding="utf-8").lower())
+                assert len(list(csv.DictReader(input_file))) == 5
+            assert "best" not in (output_dir / "report.md").read_text(encoding="utf-8").lower()
 
     def test_manifest_classifier_accepts_one_lora_family_and_rejects_mixed_families(self):
         lora = [_manifest(variant, step, family="lora") for variant in ("baseline", "bsp") for step in _STEPS]
 
         classified = libero_report.classify_phase_one_manifests(lora)
 
-        self.assertEqual(
-            set(classified),
-            {(variant, step) for variant in ("baseline", "bsp") for step in _STEPS},
-        )
+        assert set(classified) == {(variant, step) for variant in ("baseline", "bsp") for step in _STEPS}
         mixed = copy.deepcopy(lora)
         mixed[0]["config_name"] = "pi05_libero_baseline_h16"
-        with self.assertRaisesRegex(libero_report.ComparisonError, "training family"):
+        with pytest.raises(libero_report.ComparisonError, match="training family"):
             libero_report.classify_phase_one_manifests(mixed)
 
     def test_manifest_classifier_rejects_missing_duplicate_extra_and_wrong_protocol(self):
@@ -280,7 +275,7 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
         wrong_config[0]["config_name"] = "pi05_libero"
         cases.append(wrong_config)
         for manifests in cases:
-            with self.subTest(case=cases.index(manifests)), self.assertRaises(libero_report.ComparisonError):
+            with pytest.raises(libero_report.ComparisonError):
                 libero_report.classify_phase_one_manifests(manifests)
 
     def test_manifest_classifier_binds_unique_checkpoint_paths_to_their_steps(self):
@@ -294,7 +289,7 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
         wrong_step = copy.deepcopy(valid)
         wrong_step[0]["checkpoint"] = "checkpoint/baseline/9999"
         for manifests in (duplicate_path, wrong_step):
-            with self.subTest(manifests=manifests), self.assertRaises(libero_report.ComparisonError):
+            with pytest.raises(libero_report.ComparisonError):
                 libero_report.classify_phase_one_manifests(manifests)
 
     def test_manifest_requires_real_revision_hashes_finite_timeouts_and_shared_deadlines(self):
@@ -309,12 +304,12 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
         for field, value in mutations:
             manifests = copy.deepcopy(valid)
             manifests[0][field] = value
-            with self.subTest(field=field), self.assertRaises(libero_report.ComparisonError):
+            with pytest.raises(libero_report.ComparisonError):
                 libero_report.classify_phase_one_manifests(manifests)
 
         mismatched = copy.deepcopy(valid)
         mismatched[-1]["inference_timeout_s"] = 60.0
-        with self.assertRaises(libero_report.ComparisonError):
+        with pytest.raises(libero_report.ComparisonError):
             libero_report.classify_phase_one_manifests(mismatched)
 
     def test_strict_json_rejects_nan_and_truncated_input(self):
@@ -324,9 +319,9 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
             nan_path.write_text('{"value": NaN}\n', encoding="utf-8")
             truncated_path = root / "truncated.jsonl"
             truncated_path.write_text('{"value": 1}\n{"value":', encoding="utf-8")
-            with self.assertRaises(libero_report.ComparisonError):
+            with pytest.raises(libero_report.ComparisonError):
                 libero_report.load_strict_json(nan_path)
-            with self.assertRaises(libero_report.ComparisonError):
+            with pytest.raises(libero_report.ComparisonError):
                 libero_report.load_strict_jsonl(truncated_path)
 
     def test_pair_validator_rejects_duplicate_missing_or_identity_mismatch(self):
@@ -345,7 +340,7 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
             [bsp[0], dict(bsp[1], task_name="different task")],
             [bsp[0], dict(bsp[1], eval_seed=7)],
         ):
-            with self.subTest(invalid=invalid), self.assertRaises(libero_report.ComparisonError):
+            with pytest.raises(libero_report.ComparisonError):
                 libero_report.validate_paired_records(baseline, invalid)
 
     def test_hierarchical_macro_averages_tasks_then_suites(self):
@@ -357,7 +352,7 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
 
         observed = libero_report.hierarchical_delta(paired)
 
-        self.assertAlmostEqual(observed, 1.0 / 40.0)
+        assert observed == pytest.approx(1.0 / 40.0)
 
     def test_bootstrap_is_reproducible_and_constant_one_has_exact_unit_interval(self):
         paired = {(suite, task_id): [1.0] * 50 for suite in libero_eval.SUPPORTED_SUITES for task_id in range(10)}
@@ -365,8 +360,8 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
         first = libero_report.stratified_paired_bootstrap(paired)
         second = libero_report.stratified_paired_bootstrap(paired)
 
-        self.assertEqual(first, second)
-        self.assertEqual(first, (1.0, 1.0))
+        assert first == second
+        assert first == (1.0, 1.0)
 
     def test_bootstrap_is_reproducible_for_nonconstant_paired_deltas(self):
         paired = {(suite, task_id): [0.0] * 50 for suite in libero_eval.SUPPORTED_SUITES for task_id in range(10)}
@@ -375,9 +370,9 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
         first = libero_report.stratified_paired_bootstrap(paired)
         second = libero_report.stratified_paired_bootstrap(paired)
 
-        self.assertEqual(first, second)
-        self.assertLess(first[0], 0.0)
-        self.assertGreater(first[1], 0.0)
+        assert first == second
+        assert first[0] < 0.0
+        assert first[1] > 0.0
 
     def test_run_loader_rejects_artifact_errors_infrastructure_and_summary_mismatch(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -386,7 +381,7 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
             artifact_run = root / "artifact"
             _write_run(artifact_run, "baseline", 10000)
             (artifact_run / "artifact_errors.jsonl").write_text('{"error": "ffmpeg failed"}\n', encoding="utf-8")
-            with self.assertRaises(libero_report.ComparisonError):
+            with pytest.raises(libero_report.ComparisonError):
                 libero_report.load_run(artifact_run)
 
             infrastructure_run = root / "infrastructure"
@@ -403,7 +398,7 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
             )
             lines[0] = json.dumps(first_record, allow_nan=False, sort_keys=True)
             (infrastructure_run / "episodes.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
-            with self.assertRaises(libero_report.ComparisonError):
+            with pytest.raises(libero_report.ComparisonError):
                 libero_report.load_run(infrastructure_run)
 
             summary_run = root / "summary"
@@ -413,7 +408,7 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
             (summary_run / "summary.json").write_text(
                 json.dumps(summary, allow_nan=False, sort_keys=True) + "\n", encoding="utf-8"
             )
-            with self.assertRaises(libero_report.ComparisonError):
+            with pytest.raises(libero_report.ComparisonError):
                 libero_report.load_run(summary_run)
 
     def test_episode_validation_rejects_noncanonical_or_internally_inconsistent_records(self):
@@ -439,13 +434,13 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
         for mutation in mutations:
             record = dict(valid)
             record.update(mutation)
-            with self.subTest(mutation=mutation), self.assertRaises(libero_report.ComparisonError):
+            with pytest.raises(libero_report.ComparisonError):
                 libero_report._validate_episode(record, manifest)
 
         for missing in ("error", "mean_inference_ms"):
             record = dict(valid)
             record.pop(missing)
-            with self.subTest(missing=missing), self.assertRaises(libero_report.ComparisonError):
+            with pytest.raises(libero_report.ComparisonError):
                 libero_report._validate_episode(record, manifest)
 
         failure = _episode("libero_spatial", 0, 0, False).to_dict()
@@ -458,7 +453,7 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
         ):
             record = dict(failure)
             record.update(mutation)
-            with self.subTest(failure_mutation=mutation), self.assertRaises(libero_report.ComparisonError):
+            with pytest.raises(libero_report.ComparisonError):
                 libero_report._validate_episode(record, manifest)
 
     def test_episode_validation_accepts_real_retry_history_and_rejects_forged_history(self):
@@ -503,7 +498,7 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
         )
         for history in histories:
             record = dict(valid, infrastructure_history=history)
-            with self.subTest(history=history), self.assertRaises(libero_report.ComparisonError):
+            with pytest.raises(libero_report.ComparisonError):
                 libero_report._validate_episode(record, manifest)
 
     def test_diagnostics_must_match_all_variant_artifact_identities(self):
@@ -535,19 +530,19 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
             changed_norm = copy.deepcopy(norm)
             target = changed_bsp if payload is bsp else changed_norm
             target[key] = replacement
-            with self.subTest(key=key), self.assertRaises(libero_report.ComparisonError):
+            with pytest.raises(libero_report.ComparisonError):
                 libero_report.validate_diagnostics(manifests, changed_bsp, changed_norm)
 
         for flag in _VERIFICATION_FLAGS:
             changed = _bsp_diagnostics()
             changed[flag] = False
-            with self.subTest(verification_flag=flag), self.assertRaises(libero_report.ComparisonError):
+            with pytest.raises(libero_report.ComparisonError):
                 libero_report.validate_diagnostics(manifests, changed, norm)
 
         for field in ("mean", "std", "q01", "q99"):
             changed = _norm_diagnostics()
             changed["state_fields"][field]["equal"] = False
-            with self.subTest(state_field=field), self.assertRaises(libero_report.ComparisonError):
+            with pytest.raises(libero_report.ComparisonError):
                 libero_report.validate_diagnostics(manifests, bsp, changed)
 
     def test_diagnostics_allow_mean_reconstruction_error_above_p95_under_the_strict_maximum(self):
@@ -558,9 +553,5 @@ class LiberoPhaseOneReportTest(unittest.TestCase):
 
         result = libero_report.validate_diagnostics(manifests, bsp, _norm_diagnostics())
 
-        self.assertEqual(result["mean_reconstruction_error"], 0.0009)
-        self.assertEqual(result["p95_reconstruction_error"], 0.0008)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert result["mean_reconstruction_error"] == 0.0009
+        assert result["p95_reconstruction_error"] == 0.0008

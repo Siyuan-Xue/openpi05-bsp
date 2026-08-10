@@ -1,4 +1,4 @@
-"""Dependency-free contracts for the slim repository configuration and CI surface."""
+"""Stdlib-only pytest contracts for the slim repository configuration and CI surface."""
 
 from __future__ import annotations
 
@@ -9,7 +9,8 @@ import re
 import subprocess
 import sys
 import tomllib
-import unittest
+
+import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
 _REMOVED_DISTRIBUTIONS = {
@@ -86,123 +87,186 @@ def _undeclared_imports(imports: set[str], dependencies: set[str], local_modules
     }
 
 
-class RepositorySlimContractTest(unittest.TestCase):
-    def test_surviving_production_imports_are_declared_directly(self):
-        root_project = _project(_ROOT / "pyproject.toml")
-        client_project = _project(_ROOT / "packages/openpi-client/pyproject.toml")
-
-        root_imports = _production_imports((_ROOT / "src/openpi", _ROOT / "scripts"))
-        client_imports = _production_imports((_ROOT / "packages/openpi-client/src/openpi_client",))
-
-        self.assertEqual(
-            _undeclared_imports(root_imports, _dependency_names(root_project), {"openpi", "scripts"}),
-            set(),
-        )
-        self.assertEqual(
-            _undeclared_imports(client_imports, _dependency_names(client_project), {"openpi_client"}),
-            set(),
-        )
-
-    def test_openpi_client_test_imports_are_declared(self):
-        client_project = _project(_ROOT / "packages/openpi-client/pyproject.toml")
-        dependencies = _dependency_names(client_project)
-        dependencies.update(
-            _distribution_name(requirement) for requirement in client_project["dependency-groups"]["dev"]
-        )
-        tests = tuple(sorted((_ROOT / "packages/openpi-client/src/openpi_client").glob("*_test.py")))
-
-        self.assertTrue(tests)
-        self.assertEqual(
-            _undeclared_imports(_file_imports(tests), dependencies, {"openpi_client"}),
-            set(),
-        )
-
-    def test_removed_dependency_families_and_rlds_group_stay_absent(self):
-        project = _project(_ROOT / "pyproject.toml")
-        root_dependencies = _dependency_names(project)
-        client_dependencies = _dependency_names(_project(_ROOT / "packages/openpi-client/pyproject.toml"))
-        source_names = set(project["tool"]["uv"]["sources"])
-
-        self.assertEqual(root_dependencies.intersection(_REMOVED_DISTRIBUTIONS), set())
-        self.assertEqual(client_dependencies.intersection(_REMOVED_DISTRIBUTIONS), set())
-        self.assertNotIn("rlds", project["dependency-groups"])
-        self.assertNotIn("dlimp", source_names)
-
-    def test_retained_runtime_dependency_families_remain_explicit(self):
-        root_dependencies = _dependency_names(_project(_ROOT / "pyproject.toml"))
-        client_dependencies = _dependency_names(_project(_ROOT / "packages/openpi-client/pyproject.toml"))
-
-        self.assertTrue(
-            {
-                "etils",
-                "flax",
-                "imageio",
-                "jax",
-                "lerobot",
-                "optax",
-                "orbax-checkpoint",
-                "pillow",
-                "pydantic",
-                "scipy",
-                "sentencepiece",
-                "torch",
-                "tqdm",
-                "tyro",
-                "wandb",
-                "websockets",
-            }.issubset(root_dependencies)
-        )
-        self.assertTrue({"msgpack", "pillow", "typing-extensions", "websockets"}.issubset(client_dependencies))
-
-    def test_metadata_ownership_and_test_discovery_target_the_specialized_fork(self):
-        project = _project(_ROOT / "pyproject.toml")
-        vscode_source = (_ROOT / ".vscode/settings.json").read_text(encoding="utf-8")
-        vscode = json.loads(re.sub(r",(\s*[}\]])", r"\1", vscode_source))
-        codeowners = (_ROOT / ".github/CODEOWNERS").read_text(encoding="utf-8")
-
-        self.assertIn("pi0.5", project["project"]["description"].lower())
-        self.assertIn("libero", project["project"]["description"].lower())
-        self.assertEqual(project["project"]["urls"]["Repository"], "https://github.com/Siyuan-Xue/openpi05-bsp")
-        self.assertRegex(codeowners, r"(?m)^\*\s+@Siyuan-Xue\s*$")
-        self.assertEqual(
-            vscode["python.testing.pytestArgs"],
-            ["src/openpi", "scripts", "packages/openpi-client/src/openpi_client"],
-        )
-
-    def test_generated_experiment_and_tool_artifacts_are_ignored(self):
-        for relative_path in (
-            ".ruff_cache/cache.db",
-            ".uv-cache/archive-v0/item",
-            "artifacts/phase1/verification.json",
-            "reports/phase1/report.md",
-        ):
-            with self.subTest(path=relative_path):
-                result = subprocess.run(
-                    ["git", "check-ignore", "--quiet", "--no-index", relative_path],
-                    cwd=_ROOT,
-                    check=False,
-                )
-                self.assertEqual(result.returncode, 0)
-
-    def test_cpu_ci_runs_only_lightweight_static_and_client_gates(self):
-        workflows = "\n".join(
-            path.read_text(encoding="utf-8") for path in sorted((_ROOT / ".github/workflows").glob("*.yml"))
-        )
-        lowered = workflows.lower()
-
-        self.assertNotIn("openpi-verylarge", workflows)
-        self.assertNotIn("uv sync --all-extras", workflows)
-        self.assertNotIn("uv python install", workflows)
-        self.assertNotRegex(lowered, r"\b(?:cuda|mujoco|ffmpeg|apt-get)\b")
-        self.assertIn("runs-on: ubuntu-latest", workflows)
-        self.assertIn("ruff check", workflows)
-        self.assertIn("ruff format --check", workflows)
-        self.assertIn("repository_slim_contract_test", workflows)
-        self.assertIn("core_runtime_slim_test", workflows)
-        self.assertIn("libero_host_contract_test", workflows)
-        self.assertIn("packages/openpi-client", workflows)
-        self.assertIn("pytest", workflows)
+def _unittest_style_findings(paths: tuple[Path, ...]) -> list[str]:
+    findings = []
+    for path in paths:
+        module = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(module):
+            if isinstance(node, ast.Import) and any(alias.name == "unittest" for alias in node.names):
+                findings.append(f"{path.relative_to(_ROOT)}:{node.lineno}: import unittest")
+            elif isinstance(node, ast.ImportFrom) and node.module and node.module.split(".", 1)[0] == "unittest":
+                findings.append(f"{path.relative_to(_ROOT)}:{node.lineno}: from unittest")
+            elif isinstance(node, ast.ClassDef) and any(
+                (isinstance(base, ast.Name) and base.id == "TestCase")
+                or (isinstance(base, ast.Attribute) and base.attr == "TestCase")
+                for base in node.bases
+            ):
+                findings.append(f"{path.relative_to(_ROOT)}:{node.lineno}: TestCase")
+            elif (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "self"
+                and (node.attr.startswith("assert") or node.attr == "subTest")
+            ):
+                findings.append(f"{path.relative_to(_ROOT)}:{node.lineno}: self.{node.attr}")
+    return findings
 
 
-if __name__ == "__main__":
-    unittest.main()
+def _is_pytest_module(path: str | Path) -> bool:
+    name = Path(path).name
+    return name.endswith(".py") and (name.startswith("test_") or name.endswith("_test.py"))
+
+
+def _tracked_pytest_modules() -> tuple[Path, ...]:
+    tracked_paths = subprocess.run(
+        ["git", "ls-files"],
+        cwd=_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    return tuple(_ROOT / relative_path for relative_path in tracked_paths if _is_pytest_module(relative_path))
+
+
+def test_surviving_production_imports_are_declared_directly():
+    root_project = _project(_ROOT / "pyproject.toml")
+    client_project = _project(_ROOT / "packages/openpi-client/pyproject.toml")
+
+    root_imports = _production_imports((_ROOT / "src/openpi", _ROOT / "scripts"))
+    client_imports = _production_imports((_ROOT / "packages/openpi-client/src/openpi_client",))
+
+    assert _undeclared_imports(root_imports, _dependency_names(root_project), {"openpi", "scripts"}) == set()
+    assert _undeclared_imports(client_imports, _dependency_names(client_project), {"openpi_client"}) == set()
+
+
+def test_openpi_client_test_imports_are_declared():
+    client_project = _project(_ROOT / "packages/openpi-client/pyproject.toml")
+    dependencies = _dependency_names(client_project)
+    dependencies.update(_distribution_name(requirement) for requirement in client_project["dependency-groups"]["dev"])
+    test_root = _ROOT / "packages/openpi-client/src/openpi_client"
+    tests = tuple(sorted(path for path in test_root.glob("*.py") if _is_pytest_module(path)))
+
+    assert tests
+    assert _undeclared_imports(_file_imports(tests), dependencies, {"openpi_client"}) == set()
+
+
+def test_tracked_tests_use_only_native_pytest_style():
+    tracked_tests = _tracked_pytest_modules()
+
+    assert tracked_tests
+    assert _unittest_style_findings(tracked_tests) == []
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "test_example.py",
+        "example_test.py",
+        "nested/test_example.py",
+        "nested/example_test.py",
+    ],
+)
+def test_pytest_module_discovery_covers_both_supported_names(name: str):
+    assert _is_pytest_module(name)
+
+
+@pytest.mark.parametrize("name", ["example.py", "test_example.txt"])
+def test_pytest_module_discovery_rejects_non_tests(name: str):
+    assert not _is_pytest_module(name)
+
+
+def test_removed_dependency_families_and_rlds_group_stay_absent():
+    project = _project(_ROOT / "pyproject.toml")
+    root_dependencies = _dependency_names(project)
+    client_dependencies = _dependency_names(_project(_ROOT / "packages/openpi-client/pyproject.toml"))
+    source_names = set(project["tool"]["uv"]["sources"])
+
+    assert root_dependencies.intersection(_REMOVED_DISTRIBUTIONS) == set()
+    assert client_dependencies.intersection(_REMOVED_DISTRIBUTIONS) == set()
+    assert "rlds" not in project["dependency-groups"]
+    assert "dlimp" not in source_names
+
+
+def test_retained_runtime_dependency_families_remain_explicit():
+    root_dependencies = _dependency_names(_project(_ROOT / "pyproject.toml"))
+    client_dependencies = _dependency_names(_project(_ROOT / "packages/openpi-client/pyproject.toml"))
+
+    assert {
+        "etils",
+        "flax",
+        "imageio",
+        "jax",
+        "lerobot",
+        "optax",
+        "orbax-checkpoint",
+        "pillow",
+        "pydantic",
+        "scipy",
+        "sentencepiece",
+        "torch",
+        "tqdm",
+        "tyro",
+        "wandb",
+        "websockets",
+    }.issubset(root_dependencies)
+    assert {"msgpack", "pillow", "typing-extensions", "websockets"}.issubset(client_dependencies)
+
+
+def test_metadata_ownership_and_test_discovery_target_the_specialized_fork():
+    project = _project(_ROOT / "pyproject.toml")
+    vscode_source = (_ROOT / ".vscode/settings.json").read_text(encoding="utf-8")
+    vscode = json.loads(re.sub(r",(\s*[}\]])", r"\1", vscode_source))
+    codeowners = (_ROOT / ".github/CODEOWNERS").read_text(encoding="utf-8")
+
+    assert "pi0.5" in project["project"]["description"].lower()
+    assert "libero" in project["project"]["description"].lower()
+    assert project["project"]["urls"]["Repository"] == "https://github.com/Siyuan-Xue/openpi05-bsp"
+    assert re.search("(?m)^\\*\\s+@Siyuan-Xue\\s*$", codeowners) is not None
+    assert vscode["python.testing.pytestArgs"] == ["src/openpi", "scripts", "packages/openpi-client/src/openpi_client"]
+    assert vscode["python.testing.pytestEnabled"] is True
+    assert vscode["python.testing.unittestEnabled"] is False
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        ".ruff_cache/cache.db",
+        ".uv-cache/archive-v0/item",
+        "artifacts/phase1/verification.json",
+        "reports/phase1/report.md",
+    ],
+)
+def test_generated_experiment_and_tool_artifacts_are_ignored(relative_path: str):
+    result = subprocess.run(
+        ["git", "check-ignore", "--quiet", "--no-index", relative_path],
+        cwd=_ROOT,
+        check=False,
+    )
+    assert result.returncode == 0, relative_path
+
+
+def test_cpu_ci_runs_only_lightweight_static_and_client_gates():
+    workflows = "\n".join(
+        path.read_text(encoding="utf-8") for path in sorted((_ROOT / ".github/workflows").glob("*.yml"))
+    )
+    lowered = workflows.lower()
+
+    assert "openpi-verylarge" not in workflows
+    assert "uv sync --all-extras" not in workflows
+    assert "uv python install" not in workflows
+    assert "python -m unittest" not in workflows
+    assert re.search("\\b(?:cuda|mujoco|ffmpeg|apt-get)\\b", lowered) is None
+    assert "runs-on: ubuntu-latest" in workflows
+    assert "ruff check" in workflows
+    assert "ruff format --check" in workflows
+    assert "repository_slim_contract_test" in workflows
+    assert "core_runtime_slim_test" in workflows
+    assert "libero_host_contract_test" in workflows
+    assert "runtime_paths_test" in workflows
+    assert "train_planning_test" in workflows
+    assert "compare_libero_phase1_test" in workflows
+    assert "packages/openpi-client" in workflows
+    assert "pytest==9.0.3" in workflows
+    assert "pytest==8.3.5" in workflows
+    assert "PYTEST_DEBUG_TEMPROOT" in workflows
+    assert "--basetemp" in workflows

@@ -1,10 +1,9 @@
-"""Dependency-free repository contract for the official LIBERO dataset revision."""
+"""Stdlib-only pytest contract for the official LIBERO dataset revision."""
 
 from __future__ import annotations
 
 import ast
 from pathlib import Path
-import unittest
 
 _REPOSITORY = Path(__file__).resolve().parents[1]
 _EXPECTED_REVISION = "v2.0"
@@ -60,30 +59,18 @@ def _phase_one_config_revisions(path: Path) -> dict[str, str]:
     return revisions
 
 
-class LiberoRevisionContractTest(unittest.TestCase):
-    def test_all_phase_one_entrypoints_use_the_real_hub_revision(self):
-        self.assertEqual(
-            _module_assignment(_REPOSITORY / "src/openpi/training/bsp_dataset.py", "LIBERO_REVISION"),
-            _EXPECTED_REVISION,
-        )
-        self.assertEqual(
-            _phase_one_config_revisions(_REPOSITORY / "src/openpi/training/config.py"),
-            {
-                "pi05_libero_baseline_h16": _EXPECTED_REVISION,
-                "pi05_libero_bsp_h16": _EXPECTED_REVISION,
-                "pi05_libero_baseline_lora_h16": _EXPECTED_REVISION,
-                "pi05_libero_bsp_lora_h16": _EXPECTED_REVISION,
-            },
-        )
-        self.assertEqual(
-            _args_field_default(_REPOSITORY / "examples/libero/main.py", "dataset_revision"),
-            _EXPECTED_REVISION,
-        )
-        self.assertIn(
-            f"export LIBERO_DATASET_REVISION={_EXPECTED_REVISION}",
-            (_REPOSITORY / "examples/libero/README.md").read_text(),
-        )
-
-
-if __name__ == "__main__":
-    unittest.main()
+def test_all_phase_one_entrypoints_use_the_real_hub_revision():
+    assert (
+        _module_assignment(_REPOSITORY / "src/openpi/training/bsp_dataset.py", "LIBERO_REVISION") == _EXPECTED_REVISION
+    )
+    assert _phase_one_config_revisions(_REPOSITORY / "src/openpi/training/config.py") == {
+        "pi05_libero_baseline_h16": _EXPECTED_REVISION,
+        "pi05_libero_bsp_h16": _EXPECTED_REVISION,
+        "pi05_libero_baseline_lora_h16": _EXPECTED_REVISION,
+        "pi05_libero_bsp_lora_h16": _EXPECTED_REVISION,
+    }
+    assert _args_field_default(_REPOSITORY / "examples/libero/main.py", "dataset_revision") == _EXPECTED_REVISION
+    assert (
+        f"export LIBERO_DATASET_REVISION={_EXPECTED_REVISION}"
+        in (_REPOSITORY / "examples/libero/README.md").read_text()
+    )
