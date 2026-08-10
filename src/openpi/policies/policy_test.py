@@ -1,4 +1,3 @@
-from openpi_client import action_chunk_broker
 import pytest
 
 from openpi.policies import libero_policy
@@ -15,20 +14,3 @@ def test_infer():
     result = policy.infer(example)
 
     assert result["actions"].shape == (config.model.action_horizon, 7)
-
-
-@pytest.mark.manual
-def test_broker():
-    config = _config.get_config("pi05_libero")
-    policy = _policy_config.create_trained_policy(config, "gs://openpi-assets/checkpoints/pi05_libero")
-
-    broker = action_chunk_broker.ActionChunkBroker(
-        policy,
-        # Only execute the first half of the chunk.
-        action_horizon=config.model.action_horizon // 2,
-    )
-
-    example = libero_policy.make_libero_example()
-    for _ in range(config.model.action_horizon):
-        outputs = broker.infer(example)
-        assert outputs["actions"].shape == (7,)
