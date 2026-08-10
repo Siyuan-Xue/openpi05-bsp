@@ -111,9 +111,6 @@ export CLIENT_ARGS="\
 python examples/libero/main.py $CLIENT_ARGS
 ```
 
-For the complete phase-one protocol and its audit artifacts, follow the
-[authoritative server runbook](../../docs/pi05_libero_bsp_phase1_server.md).
-
 ## Results
 
 If you want to reproduce the following numbers, you can evaluate the checkpoint at `gs://openpi-assets/checkpoints/pi05_libero/`. This

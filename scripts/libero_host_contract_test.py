@@ -39,6 +39,35 @@ def _function_parameters(path: Path, function_name: str) -> set[str]:
     return {argument.arg.replace("_", "-") for argument in arguments}
 
 
+def _call_keyword(call: ast.Call, name: str) -> ast.expr:
+    for keyword in call.keywords:
+        if keyword.arg == name:
+            return keyword.value
+    raise AssertionError(f"Missing {name!r} in configuration call")
+
+
+def _train_config_calls() -> dict[str, ast.Call]:
+    config_path = _ROOT / "src" / "openpi" / "training" / "config.py"
+    module = ast.parse(config_path.read_text(encoding="utf-8"))
+    configs = next(
+        node.value
+        for node in module.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "_CONFIGS" for target in node.targets)
+    )
+    if not isinstance(configs, ast.List):
+        raise AssertionError("_CONFIGS must remain a literal list of TrainConfig calls")
+    return {
+        ast.literal_eval(_call_keyword(config, "name")): config
+        for config in configs.elts
+        if isinstance(config, ast.Call)
+    }
+
+
+def _literal_keyword(call: ast.Call, name: str):
+    return ast.literal_eval(_call_keyword(call, name))
+
+
 class LiberoHostContractTest(unittest.TestCase):
     def test_host_server_python_and_scipy_remain_pinned(self):
         project = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
@@ -63,6 +92,7 @@ class LiberoHostContractTest(unittest.TestCase):
         self.assertIn("HOST_RUNTIME_DIGEST", readme)
         self.assertIn("--args.container-digest ${HOST_RUNTIME_DIGEST}", readme)
         self.assertIn("${EXPERIMENTS_DIR}", readme)
+        self.assertNotIn("../../docs/pi05_libero_bsp_phase1_server.md", readme)
 
     def test_readme_evaluator_flags_match_retained_args_and_protocols(self):
         readme = _README.read_text(encoding="utf-8")
@@ -145,6 +175,97 @@ class LiberoHostContractTest(unittest.TestCase):
                 "learning_curve.svg",
             },
         )
+
+    def test_host_training_overrides_keep_libero_data_inputs_addressable(self):
+        """Fails if a host CLI override or LIBERO data path is removed from its dataclass."""
+        config_path = _ROOT / "src" / "openpi" / "training" / "config.py"
+        train_fields = _class_fields(config_path, "TrainConfig")
+        data_fields = _class_fields(config_path, "LeRobotLiberoDataConfig")
+
+        self.assertTrue(
+            {
+                "exp-name",
+                "seed",
+                "batch-size",
+                "micro-batch-size",
+                "num-train-steps",
+                "save-interval",
+                "assets-base-dir",
+                "checkpoint-base-dir",
+                "resume",
+            }.issubset(train_fields)
+        )
+        self.assertTrue({"lerobot-root", "bsp-cache-path"}.issubset(data_fields))
+
+    def test_five_configs_keep_h10_and_h16_phase_one_checkpoint_milestones(self):
+        """Fails if a production config loses its fixed checkpoint cadence or H10 default."""
+        configs = _train_config_calls()
+        phase_one = (
+            "pi05_libero_baseline_h16",
+            "pi05_libero_bsp_h16",
+            "pi05_libero_baseline_lora_h16",
+            "pi05_libero_bsp_lora_h16",
+        )
+        milestones = (0, 1_000, 2_000, 5_000, 10_000)
+
+        self.assertEqual(tuple(configs), ("pi05_libero", *phase_one))
+        self.assertEqual(_literal_keyword(configs["pi05_libero"], "num_train_steps"), 30_000)
+        for name in phase_one:
+            with self.subTest(config=name):
+                config = configs[name]
+                self.assertEqual(_literal_keyword(config, "num_train_steps"), 10_000)
+                self.assertEqual(_literal_keyword(config, "save_interval"), 1_000)
+                self.assertEqual(_literal_keyword(config, "keep_period"), 10_000)
+                self.assertEqual(_literal_keyword(config, "permanent_checkpoint_steps"), milestones)
+
+        h10_model = _call_keyword(configs["pi05_libero"], "model")
+        self.assertIsInstance(h10_model, ast.Call)
+        self.assertEqual(_literal_keyword(h10_model, "action_horizon"), 10)
+
+    def test_h16_ab_bindings_and_checkpoint_save_protocol_remain_coupled(self):
+        """Fails if report A/B identities or training's checkpoint save inputs drift apart."""
+        expected_bindings = {
+            ("baseline", "full"): "pi05_libero_baseline_h16",
+            ("bsp", "full"): "pi05_libero_bsp_h16",
+            ("baseline", "lora"): "pi05_libero_baseline_lora_h16",
+            ("bsp", "lora"): "pi05_libero_bsp_lora_h16",
+        }
+        self.assertEqual(libero_report._PHASE_ONE_CONFIGS, expected_bindings)
+        self.assertEqual(libero_eval.resolve_policy_protocol("baseline", 10).name, "baseline_h10_calibration")
+        self.assertEqual(libero_eval.resolve_policy_protocol("baseline", 16).name, "baseline_h16")
+
+        configs = _train_config_calls()
+        for name in ("pi05_libero_baseline_h16", "pi05_libero_bsp_h16"):
+            model = _call_keyword(configs[name], "model")
+            self.assertIsInstance(model, ast.Call)
+            self.assertEqual(_literal_keyword(model, "action_horizon"), 16)
+        for name in ("pi05_libero_bsp_h16", "pi05_libero_bsp_lora_h16"):
+            data = _call_keyword(configs[name], "data")
+            self.assertIsInstance(data, ast.Call)
+            self.assertTrue(_literal_keyword(data, "use_bsp"))
+
+        train_tree = ast.parse((_ROOT / "scripts" / "train.py").read_text(encoding="utf-8"))
+        calls = [node for node in ast.walk(train_tree) if isinstance(node, ast.Call)]
+        call_names = {
+            node.func.attr
+            for node in calls
+            if isinstance(node.func, ast.Attribute)
+        }
+        self.assertTrue({"initialize_checkpoint_dir", "save_state", "should_save_checkpoint"}.issubset(call_names))
+        initialize = next(
+            call
+            for call in calls
+            if isinstance(call.func, ast.Attribute) and call.func.attr == "initialize_checkpoint_dir"
+        )
+        initialize_keywords = {keyword.arg for keyword in initialize.keywords}
+        self.assertTrue({"keep_period", "permanent_checkpoint_steps", "overwrite", "resume"}.issubset(initialize_keywords))
+        should_save = next(
+            call
+            for call in calls
+            if isinstance(call.func, ast.Attribute) and call.func.attr == "should_save_checkpoint"
+        )
+        should_save_keywords = {keyword.arg for keyword in should_save.keywords}
+        self.assertTrue({"num_train_steps", "save_interval"}.issubset(should_save_keywords))
 
 
 if __name__ == "__main__":
