@@ -53,7 +53,9 @@ def test_torch_data_loader_parallel():
 
 
 def test_with_fake_dataset():
-    config = _config.get_config("debug")
+    config = dataclasses.replace(
+        _config.get_config("pi05_libero"), data=_config.FakeDataConfig(), batch_size=4, num_workers=0
+    )
 
     loader = _data_loader.create_data_loader(config, skip_norm_stats=True, num_batches=2)
     batches = list(loader)
@@ -68,7 +70,13 @@ def test_with_fake_dataset():
 
 
 def test_jax_data_loader_emits_the_global_micro_batch():
-    config = dataclasses.replace(_config.get_config("debug"), batch_size=4, micro_batch_size=2)
+    config = dataclasses.replace(
+        _config.get_config("pi05_libero"),
+        data=_config.FakeDataConfig(),
+        batch_size=4,
+        micro_batch_size=2,
+        num_workers=0,
+    )
 
     loader = _data_loader.create_data_loader(config, skip_norm_stats=True, num_batches=1)
     batch = next(iter(loader))
@@ -77,7 +85,7 @@ def test_jax_data_loader_emits_the_global_micro_batch():
 
 
 def test_with_real_dataset():
-    config = _config.get_config("pi0_aloha_sim")
+    config = _config.get_config("pi05_libero")
     config = dataclasses.replace(config, batch_size=4)
 
     loader = _data_loader.create_data_loader(
@@ -137,7 +145,6 @@ def test_libero_h16_configs_use_the_same_jax_full_finetuning_recipe():
         assert config.keep_period == 10_000
         assert config.permanent_checkpoint_steps == expected_milestones
         assert config.weight_loader.params_path == "gs://openpi-assets/checkpoints/pi05_base/params"
-        assert config.pytorch_weight_path is None
         assert config.lr_schedule.warmup_steps == 10_000
         assert config.lr_schedule.peak_lr == 5e-5
         assert config.lr_schedule.decay_steps == 1_000_000

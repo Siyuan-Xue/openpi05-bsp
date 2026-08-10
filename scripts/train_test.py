@@ -8,15 +8,30 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import pytest
 from flax import nnx
 
 from openpi.models import model as _model
+from openpi.models import pi0_config
 from openpi.training import config as _config
 from openpi.training import train_planning
 from openpi.training import utils as training_utils
 
 from . import train
+
+
+def _debug_config() -> _config.TrainConfig:
+    """Build the tiny test-only config without expanding the production registry."""
+    return _config.TrainConfig(
+        name="debug",
+        data=_config.FakeDataConfig(),
+        batch_size=2,
+        model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
+        save_interval=100,
+        overwrite=True,
+        exp_name="debug",
+        num_train_steps=10,
+        wandb_enabled=False,
+    )
 
 
 class _DeterministicLinearModel(_model.BaseModel):
@@ -58,10 +73,10 @@ def _assert_trees_allclose(actual, expected):
         np.testing.assert_allclose(actual_leaf, expected_leaf, rtol=1e-6, atol=1e-6)
 
 
-@pytest.mark.parametrize("config_name", ["debug"])
-def test_train(tmp_path: pathlib.Path, config_name: str):
+def test_train(tmp_path: pathlib.Path):
+    config_name = "debug"
     config = dataclasses.replace(
-        _config._CONFIGS_DICT[config_name],  # noqa: SLF001
+        _debug_config(),
         batch_size=2,
         micro_batch_size=1,
         checkpoint_base_dir=str(tmp_path / "checkpoint"),
@@ -85,7 +100,7 @@ def test_train(tmp_path: pathlib.Path, config_name: str):
 
 def _step_zero_config(tmp_path: pathlib.Path, *, exp_name: str) -> _config.TrainConfig:
     return dataclasses.replace(
-        _config._CONFIGS_DICT["debug"],  # noqa: SLF001
+        _debug_config(),
         batch_size=2,
         micro_batch_size=1,
         checkpoint_base_dir=str(tmp_path / "checkpoint"),
@@ -124,7 +139,7 @@ def test_train_resumes_from_step_zero_without_overwriting_it(tmp_path: pathlib.P
 
 
 def test_two_micro_batches_match_one_direct_batch_and_advance_state_once():
-    config = _config._CONFIGS_DICT["debug"]  # noqa: SLF001
+    config = _debug_config()
     accumulation_plan = train_planning.plan_gradient_accumulation(
         batch_size=4,
         micro_batch_size=2,

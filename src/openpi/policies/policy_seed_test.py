@@ -22,7 +22,6 @@ def test_explicit_inference_seed_is_stateless_but_absent_seed_preserves_split_be
 def test_policy_infer_pops_reserved_seed_before_input_transforms(monkeypatch):
     seen_inputs = []
     policy_instance = object.__new__(policy.Policy)
-    policy_instance._is_pytorch_model = False
     policy_instance._rng = jax.random.key(5)
     policy_instance._sample_kwargs = {}
     policy_instance._input_transform = lambda inputs: seen_inputs.append(inputs) or {"state": np.asarray([1.0])}
