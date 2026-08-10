@@ -46,9 +46,10 @@ def _call_keyword(call: ast.Call, name: str) -> ast.expr:
     raise AssertionError(f"Missing {name!r} in configuration call")
 
 
-def _train_config_calls() -> dict[str, ast.Call]:
-    config_path = _ROOT / "src" / "openpi" / "training" / "config.py"
-    module = ast.parse(config_path.read_text(encoding="utf-8"))
+def _train_config_calls(module: ast.Module | None = None) -> dict[str, ast.Call]:
+    if module is None:
+        config_path = _ROOT / "src" / "openpi" / "training" / "config.py"
+        module = ast.parse(config_path.read_text(encoding="utf-8"))
     configs = next(
         node.value
         for node in module.body
@@ -66,6 +67,30 @@ def _train_config_calls() -> dict[str, ast.Call]:
 
 def _literal_keyword(call: ast.Call, name: str):
     return ast.literal_eval(_call_keyword(call, name))
+
+
+def _assert_shared_lora_model_contract(config_source: str) -> None:
+    """Reject a LoRA shape change or a config that stops sharing the common model."""
+    module = ast.parse(config_source)
+    assignment = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "_PI05_LIBERO_LORA_H16_MODEL" for target in node.targets)
+    )
+    if not isinstance(assignment.value, ast.Call):
+        raise AssertionError("_PI05_LIBERO_LORA_H16_MODEL must remain a model constructor call")
+    model = assignment.value
+    expected = {"pi05": True, "action_dim": 32, "action_horizon": 16}
+    actual = {name: _literal_keyword(model, name) for name in expected}
+    if actual != expected:
+        raise AssertionError(f"shared LoRA model contract changed: {actual}")
+
+    configs = _train_config_calls(module)
+    for name in ("pi05_libero_baseline_lora_h16", "pi05_libero_bsp_lora_h16"):
+        reference = _call_keyword(configs[name], "model")
+        if not isinstance(reference, ast.Name) or reference.id != "_PI05_LIBERO_LORA_H16_MODEL":
+            raise AssertionError(f"{name} must reference _PI05_LIBERO_LORA_H16_MODEL")
 
 
 class LiberoHostContractTest(unittest.TestCase):
@@ -266,6 +291,12 @@ class LiberoHostContractTest(unittest.TestCase):
         )
         should_save_keywords = {keyword.arg for keyword in should_save.keywords}
         self.assertTrue({"num_train_steps", "save_interval"}.issubset(should_save_keywords))
+
+    def test_shared_lora_model_preserves_h16_shape_and_is_reused_by_both_lora_configs(self):
+        """Fails if the shared LoRA model changes shape or either LoRA config inlines another model."""
+        source = (_ROOT / "src" / "openpi" / "training" / "config.py").read_text(encoding="utf-8")
+
+        _assert_shared_lora_model_contract(source)
 
 
 if __name__ == "__main__":
