@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import csv
 import dataclasses
 import hashlib
 import html
@@ -12,9 +11,9 @@ from pathlib import Path
 import random
 import re
 import statistics
-import tempfile
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from openpi_client import libero_artifacts
 from openpi_client import libero_eval
 
 
@@ -25,6 +24,7 @@ TASKS_PER_SUITE = 10
 TRIALS_PER_TASK = 50
 EPISODES_PER_RUN = len(libero_eval.SUPPORTED_SUITES) * TASKS_PER_SUITE * TRIALS_PER_TASK
 TOTAL_EPISODES = EPISODES_PER_RUN * 2 * len(MILESTONES)
+_REPLAN_STEPS = libero_eval.BSP_PARAMETERS["executed_actions"]
 OUTPUT_FILENAMES = (
     "task_comparison.csv",
     "suite_comparison.csv",
@@ -160,10 +160,6 @@ def _file_sha256(path: Path) -> str:
     return hasher.hexdigest()
 
 
-def _is_sha256(value: Any) -> bool:
-    return isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
-
-
 def _require_fields(payload: Mapping[str, Any], fields: Sequence[str], *, label: str) -> None:
     missing = sorted(field for field in fields if field not in payload)
     if missing:
@@ -216,7 +212,7 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> Tuple[str, int]:
     _require_fields(manifest, required, label="evaluation manifest")
     if manifest["schema_version"] != 2:
         raise ComparisonError("Phase-one comparison requires evaluation manifest schema_version 2")
-    if manifest["native_control_hz"] != 10 or manifest["replan_steps"] != 8:
+    if manifest["native_control_hz"] != 10 or manifest["replan_steps"] != _REPLAN_STEPS:
         raise ComparisonError("Evaluation manifest has an incompatible native-control protocol")
     variant = manifest["policy_variant"]
     step = manifest["checkpoint_step"]
@@ -229,14 +225,14 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> Tuple[str, int]:
     _training_family(manifest)
     expected = {
         "baseline": ("baseline_h16", 16),
-        "bsp": ("bsp_decoded_h8", 8),
+        "bsp": ("bsp_decoded_h8", _REPLAN_STEPS),
     }[variant]
     actual = (manifest["policy_protocol"], manifest["expected_action_horizon"])
     if actual != expected:
         raise ComparisonError(
             "{}@{} has config/protocol/horizon {}, expected {}".format(variant, step, actual, expected)
         )
-    if manifest["execution_horizon"] != 8:
+    if manifest["execution_horizon"] != _REPLAN_STEPS:
         raise ComparisonError("Phase-one evaluation must execute exactly eight actions per replan")
     if tuple(manifest["suites"]) != tuple(libero_eval.SUPPORTED_SUITES):
         raise ComparisonError("Phase-one evaluation requires all four suites in canonical order")
@@ -264,7 +260,7 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> Tuple[str, int]:
     normalized_checkpoint = manifest["checkpoint"].rstrip("/")
     if not normalized_checkpoint or normalized_checkpoint.rsplit("/", 1)[-1] != str(step):
         raise ComparisonError("Evaluation checkpoint terminal component must equal checkpoint_step")
-    if not _is_sha256(manifest["norm_hash"]):
+    if not libero_artifacts.is_sha256(manifest["norm_hash"]):
         raise ComparisonError("Evaluation manifest norm_hash must be a lowercase SHA256")
     if manifest["bsp_parameters"] != libero_eval.BSP_PARAMETERS:
         raise ComparisonError("Evaluation manifest BSP parameters do not match the fixed protocol")
@@ -272,9 +268,9 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> Tuple[str, int]:
         if manifest["bsp_cache_hash"] is not None or manifest["bsp_cache_manifest_fingerprint"] is not None:
             raise ComparisonError("Baseline manifests must record null BSP cache identities")
     else:
-        if not _is_sha256(manifest["bsp_cache_hash"]):
+        if not libero_artifacts.is_sha256(manifest["bsp_cache_hash"]):
             raise ComparisonError("BSP cache hash must be the actual NPZ lowercase SHA256")
-        if not _is_sha256(manifest["bsp_cache_manifest_fingerprint"]):
+        if not libero_artifacts.is_sha256(manifest["bsp_cache_manifest_fingerprint"]):
             raise ComparisonError("BSP cache manifest fingerprint must be a lowercase SHA256")
     return str(variant), int(step)
 
@@ -368,7 +364,7 @@ def _validate_episode(record: Mapping[str, Any], manifest: Mapping[str, Any]) ->
     for field in ("episode_id", "paired_key", "task_name", "init_state_fingerprint"):
         if not isinstance(record[field], str) or not record[field]:
             raise ComparisonError("Episode {} must be non-empty".format(field))
-    if not _is_sha256(record["init_state_fingerprint"]):
+    if not libero_artifacts.is_sha256(record["init_state_fingerprint"]):
         raise ComparisonError("Episode init_state_fingerprint must be a lowercase SHA256")
     try:
         canonical_identity = libero_eval.EpisodeIdentity(
@@ -413,7 +409,7 @@ def _validate_episode(record: Mapping[str, Any], manifest: Mapping[str, Any]) ->
     max_steps = _MAX_STEPS_BY_SUITE[record["suite"]]
     if record["steps"] > max_steps:
         raise ComparisonError("Episode steps exceed the suite maximum")
-    if record["replans"] > math.ceil(max_steps / 8):
+    if record["replans"] > math.ceil(max_steps / _REPLAN_STEPS):
         raise ComparisonError("Episode replans exceed the suite maximum at an eight-step horizon")
     timings = record["inference_ms"]
     if not isinstance(timings, list):
@@ -781,7 +777,11 @@ def validate_diagnostics(
         raise ComparisonError("BSP reconstruction requires the strict maximum error < 0.002")
     contents_sha = bsp_diagnostics["cache_contents_sha256"]
     rebuilt_sha = bsp_diagnostics["rebuilt_contents_sha256"]
-    if not _is_sha256(contents_sha) or not _is_sha256(rebuilt_sha) or contents_sha != rebuilt_sha:
+    if (
+        not libero_artifacts.is_sha256(contents_sha)
+        or not libero_artifacts.is_sha256(rebuilt_sha)
+        or contents_sha != rebuilt_sha
+    ):
         raise ComparisonError("BSP cache and rebuilt canonical content SHA256 values must match")
     if any(bsp_diagnostics["code_sha"] != manifest["code_sha"] for manifest in classified.values()):
         raise ComparisonError("BSP diagnostics code SHA does not match all evaluation manifests")
@@ -819,7 +819,11 @@ def validate_diagnostics(
             raise ComparisonError("Normalization state field {} must be equal".format(field))
     baseline_action_sha = norm_diagnostics["baseline_action_stats_sha256"]
     bsp_action_sha = norm_diagnostics["bsp_action_stats_sha256"]
-    if not _is_sha256(baseline_action_sha) or not _is_sha256(bsp_action_sha) or baseline_action_sha == bsp_action_sha:
+    if (
+        not libero_artifacts.is_sha256(baseline_action_sha)
+        or not libero_artifacts.is_sha256(bsp_action_sha)
+        or baseline_action_sha == bsp_action_sha
+    ):
         raise ComparisonError("Baseline/BSP action-stat SHA256 values must be valid and distinct")
     baseline_asset_dir = norm_diagnostics["baseline_asset_dir"]
     bsp_asset_dir = norm_diagnostics["bsp_asset_dir"]
@@ -843,31 +847,6 @@ def validate_diagnostics(
         "mean_reconstruction_error": mean,
         "p95_reconstruction_error": p95,
     }
-
-
-def _atomic_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(prefix=".{}-".format(path.name), suffix=".tmp", dir=path.parent)
-    try:
-        with open(descriptor, "w", encoding="utf-8", newline="") as output:
-            output.write(text)
-        Path(temporary_name).replace(path)
-    finally:
-        temporary = Path(temporary_name)
-        if temporary.exists():
-            temporary.unlink()
-
-
-def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
-    if not rows:
-        raise ComparisonError("Refusing to write an empty report table")
-    import io
-
-    buffer = io.StringIO(newline="")
-    writer = csv.DictWriter(buffer, fieldnames=list(rows[0]))
-    writer.writeheader()
-    writer.writerows(rows)
-    _atomic_text(path, buffer.getvalue())
 
 
 def _render_markdown(milestones: Sequence[Mapping[str, Any]]) -> str:
@@ -1110,15 +1089,15 @@ def compare_phase_one(
         "suites": all_suite_rows,
     }
     try:
-        comparison_json = json.dumps(comparison, allow_nan=False, indent=2, sort_keys=True) + "\n"
+        comparison_json = libero_artifacts.json_text(comparison)
     except (TypeError, ValueError) as error:
         raise ComparisonError("Comparison contains a non-JSON diagnostic value") from error
-    _write_csv(output / "task_comparison.csv", all_task_rows)
-    _write_csv(output / "suite_comparison.csv", all_suite_rows)
-    _write_csv(output / "learning_curve.csv", learning_rows)
-    _atomic_text(output / "comparison.json", comparison_json)
-    _atomic_text(output / "report.md", _render_markdown(milestones))
-    _atomic_text(output / "learning_curve.svg", _render_svg(milestones))
+    libero_artifacts.write_csv(output / "task_comparison.csv", all_task_rows)
+    libero_artifacts.write_csv(output / "suite_comparison.csv", all_suite_rows)
+    libero_artifacts.write_csv(output / "learning_curve.csv", learning_rows)
+    libero_artifacts.atomic_text(output / "comparison.json", comparison_json)
+    libero_artifacts.atomic_text(output / "report.md", _render_markdown(milestones))
+    libero_artifacts.atomic_text(output / "learning_curve.svg", _render_svg(milestones))
     actual_outputs = {path.name for path in output.iterdir()}
     if actual_outputs != set(OUTPUT_FILENAMES):
         raise ComparisonError("Unexpected comparison output set: {}".format(sorted(actual_outputs)))

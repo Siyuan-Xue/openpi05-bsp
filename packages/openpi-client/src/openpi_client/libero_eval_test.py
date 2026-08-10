@@ -19,6 +19,28 @@ def _identity(suite: str = "libero_spatial", task_id: int = 0, init_index: int =
     )
 
 
+def _manifest(**overrides):
+    values = {
+        "code_sha": "a" * 40,
+        "dataset_revision": "v2.0",
+        "config_name": "pi05_libero_baseline_h16",
+        "checkpoint_step": 10000,
+        "bsp_cache_hash": None,
+        "bsp_cache_manifest_fingerprint": None,
+        "norm_hash": "b" * 64,
+        "checkpoint": "checkpoint/baseline/10000",
+        "container_digest": "sha256:" + "d" * 64,
+        "train_seed": 42,
+        "eval_seed": 42,
+        "policy_variant": "baseline",
+        "bsp_parameters": libero_eval.BSP_PARAMETERS,
+        "policy_protocol": "baseline_h16",
+        "expected_action_horizon": 16,
+        "execution_horizon": 8,
+    }
+    return libero_eval.EvaluationManifest(**{**values, **overrides})
+
+
 class TestLiberoEvaluation:
     def test_task_filter_is_canonical_and_rejects_duplicates_or_out_of_range_ids(self):
         assert libero_eval.resolve_task_ids(None) == tuple(range(10))
@@ -200,23 +222,15 @@ class TestLiberoEvaluation:
             assert selector.claim(infra) is None
 
     def test_manifest_preserves_all_audit_identities_and_bsp_parameters(self):
-        manifest = libero_eval.EvaluationManifest(
-            code_sha="a" * 40,
-            dataset_revision="v2.0",
+        manifest = _manifest(
             config_name="pi05_libero_bsp_h16",
-            checkpoint_step=10000,
             bsp_cache_hash="a" * 64,
             bsp_cache_manifest_fingerprint="c" * 64,
-            norm_hash="b" * 64,
             checkpoint="checkpoint/10000",
-            container_digest="sha256:" + "d" * 64,
-            train_seed=42,
             eval_seed=7,
             policy_variant="bsp",
-            bsp_parameters=libero_eval.BSP_PARAMETERS,
             policy_protocol="bsp_decoded_h8",
             expected_action_horizon=8,
-            execution_horizon=8,
             suites=libero_eval.SUPPORTED_SUITES,
             task_ids=(0, 3),
         )
@@ -235,32 +249,11 @@ class TestLiberoEvaluation:
         assert payload["task_ids"] == [0, 3]
 
     def test_manifest_requires_cache_sha_and_fingerprint_together_only_for_bsp(self):
-        shared = dict(
-            code_sha="a" * 40,
-            dataset_revision="v2.0",
-            norm_hash="b" * 64,
-            checkpoint="checkpoint/10000",
-            checkpoint_step=10000,
-            container_digest="sha256:" + "d" * 64,
-            train_seed=42,
-            eval_seed=42,
-            bsp_parameters=libero_eval.BSP_PARAMETERS,
-            execution_horizon=8,
-        )
-        baseline = libero_eval.EvaluationManifest(
-            **shared,
-            config_name="pi05_libero_baseline_h16",
-            bsp_cache_hash=None,
-            bsp_cache_manifest_fingerprint=None,
-            policy_variant="baseline",
-            policy_protocol="baseline_h16",
-            expected_action_horizon=16,
-        )
+        baseline = _manifest()
         assert baseline.to_dict()["bsp_cache_hash"] is None
         for cache_hash, fingerprint in ((None, "c" * 64), ("a" * 64, None)):
             with pytest.raises(ValueError):
-                libero_eval.EvaluationManifest(
-                    **shared,
+                _manifest(
                     config_name="pi05_libero_bsp_h16",
                     bsp_cache_hash=cache_hash,
                     bsp_cache_manifest_fingerprint=fingerprint,
@@ -270,24 +263,7 @@ class TestLiberoEvaluation:
                 )
 
     def test_manifest_rejects_unverifiable_source_identities_or_nonfinite_timeouts(self):
-        manifest = libero_eval.EvaluationManifest(
-            code_sha="a" * 40,
-            dataset_revision="v2.0",
-            config_name="pi05_libero_baseline_h16",
-            checkpoint_step=10000,
-            bsp_cache_hash=None,
-            bsp_cache_manifest_fingerprint=None,
-            norm_hash="b" * 64,
-            checkpoint="checkpoint/baseline/10000",
-            container_digest="sha256:" + "d" * 64,
-            train_seed=42,
-            eval_seed=42,
-            policy_variant="baseline",
-            bsp_parameters=libero_eval.BSP_PARAMETERS,
-            policy_protocol="baseline_h16",
-            expected_action_horizon=16,
-            execution_horizon=8,
-        )
+        manifest = _manifest()
         for field, value in (
             ("code_sha", "abc"),
             ("code_sha", 123),
@@ -317,6 +293,23 @@ class TestLiberoEvaluation:
             assert (root / "tasks.csv").is_file()
             assert (root / "suites.csv").is_file()
             assert json.loads((root / "summary.json").read_text()) == summary
+
+    def test_summary_write_preserves_existing_csv_if_serialization_fails(self):
+        class UnserializableTaskName:
+            def __str__(self):
+                raise RuntimeError("cannot serialize task name")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tasks_path = root / "tasks.csv"
+            tasks_path.write_text("previous artifact\n", encoding="utf-8")
+            identity = dataclasses.replace(_identity(), task_name=UnserializableTaskName())
+            record = libero_eval.EpisodeRecord.from_attempt(identity, 42, 1, success=True)
+
+            with pytest.raises(RuntimeError, match="cannot serialize task name"):
+                libero_eval.ArtifactWriter(root).write_summary([record])
+
+            assert tasks_path.read_text(encoding="utf-8") == "previous artifact\n"
 
     def test_artifact_failure_is_separately_audited_and_marks_summary_incomplete(self):
         with tempfile.TemporaryDirectory() as directory:

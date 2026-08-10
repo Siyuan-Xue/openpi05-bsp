@@ -7,15 +7,15 @@ rules can be tested without importing LIBERO, MuJoCo, NumPy, or a GPU stack.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
-import csv
 import dataclasses
 import hashlib
 import json
 import math
 from pathlib import Path
 import re
-import tempfile
 from typing import Any
+
+from openpi_client import libero_artifacts
 
 
 SUPPORTED_SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
@@ -39,7 +39,7 @@ BSP_PARAMETERS = {
     "smoothing": 1e-12,
     "stride": 1,
     "relative_knots": False,
-    "decoded_actions": 8,
+    "decoded_actions": _REPLAN_ACTIONS,
     "control_rows": 12,
     "control_selection": "first_12_rows",
     "channel_layout": "controls[0:7],knot[7]",
@@ -50,7 +50,7 @@ BSP_PARAMETERS = {
     "projection_epsilon": 1e-6,
     "model_action_dim": 32,
     "model_action_horizon": 16,
-    "executed_actions": 8,
+    "executed_actions": _REPLAN_ACTIONS,
 }
 
 
@@ -100,10 +100,10 @@ def resolve_policy_protocol(policy_variant: str, expected_action_horizon: int | 
             return PolicyProtocol(name="baseline_h10_calibration", expected_action_horizon=10)
         raise ValueError("Baseline expected_action_horizon must be 16 (phase one) or 10 (official calibration)")
     if policy_variant == "bsp":
-        horizon = 8 if expected_action_horizon is None else expected_action_horizon
-        if horizon != 8:
+        horizon = _REPLAN_ACTIONS if expected_action_horizon is None else expected_action_horizon
+        if horizon != _REPLAN_ACTIONS:
             raise ValueError("BSP policy output must be the decoded horizon-8 protocol")
-        return PolicyProtocol(name="bsp_decoded_h8", expected_action_horizon=8)
+        return PolicyProtocol(name="bsp_decoded_h8", expected_action_horizon=_REPLAN_ACTIONS)
     raise ValueError("Policy variant must be baseline or bsp")
 
 
@@ -531,21 +531,17 @@ class EvaluationManifest:
             raise ValueError("Evaluation checkpoint_step must be an integer")
         if self.checkpoint_step < 0:
             raise ValueError("Evaluation checkpoint_step must be non-negative")
-        if len(self.norm_hash) != 64 or any(character not in "0123456789abcdef" for character in self.norm_hash):
+        if not libero_artifacts.is_sha256(self.norm_hash):
             raise ValueError("norm_hash must be the lowercase SHA256 of norm_stats.json")
         cache_identities_present = (self.bsp_cache_hash is not None, self.bsp_cache_manifest_fingerprint is not None)
         if self.policy_variant == "bsp" and cache_identities_present != (True, True):
             raise ValueError("BSP evaluation requires both the sidecar NPZ SHA256 and manifest fingerprint")
         if self.policy_variant == "baseline" and cache_identities_present != (False, False):
             raise ValueError("Baseline evaluation must record null BSP cache identities")
-        if self.bsp_cache_hash is not None and (
-            len(self.bsp_cache_hash) != 64
-            or any(character not in "0123456789abcdef" for character in self.bsp_cache_hash)
-        ):
+        if self.bsp_cache_hash is not None and not libero_artifacts.is_sha256(self.bsp_cache_hash):
             raise ValueError("bsp_cache_hash must be the lowercase SHA256 of the actual sidecar NPZ")
-        if self.bsp_cache_manifest_fingerprint is not None and (
-            len(self.bsp_cache_manifest_fingerprint) != 64
-            or any(character not in "0123456789abcdef" for character in self.bsp_cache_manifest_fingerprint)
+        if self.bsp_cache_manifest_fingerprint is not None and not libero_artifacts.is_sha256(
+            self.bsp_cache_manifest_fingerprint
         ):
             raise ValueError("bsp_cache_manifest_fingerprint must be a lowercase SHA256")
         if not self.bsp_parameters:
@@ -631,31 +627,6 @@ class ArtifactError:
         return dataclasses.asdict(self)
 
 
-def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with open(descriptor, "w", encoding="utf-8") as output:
-            json.dump(payload, output, indent=2, sort_keys=True, allow_nan=False)
-            output.write("\n")
-        Path(temporary_name).replace(path)
-    finally:
-        temporary = Path(temporary_name)
-        if temporary.exists():
-            temporary.unlink()
-
-
-def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = list(rows[0]) if rows else []
-    with path.open("w", encoding="utf-8", newline="") as output:
-        if not fieldnames:
-            return
-        writer = csv.DictWriter(output, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
 class ArtifactWriter:
     """Incrementally persist episodes and finalize auditable aggregates."""
 
@@ -666,25 +637,19 @@ class ArtifactWriter:
         self.artifact_errors_path = self.output_dir / "artifact_errors.jsonl"
 
     def write_manifest(self, manifest: EvaluationManifest) -> None:
-        _atomic_json(self.output_dir / "manifest.json", manifest.to_dict())
+        libero_artifacts.atomic_text(self.output_dir / "manifest.json", libero_artifacts.json_text(manifest.to_dict()))
 
     def append_episode(self, record: EpisodeRecord) -> None:
-        with self.episodes_path.open("a", encoding="utf-8") as output:
-            json.dump(record.to_dict(), output, sort_keys=True, allow_nan=False)
-            output.write("\n")
-            output.flush()
+        libero_artifacts.append_jsonl(self.episodes_path, record.to_dict())
 
     def append_artifact_error(self, error: ArtifactError) -> None:
-        with self.artifact_errors_path.open("a", encoding="utf-8") as output:
-            json.dump(error.to_dict(), output, sort_keys=True, allow_nan=False)
-            output.write("\n")
-            output.flush()
+        libero_artifacts.append_jsonl(self.artifact_errors_path, error.to_dict())
 
     def write_summary(
         self, records: Sequence[EpisodeRecord], *, artifact_errors: Sequence[ArtifactError] = ()
     ) -> dict[str, Any]:
         summary = aggregate_records(records, artifact_errors=artifact_errors)
-        _write_csv(self.output_dir / "tasks.csv", summary["tasks"])
-        _write_csv(self.output_dir / "suites.csv", summary["suites"])
-        _atomic_json(self.output_dir / "summary.json", summary)
+        libero_artifacts.write_csv(self.output_dir / "tasks.csv", summary["tasks"])
+        libero_artifacts.write_csv(self.output_dir / "suites.csv", summary["suites"])
+        libero_artifacts.atomic_text(self.output_dir / "summary.json", libero_artifacts.json_text(summary))
         return summary
