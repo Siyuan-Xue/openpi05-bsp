@@ -205,7 +205,7 @@ BSP 作者仓库和论文 PDF 是实现参考，不是服务器运行依赖，�
 | `src/openpi/policies/aloha_policy.py`；`src/openpi/policies/droid_policy.py` | 非 LIBERO observation/action transforms | 非目标平台 | `libero_policy.py` | 不再接受 ALOHA/DROID schema | server 环境枚举和训练配置只保留 LIBERO |
 | `src/openpi/training/droid_rlds_dataset.py`；`src/openpi/training/misc/polaris_config.py`；`src/openpi/training/misc/roboarena_config.py` | RLDS loader 与非目标内部/竞技场配置 | 官方 LIBERO LeRobot 已覆盖唯一数据面 | `data_loader.py` + `LeRobotLiberoDataConfig` | 不再读取 RLDS 或生成这些配置 | sidecar fingerprint 绑定官方 LeRobot schema、episode 边界和 revision |
 | `src/openpi/models/vit.py` | 未被目标路径引用的旧视觉模块 | 当前 SigLIP 路径不依赖它 | `siglip.py` | 不再保留孤立 ViT API | import 合同与目标模型测试证明生产闭包没有引用 |
-| `scripts/server_runtime_contract_test.py`；`scripts/pi05_libero_bsp_phase1_server_test.py` | 旧通用 server/大 runbook 文本合同 | 被精简入口和结构化合同替代 | `core_runtime_slim_test.py`、`libero_host_contract_test.py`、本文档合同 | 不再维护旧路径的文本快照 | 新合同直接检查五配置、host 数据流、文档链接与删除对账 |
+| `scripts/server_runtime_contract_test.py`；`scripts/pi05_libero_bsp_phase1_server_test.py`；`scripts/libero_revision_contract_test.py` | 旧通用 server/大 runbook 文本合同与配置源码形状合同 | 被精简入口和结构化行为合同替代 | `tests/contracts/core_runtime_slim_test.py`、`tests/contracts/libero_host_contract_test.py`、导入配置/数据/evaluator 测试与本文档合同 | 不再维护旧路径的文本快照或以 AST 固定配置构造方式 | 新合同直接检查五配置语义、host 数据流、文档链接与删除对账 |
 | `docs/docker.md`；`docs/pi05_libero_bsp_server_state.md`；`docs/superpowers/**` | 旧容器说明、一次性服务器快照、设计/执行过程记录 | 它们与最终 host-only 协议重复或冲突 | 当前 runbook、本文与 Git 历史/tags | 不再把中间决策日志当用户文档 | 最终协议、身份和恢复命令已集中到两份规范文档 |
 | `.superpowers/sdd/pi05-libero-bsp-sdd-plan/**` | 已提交的开发 agent task 报告 | 属于过程产物，降低仓库可读性 | Git commits、tags、CI 与 architecture audit | 不再在发布树保留内部开发记录 | 不含运行时输入；删除不会改变包、CLI 或实验 artifact |
 
@@ -242,6 +242,7 @@ BSP 作者仓库和论文 PDF 是实现参考，不是服务器运行依赖，�
 <!-- deletion-pattern: src/openpi/models/vit.py -->
 <!-- deletion-pattern: scripts/server_runtime_contract_test.py -->
 <!-- deletion-pattern: scripts/pi05_libero_bsp_phase1_server_test.py -->
+<!-- deletion-pattern: scripts/libero_revision_contract_test.py -->
 <!-- deletion-pattern: docs/docker.md -->
 <!-- deletion-pattern: docs/pi05_libero_bsp_server_state.md -->
 <!-- deletion-pattern: docs/superpowers/** -->
@@ -299,10 +300,10 @@ openpi05-bsp/
 │   ├── {__init__.py,prepare_libero_bsp.py,compute_norm_stats.py,train.py}
 │   ├── {serve_policy.py,compare_libero_phase1.py}
 │   ├── {prepare_libero_bsp_test.py,compute_norm_stats_test.py,train_test.py}
-│   ├── {libero_eval_test.py,compare_libero_phase1_test.py}
-│   └── {core_runtime_slim_test.py,libero_revision_contract_test.py,
-│        libero_host_contract_test.py,repository_slim_contract_test.py,
-│        repository_documentation_contract_test.py}
+│   └── {libero_eval_test.py,compare_libero_phase1_test.py,serve_policy_test.py}
+├── tests/contracts/
+│   └── {core_runtime_slim_test.py,libero_host_contract_test.py,
+│        repository_slim_contract_test.py,repository_documentation_contract_test.py}
 ├── src/openpi/
 │   ├── {__init__.py,conftest.py,py.typed,transforms.py,transforms_test.py}
 │   ├── models/

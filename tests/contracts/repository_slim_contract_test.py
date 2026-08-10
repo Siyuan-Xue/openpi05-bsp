@@ -155,6 +155,28 @@ def _run_pytest_probe(tmp_path: Path, source: str, *arguments: str) -> subproces
     )
 
 
+def _external_marker_probe(path: Path, test_names: tuple[str, ...]) -> str:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    blocks = ["import pytest"]
+    for test_name in test_names:
+        decorators = []
+        for decorator in functions[test_name].decorator_list:
+            marker = decorator.func if isinstance(decorator, ast.Call) else decorator
+            if (
+                isinstance(marker, ast.Attribute)
+                and isinstance(marker.value, ast.Attribute)
+                and isinstance(marker.value.value, ast.Name)
+                and marker.value.value.id == "pytest"
+                and marker.value.attr == "mark"
+                and marker.attr in {"manual", "network", "data", "gpu"}
+            ):
+                decorators.append(f"@pytest.mark.{marker.attr}")
+        blocks.append("\n".join([*decorators, f"def {test_name}():", f'    raise AssertionError("{test_name} ran")']))
+    blocks.append("def test_offline_sentinel():\n    pass")
+    return "\n\n".join(blocks)
+
+
 def test_surviving_production_imports_are_declared_directly():
     root_project = _project(_ROOT / "pyproject.toml")
     client_project = _project(_ROOT / "packages/openpi-client/pyproject.toml")
@@ -244,6 +266,19 @@ def test_offline():
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "1 passed, 4 deselected" in result.stdout
+
+
+def test_default_selection_deselects_external_tokenizer_transform_tests(tmp_path: Path):
+    probe = _external_marker_probe(
+        _ROOT / "src/openpi/transforms_test.py",
+        ("test_tokenize_prompt", "test_tokenize_no_prompt"),
+    )
+
+    for marker_expression in (None, "not network", "not data"):
+        arguments = () if marker_expression is None else ("-m", marker_expression)
+        result = _run_pytest_probe(tmp_path, probe, *arguments)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "1 passed, 2 deselected" in result.stdout
 
 
 @pytest.mark.parametrize(

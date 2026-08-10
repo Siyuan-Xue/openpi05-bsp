@@ -67,6 +67,8 @@ def test_make_bool_mask():
     assert _transforms.make_bool_mask(2, 0, 2) == (True, True, True, True)
 
 
+@pytest.mark.network
+@pytest.mark.data
 def test_tokenize_prompt():
     tokenizer = _tokenizer.PaligemmaTokenizer(max_len=12)
     transform = _transforms.TokenizePrompt(tokenizer)
@@ -78,6 +80,8 @@ def test_tokenize_prompt():
     assert np.allclose(tok_mask, data["tokenized_prompt_mask"])
 
 
+@pytest.mark.network
+@pytest.mark.data
 def test_tokenize_no_prompt():
     transform = _transforms.TokenizePrompt(_tokenizer.PaligemmaTokenizer())
 

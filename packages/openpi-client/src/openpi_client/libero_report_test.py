@@ -252,6 +252,9 @@ class TestLiberoPhaseOneReport:
         classified = libero_report.classify_phase_one_manifests(lora)
 
         assert set(classified) == {(variant, step) for variant in ("baseline", "bsp") for step in _STEPS}
+        assert {key: manifest["config_name"] for key, manifest in classified.items()} == {
+            (variant, step): f"pi05_libero_{variant}_lora_h16" for variant in ("baseline", "bsp") for step in _STEPS
+        }
         mixed = copy.deepcopy(lora)
         mixed[0]["config_name"] = "pi05_libero_baseline_h16"
         with pytest.raises(libero_report.ComparisonError, match="training family"):
@@ -259,6 +262,10 @@ class TestLiberoPhaseOneReport:
 
     def test_manifest_classifier_rejects_missing_duplicate_extra_and_wrong_protocol(self):
         valid = [_manifest(variant, step) for variant in ("baseline", "bsp") for step in _STEPS]
+        classified = libero_report.classify_phase_one_manifests(valid)
+        assert {key: manifest["config_name"] for key, manifest in classified.items()} == {
+            (variant, step): f"pi05_libero_{variant}_h16" for variant in ("baseline", "bsp") for step in _STEPS
+        }
         cases = []
         cases.append(valid[:-1])
         duplicate = copy.deepcopy(valid)

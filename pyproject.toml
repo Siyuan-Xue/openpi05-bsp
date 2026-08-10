@@ -119,7 +119,7 @@ known-third-party = ["wandb"]
 # These focused contracts intentionally exercise private helpers.
 "scripts/libero_eval_test.py" = ["SLF001"]
 "scripts/serve_policy_test.py" = ["SLF001"]
-"tests/contracts/libero_host_contract_test.py" = ["E402", "SLF001"]
+"tests/contracts/libero_host_contract_test.py" = ["E402"]
 "src/openpi/policies/policy_seed_test.py" = ["SLF001"]
 "src/openpi/training/bsp_dataset_test.py" = ["SLF001"]
 "src/openpi/training/bsp_test.py" = ["SLF001"]

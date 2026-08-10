@@ -57,14 +57,3 @@ def test_audit_protocol_retains_calibration_h16_and_comparison_artifacts():
         "report.md",
         "learning_curve.svg",
     }
-
-
-def test_h16_ab_bindings_match_calibration_and_phase_one_variants():
-    assert libero_report._PHASE_ONE_CONFIGS == {
-        ("baseline", "full"): "pi05_libero_baseline_h16",
-        ("bsp", "full"): "pi05_libero_bsp_h16",
-        ("baseline", "lora"): "pi05_libero_baseline_lora_h16",
-        ("bsp", "lora"): "pi05_libero_bsp_lora_h16",
-    }
-    assert libero_eval.resolve_policy_protocol("baseline", 10).name == "baseline_h10_calibration"
-    assert libero_eval.resolve_policy_protocol("baseline", 16).name == "baseline_h16"
