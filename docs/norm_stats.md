@@ -1,69 +1,148 @@
-# Normalization statistics
+# LIBERO phase-one normalization statistics
 
-Following common practice, our models normalize the proprioceptive state inputs and action targets during policy training and inference. The statistics used for normalization are computed over the training data and stored alongside the model checkpoint.
+第一阶段必须为 baseline 和 BSP 分别计算 action normalization statistics，同时证明两组看到
+完全相同的 state distribution。不能复用官方 `pi05_libero` 的统计，也不能让一组读取另一组
+的 action stats。
 
-## Reloading normalization statistics
+## 为什么必须分离
 
-When you fine-tune one of our models on a new dataset, you need to decide whether to (A) reuse existing normalization statistics or (B) compute new statistics over your new training data. Which option is better for you depends on the similarity of your robot and task to the robot and task distribution in the pre-training dataset. Below, we list all the available pre-training normalization statistics for each model.
+`scripts/compute_norm_stats.py` 在 model padding 前统计：
 
-**If your target robot matches one of these pre-training statistics, consider reloading the same normalization statistics.** By reloading the normalization statistics, the actions in your dataset will be more "familiar" to the model, which can lead to better performance. You can reload the normalization statistics by adding an `AssetsConfig` to your training config that points to the corresponding checkpoint directory and normalization statistics ID, like below for the `Trossen` (aka ALOHA) robot statistics of the `pi0_base` checkpoint:
-
-```python
-TrainConfig(
-    ...
-    data=LeRobotAlohaDataConfig(
-        ...
-        assets=AssetsConfig(
-            assets_dir="gs://openpi-assets/checkpoints/pi0_base/assets",
-            asset_id="trossen",
-        ),
-    ),
-)
+```text
+baseline actions: [16, 7]   7D native LIBERO chunks
+BSP actions:      [16, 8]   controls[0:7] + knot[7]
+state:            [8]       both variants use the same observations
 ```
 
-For an example of a full training config that reloads normalization statistics, see the `pi0_aloha_pen_uncap` config in the [training config file](https://github.com/physical-intelligence/openpi/blob/main/src/openpi/training/config.py).
+baseline 和 BSP 的 action 语义、维度和分布不同，共用 stats 会把 spline knot 当成普通动作，
+或让模型按错误区间缩放。相反，state 的 `mean/std/q01/q99` 应在给定容差内逐项相同；不相同
+说明数据选择、episode mapping 或 transforms 已经漂移。
 
-**Note:** To successfully reload normalization statistics, it's important that your robot + dataset are following the action space definitions used in pre-training. We provide a detailed description of our action space definitions below.
+## 规范路径
 
-**Note #2:** Whether reloading normalization statistics is beneficial depends on the similarity of your robot and task to the robot and task distribution in the pre-training dataset. We recommend to always try both, reloading and training with a fresh set of statistics computed on your new dataset (see [main README](../README.md) for instructions on how to compute new statistics), and pick the one that works better for your task.
+```bash
+export BSP_WORK=/root/openpi-bsp-work
+export BSP_REPO_DIR="$BSP_WORK/repo/openpi05-bsp"
+export OPENPI_PY="$BSP_WORK/venvs/openpi/bin/python"
+export ASSETS_BASE="$BSP_WORK/experiments/assets"
+export LIBERO_DATASET_DIR=/mnt/data/siyuanxue/openpi-bsp/data/lerobot/physical-intelligence/libero
+export BSP_CACHE=/mnt/data/siyuanxue/openpi-bsp/data/bspline-targets/libero-v2.0-bsp-v2.npz
 
+export BASELINE_FULL_ASSETS="$ASSETS_BASE/pi05_libero_baseline_h16"
+export BSP_FULL_ASSETS="$ASSETS_BASE/pi05_libero_bsp_h16"
+export BASELINE_FULL_NORM="$BASELINE_FULL_ASSETS/libero_baseline_h16"
+export BSP_FULL_NORM="$BSP_FULL_ASSETS/libero_bsp_h16"
 
-## Provided Pre-training Normalization Statistics
-
-Below is a list of all the pre-training normalization statistics we provide. We provide them for both, the `pi0_base` and `pi0_fast_base` models. For `pi0_base`, set the `assets_dir` to `gs://openpi-assets/checkpoints/pi0_base/assets` and for `pi0_fast_base`, set the `assets_dir` to `gs://openpi-assets/checkpoints/pi0_fast_base/assets`.
-| Robot | Description | Asset ID |
-|-------|-------------|----------|
-| ALOHA | 6-DoF dual arm robot with parallel grippers | trossen |
-| Mobile ALOHA | Mobile version of ALOHA mounted on a Slate base | trossen_mobile |
-| Franka Emika (DROID) | 7-DoF arm with parallel gripper based on the DROID setup | droid |
-| Franka Emika (non-DROID) | Franka FR3 arm with Robotiq 2F-85 gripper | franka |
-| UR5e | 6-DoF UR5e arm with Robotiq 2F-85 gripper | ur5e |
-| UR5e bi-manual | Bi-manual UR5e setup with Robotiq 2F-85 grippers | ur5e_dual |
-| ARX | Bi-manual ARX-5 robot arm setup with parallel gripper | arx |
-| ARX mobile | Mobile version of bi-manual ARX-5 robot arm setup mounted on a Slate base | arx_mobile |
-| Fibocom mobile | Fibocom mobile robot with 2x ARX-5 arms | fibocom_mobile |
-
-
-## Pi0 Model Action Space Definitions
-
-Out of the box, both the `pi0_base` and `pi0_fast_base` use the following action space definitions (left and right are defined looking from behind the robot towards the workspace):
-```
-    "dim_0:dim_5": "left arm joint angles",
-    "dim_6": "left arm gripper position",
-    "dim_7:dim_12": "right arm joint angles (for bi-manual only)",
-    "dim_13": "right arm gripper position (for bi-manual only)",
-
-    # For mobile robots:
-    "dim_14:dim_15": "x-y base velocity (for mobile robots only)",
+export BASELINE_LORA_NORM="$ASSETS_BASE/pi05_libero_baseline_lora_h16/libero_baseline_h16"
+export BSP_LORA_NORM="$ASSETS_BASE/pi05_libero_bsp_lora_h16/libero_bsp_h16"
+export NORM_COMPARISON="$ASSETS_BASE/libero-phase1-norm-comparison.json"
 ```
 
-The proprioceptive state uses the same definitions as the action space, except for the base x-y position (the last two dimensions) for mobile robots, which we don't include in the proprioceptive state.
+所有数据盘写路径都位于 `/mnt/data/siyuanxue`。stats 本身是小文件，活跃训练从快速本地
+`/root` 读取；通过后再按服务器 runbook 归档。
 
-For 7-DoF robots (e.g. Franka), we use the first 7 dimensions of the action space for the joint actions, and the 8th dimension for the gripper action.
+## 计算 baseline 与 BSP
 
-General info for Pi robots:
-- Joint angles are expressed in radians, with position zero corresponding to the zero position reported by each robot's interface library, except for ALOHA, where the standard ALOHA code uses a slightly different convention (see the [ALOHA example code](../examples/aloha_real/README.md) for details).
-- Gripper positions are in [0.0, 1.0], with 0.0 corresponding to fully open and 1.0 corresponding to fully closed.
-- Control frequencies are either 20 Hz for UR5e and Franka, and 50 Hz for ARX and Trossen (ALOHA) arms.
+先 baseline，再 BSP；不要同时跑两个完整 DataLoader：
 
-For DROID, we use the original DROID action configuration, with joint velocity actions in the first 7 dimensions and gripper actions in the 8th dimension + a control frequency of 15 Hz.
+```bash
+cd "$BSP_REPO_DIR"
+test ! -e "$BASELINE_FULL_NORM/norm_stats.json"
+test ! -e "$BSP_FULL_NORM/norm_stats.json"
+test ! -e "$NORM_COMPARISON"
+
+"$OPENPI_PY" scripts/compute_norm_stats.py \
+  pi05_libero_baseline_h16 \
+  --assets-dir "$BASELINE_FULL_ASSETS" \
+  --dataset-root "$LIBERO_DATASET_DIR"
+
+"$OPENPI_PY" scripts/compute_norm_stats.py \
+  pi05_libero_bsp_h16 \
+  --assets-dir "$BSP_FULL_ASSETS" \
+  --dataset-root "$LIBERO_DATASET_DIR" \
+  --bsp-cache-path "$BSP_CACHE" \
+  --compare-state-stats-with "$BASELINE_FULL_NORM" \
+  --norm-comparison-output "$NORM_COMPARISON"
+```
+
+`max_frames` 只允许用于开发测试，不允许生成正式 stats。官方 LIBERO v2.0 的 warning 不要求
+执行 v2.1 转换。
+
+## 必须通过的 comparison gate
+
+```bash
+"$OPENPI_PY" - "$NORM_COMPARISON" <<'PY'
+import json
+import sys
+
+result = json.load(open(sys.argv[1], encoding="utf-8"))
+for key in ("state_stats_equal", "asset_directories_isolated", "action_stats_isolated"):
+    assert result[key] is True, (key, result[key])
+for field in ("mean", "std", "q01", "q99"):
+    row = result["state_fields"][field]
+    assert row["equal"] is True, (field, row)
+assert result["baseline_action_stats_sha256"] != result["bsp_action_stats_sha256"]
+print("phase1_norm_comparison_gate=PASS")
+PY
+```
+
+此外必须确认：
+
+- 两个文件的 state 和 actions `mean/std/q01/q99` 全部有限；
+- state shape 为 `[8]`；
+- baseline action shape 为 `[7]`，BSP action shape 为 `[8]`；
+- BSP knot channel 是 index 7，`q01 < q99`，没有退化区间；
+- 两个 asset 目录不同，两个完整文件 SHA256 被记录。
+
+`scripts.compute_norm_stats._validate_bsp_action_stats` 和 `_stats_sha256` 是代码门禁；不要手工
+编辑 JSON 来绕过失败。comparison 中 state 使用 `rtol=1e-7`、`atol=1e-8`，不是字符串比较。
+
+## 发布给 LoRA 配置
+
+full 与 LoRA 配置的 action/state protocol 相同，只是可训练参数不同，因此 LoRA 复用已经通过
+门禁的同一 variant stats。配置名决定 asset 根目录，必须显式发布到 LoRA 路径；仅留下 full
+目录会导致训练找不到 stats。
+
+以下操作先在目标目录写临时文件，再在同一目录原子 rename；目标存在时停止，不覆盖：
+
+```bash
+mkdir -p "$BASELINE_LORA_NORM" "$BSP_LORA_NORM"
+test ! -e "$BASELINE_LORA_NORM/norm_stats.json"
+test ! -e "$BSP_LORA_NORM/norm_stats.json"
+test ! -e "$BASELINE_LORA_NORM/.norm_stats.json.publish-tmp"
+test ! -e "$BSP_LORA_NORM/.norm_stats.json.publish-tmp"
+
+cp "$BASELINE_FULL_NORM/norm_stats.json" \
+  "$BASELINE_LORA_NORM/.norm_stats.json.publish-tmp"
+mv "$BASELINE_LORA_NORM/.norm_stats.json.publish-tmp" \
+  "$BASELINE_LORA_NORM/norm_stats.json"
+
+cp "$BSP_FULL_NORM/norm_stats.json" \
+  "$BSP_LORA_NORM/.norm_stats.json.publish-tmp"
+mv "$BSP_LORA_NORM/.norm_stats.json.publish-tmp" \
+  "$BSP_LORA_NORM/norm_stats.json"
+
+test "$(sha256sum "$BASELINE_FULL_NORM/norm_stats.json" | awk '{print $1}')" = \
+  "$(sha256sum "$BASELINE_LORA_NORM/norm_stats.json" | awk '{print $1}')"
+test "$(sha256sum "$BSP_FULL_NORM/norm_stats.json" | awk '{print $1}')" = \
+  "$(sha256sum "$BSP_LORA_NORM/norm_stats.json" | awk '{print $1}')"
+```
+
+发布前若已有文件，先创建带时间戳的备份目录并记录 SHA；不要静默覆盖。
+
+## 训练与评测绑定
+
+每个 checkpoint 的 `assets/<asset_id>/norm_stats.json` 必须与对应训练前文件逐字节同 hash：
+
+```text
+baseline -> libero_baseline_h16 -> baseline norm hash
+BSP      -> libero_bsp_h16      -> BSP norm hash
+```
+
+每个 evaluator manifest 记录 checkpoint 内实际文件的 SHA256。十个 run 中，同一 variant 的
+norm hash 必须保持一致；baseline 与 BSP 必须不同。最终 reporter 会再次读取原始
+`libero-phase1-norm-comparison.json`，拒绝 state gate 失败、action hash 相同、路径混用或
+manifest hash 漂移。
+
+本地 CPU 合同只能验证代码规则；完整 273,465-frame stats 计算与实际 JSON 数值仍是服务器
+门禁，不能声称瘦身分支已经运行过。

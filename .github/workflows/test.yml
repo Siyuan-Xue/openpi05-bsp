@@ -12,6 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           lfs: false
           submodules: false
       - uses: actions/setup-python@v5
@@ -28,6 +29,7 @@ jobs:
         run: |
           python -m unittest \
             scripts.repository_slim_contract_test \
+            scripts.repository_documentation_contract_test \
             scripts.core_runtime_slim_test \
             scripts.libero_revision_contract_test \
             scripts.libero_host_contract_test

@@ -1,33 +1,74 @@
-# Contributing to openpi
+# Contributing to the π0.5 + LIBERO BSP fork
 
-We welcome contributions, improvements, and modifications. Everyone is welcome to use openpi in accordance to the [license](LICENSE). Contributors are also welcome to submit bug reports, feature requests, and pull requests. We can't promise to approve every pull request, and we are a small team with limited bandwidth to review all requests, but we'll give it our best effort. Specifics are described below.
+This repository is a focused reproduction fork, not a general OpenPI distribution. Contributions should preserve
+the audited closure documented in [the architecture guide](docs/repository_architecture.md): official LIBERO v2.0,
+π0.5 JAX, baseline/BSP full and LoRA training, WebSocket evaluation, and paired phase-one reporting.
 
-## Issues and feature requests
+## In scope
 
-You are welcome to use the Github [discussion](https://github.com/Physical-Intelligence/openpi/discussions) feature if you would like to discuss something that is not directly reporting an issue or making a feature request. This is suitable for questions about how to use some aspect of openpi, or other topics.
+- correctness fixes for BSP fitting, sidecar identity, normalization, decoding, or LIBERO transforms;
+- deterministic and auditable training/checkpoint/evaluation behavior;
+- the five retained training configurations;
+- the Python 3.11 policy server / Python 3.8 LIBERO client boundary;
+- lightweight contracts, documentation, and reproducibility metadata for this experiment.
 
-If you found a bug or other issue, please first check that the issue was not already reported (use the search bar on Github under Issues). If the issue has not yet been reported, please include this information when filing a Github issue:
+Support for other robots, FAST/FSQ, PyTorch model execution, RLDS conversion, generic robot runtimes, notebooks,
+or container orchestration is intentionally out of scope. Propose such work to the appropriate upstream project or
+maintain it on a separate branch; do not silently re-expand the production registry or dependency surface here.
 
-- Your OS type and version and the version of Python you are using
-- Code that allows us to reproduce your bug, including all dependencies
-- Traceback of any exception
-- Any other information that would help us, such as a screenshot
+## Before changing code
 
-In order for us to address any issue, we must be able to reproduce it, so if you encountered the issue after making modifications to openpi, please reproduce the issue without any other modifications and provide a code snippet that allows us to quickly reproduce the problem on `main`.
+1. Work on a topic branch or isolated worktree; do not commit experimental refactors directly to `main`.
+2. State which phase-one invariant changes and why. Protocol changes require explicit review before implementation.
+3. Add a focused regression/contract test first and observe the expected failure.
+4. Never include access tokens, machine identities, user data, model weights, datasets, checkpoints, videos, or
+   experiment logs in a commit.
 
-If you would like to submit a feature request, please check that the feature request does not already exist, and please provide the following information:
+The frozen runtime tag `phase1-runtime-2c09840` identifies active experiments. A development branch must not be
+deployed into those runs or used to rewrite their manifests.
 
-- The motivation for the feature
-- A description of the problem you are trying to solve or your use case
-- Enough information for us to understand the nature of the request
-- Some information for how you intend to use it (this might help us in understanding the motivation!)
+## Local and CI checks
 
-We can't promise to support every feature request, but it is helpful to us to know the use cases that you are interested in!
+Install hooks in an already prepared development environment:
 
-## Submitting a pull request
+```bash
+pre-commit install
+pre-commit run --all-files
+```
 
-If you implemented support for a new robot or environment, or some other new feature, we welcome pull requests (PRs) to openpi. We encourage you to create a [feature request](https://github.com/Physical-Intelligence/openpi/issues) or make a post on the [discussion](https://github.com/Physical-Intelligence/openpi/discussions) board before starting to work on your PR, if you would like to get a sense for whether we are likely to approve your PR if it is submitted. Since we are a small team with limited ability to provide maintenance and support, we may not accept all PRs (e.g., if we believe it would make the code harder to maintain, or if reviewing the PR is out of scope for us), so contacting us in advance is a good way to get a sense for whether your PR is likely to get approved for merging into openpi directly. But even if it isn't, you are of course more than welcome to maintain your own fork with whatever modifications you would like. When creating PRs, we recommend every contribution to consider the following:
+The public lightweight CI runs Ruff, 23 dependency-free repository/core/LIBERO contracts, documentation/link/
+deletion-audit contracts, and the isolated Python 3.8 `openpi-client` suite. It deliberately does not download
+models or data and does not run CUDA, EGL, training, or rollouts.
 
-- Make sure that your PR has a clear title and description
-- Run `pre-commit` (install using `pre-commit install` first), and run `ruff check .` and `ruff format .`
-- Make sure your PR passes all tests
+When dependencies change, regenerate `uv.lock` with the pinned uv workflow and explain direct dependency additions.
+Resolver-required transitive packages may remain; an unused package is not justification for hand-editing the lock.
+
+## Server-only evidence
+
+Changes affecting data, model shapes, optimizer/checkpoint behavior, policy output, or evaluator semantics also need
+the applicable gates from the [server runbook](docs/pi05_libero_bsp_phase1_server.md):
+
+- CPython 3.11.9 frozen sync, SciPy 1.15.3, and JAX GPU discovery;
+- CPython 3.8.20 LIBERO client and EGL reset/render/step;
+- sidecar build/full verify and baseline/BSP norm gates;
+- finite pilot loss/grad/parameter norms and exact optimizer steps;
+- checkpoint assets and four-suite paired evaluation contracts.
+
+Do not claim these passed from a laptop or GitHub CPU runner. Record command, code SHA, input identity, exit status,
+and artifact hashes from the H20 server.
+
+## Pull request content
+
+A reviewable change includes:
+
+- a concise problem statement and target-closure impact;
+- RED/GREEN test evidence and the full verification commands used;
+- a deletion or dependency audit when the supported surface changes;
+- documentation updates for changed CLI, paths, manifests, or protocol;
+- explicit remaining server-only gates and known limitations.
+
+Keep large artifacts outside Git. On the current server, only `/mnt/data/siyuanxue` is an approved writable data
+namespace; repository examples must not direct writes elsewhere under `/mnt/data`.
+
+Contributions remain subject to [LICENSE](LICENSE) and [LICENSE_GEMMA.txt](LICENSE_GEMMA.txt). BSP-derived code must
+retain the MIT attribution embedded in `src/openpi/training/bsp.py`.

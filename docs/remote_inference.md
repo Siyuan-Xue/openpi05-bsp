@@ -1,71 +1,134 @@
+# LIBERO-only WebSocket inference
 
-# Running openpi models remotely
+本仓库只支持 LIBERO 的双环境远程推理。OpenPI/JAX 和 LIBERO 的依赖版本不兼容，因此不要
+合并环境：
 
-We provide utilities for running openpi models remotely. This is useful for running inference on more powerful GPUs off-robot, and also helps keep the robot and policy environments separate (and e.g. avoid dependency hell with robot software).
-
-## Starting a remote policy server
-
-To start a remote policy server, you can simply run the following command:
-
-```bash
-uv run scripts/serve_policy.py --env=[DROID | ALOHA | LIBERO]
+```text
+Python 3.11.9                         Python 3.8.20
+OpenPI + JAX + pi0.5 checkpoint      MuJoCo + robosuite + LIBERO
+scripts/serve_policy.py       <----> openpi-client + examples/libero/main.py
+                         WebSocket
 ```
 
-The `env` argument specifies which $\pi_0$ checkpoint should be loaded. Under the hood, this script will execute a command like the following, which you can use to start a policy server, e.g. for checkpoints you trained yourself (here an example for the DROID environment):
+完整路径、EGL 和评测协议见 [服务器 runbook](pi05_libero_bsp_phase1_server.md)；本页只说明
+通信边界。
+
+## `openpi-client` 是什么
+
+`packages/openpi-client` 是轻量 Python 包，不含模型权重或 JAX。它保留：
+
+- `websocket_client_policy.py`：连接 policy server，获取 metadata，发送 inference request；
+- `msgpack_numpy.py`：无损编码 NumPy arrays；
+- `image_tools.py`：将相机输入 resize/uint8；
+- `inference.py`：可选确定性 flow-noise seed 字段；
+- `libero_eval.py`：episode 身份、错误分类、两次基础设施重试和审计产物；
+- `libero_report.py`：baseline/BSP 五个里程碑的配对报告。
+
+已删除的通用 agent runtime 和 action chunk broker 不参与 LIBERO evaluator。
+
+## 启动 policy server
+
+在 OpenPI Python 3.11 环境中，从仓库根目录运行。官方校准：
 
 ```bash
-uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi0_fast_droid --policy.dir=gs://openpi-assets/checkpoints/pi0_fast_droid
+export BSP_WORK=/root/openpi-bsp-work
+export BSP_REPO_DIR="$BSP_WORK/repo/openpi05-bsp"
+export OPENPI_PY="$BSP_WORK/venvs/openpi/bin/python"
+export OPENPI_DATA_HOME="$BSP_WORK/cache/openpi"
+export JAX_COMPILATION_CACHE_DIR="$BSP_WORK/cache/jax"
+
+cd "$BSP_REPO_DIR"
+"$OPENPI_PY" scripts/serve_policy.py \
+  --env LIBERO \
+  --port 8000 \
+  policy:checkpoint \
+  --policy.config pi05_libero \
+  --policy.dir "$OPENPI_DATA_HOME/openpi-assets/checkpoints/pi05_libero"
 ```
 
-This will start a policy server that will serve the policy specified by the `config` and `dir` arguments. The policy will be served on the specified port (default: 8000).
-
-## Querying the remote policy server from your robot code
-
-We provide a client utility with minimal dependencies that you can easily embed into any robot codebase.
-
-First, install the `openpi-client` package in your robot environment:
+训练 checkpoint 只替换 config 和目录：
 
 ```bash
-cd $OPENPI_ROOT/packages/openpi-client
-pip install -e .
+"$OPENPI_PY" scripts/serve_policy.py \
+  --env LIBERO \
+  --port 8000 \
+  policy:checkpoint \
+  --policy.config pi05_libero_baseline_lora_h16 \
+  --policy.dir "$BSP_WORK/experiments/checkpoints/pi05_libero_baseline_lora_h16/phase1-short10k-seed42-baseline/1000"
 ```
 
-Then, you can use the client to query the remote policy server from your robot code. Here's an example of how to do this:
+不要使用与 checkpoint 不匹配的 config；policy construction 会从 checkpoint assets 读取对应
+norm stats。一次 GPU 只运行一个 policy/training 作业。
+
+## LIBERO request schema
+
+Python 3.8 client 每次 replan 发送：
 
 ```python
-from openpi_client import image_tools
-from openpi_client import websocket_client_policy
-
-# Outside of episode loop, initialize the policy client.
-# Point to the host and port of the policy server (localhost and 8000 are the defaults).
-client = websocket_client_policy.WebsocketClientPolicy(host="localhost", port=8000)
-
-for step in range(num_steps):
-    # Inside the episode loop, construct the observation.
-    # Resize images on the client side to minimize bandwidth / latency. Always return images in uint8 format.
-    # We provide utilities for resizing images + uint8 conversion so you match the training routines.
-    # The typical resize_size for pre-trained pi0 models is 224.
-    # Note that the proprioceptive `state` can be passed unnormalized, normalization will be handled on the server side.
-    observation = {
-        "observation/image": image_tools.convert_to_uint8(
-            image_tools.resize_with_pad(img, 224, 224)
-        ),
-        "observation/wrist_image": image_tools.convert_to_uint8(
-            image_tools.resize_with_pad(wrist_img, 224, 224)
-        ),
-        "observation/state": state,
-        "prompt": task_instruction,
-    }
-
-    # Call the policy server with the current observation.
-    # This returns an action chunk of shape (action_horizon, action_dim).
-    # Note that you typically only need to call the policy every N steps and execute steps
-    # from the predicted action chunk open-loop in the remaining steps.
-    action_chunk = client.infer(observation)["actions"]
-
-    # Execute the actions in the environment.
-    ...
-
+observation = {
+    "observation/image": agentview_rgb_uint8,
+    "observation/wrist_image": wrist_rgb_uint8,
+    "observation/state": state_float_array,
+    "prompt": task_description,
+    "inference_seed": deterministic_uint32,
+}
+result = client.infer(observation)
+actions = result["actions"]
 ```
 
-Here, the `host` and `port` arguments specify the IP address and port of the remote policy server. You can also specify these as command-line arguments to your robot code, or hard-code them in your robot codebase. The `observation` is a dictionary of observations and the prompt, following the specification of the policy inputs for the policy you are serving. We have concrete examples of how to construct this dictionary for different environments in the [simple client example](../examples/simple_client/main.py).
+`examples/libero/main.py` 会把 LIBERO 相机数组旋转 180°以匹配训练，再 resize 到 224×224。
+state 不在 client 归一化；server 使用 checkpoint norm stats。确定性 seed 由
+`(suite, task, init_state, replan_index)` 和 eval seed 42 稳定派生，使 A/B 在同一配对 episode
+使用相同 flow noise。未提供 seed 时仍兼容 policy 的 stateful RNG。
+
+## 输出协议
+
+| variant | 模型原始目标 | server 返回 | evaluator 执行 |
+|---|---|---|---|
+| 官方校准 | baseline horizon 10 | `(10, 7)` | 前 8 步 |
+| phase-one baseline | baseline horizon 16 | `(16, 7)` | 前 8 步 |
+| phase-one BSP | 16×8 spline parameters | 解码后的 `(8, 7)` | 全部 8 步 |
+
+BSP output transform 在 quantile 反归一化后：
+
+1. 取前 7 个 control 通道和第 8 个 knot 通道；
+2. 将下降 knot 投影为 `previous + 1e-6`，保留重复边界 knot；
+3. 使用 16 knots 和前 12 个 control points；
+4. 只在 `[knots[3], knots[-4]]` 内等距解码 8 个动作，禁止外推；
+5. shape 错误、NaN 或无有效区间分类为 policy failure。
+
+两组在原生 10 Hz 下执行 8 步后重新请求。第一阶段不做 2×/4× 时间缩放、异步 action
+broker、segment alignment 或 gripper threshold。
+
+## 在 simulator 环境连接
+
+```bash
+export BSP_WORK=/root/openpi-bsp-work
+export BSP_REPO_DIR="$BSP_WORK/repo/openpi05-bsp"
+export LIBERO_PY="$BSP_WORK/venvs/libero-py38/bin/python"
+export LIBERO_PYTHONPATH="$BSP_REPO_DIR:$BSP_REPO_DIR/packages/openpi-client/src:$BSP_REPO_DIR/third_party/libero:$BSP_REPO_DIR/third_party/libero/libero"
+export EGL_VENDOR_JSON="$BSP_WORK/cache/egl/10_nvidia.json"
+
+cd "$BSP_REPO_DIR"
+env \
+  PYTHONPATH="$LIBERO_PYTHONPATH" \
+  MUJOCO_GL=egl \
+  PYOPENGL_PLATFORM=egl \
+  __EGL_VENDOR_LIBRARY_FILENAMES="$EGL_VENDOR_JSON" \
+  "$LIBERO_PY" examples/libero/main.py --help
+```
+
+正式运行必须补齐 evaluator 的 config/checkpoint/step/code SHA/dataset revision/norm hash/runtime
+digest，以及 BSP 时的 sidecar hash/fingerprint。不要用空身份生成验收结果；完整命令见
+[LIBERO evaluator README](../examples/libero/README.md)。
+
+## 错误边界
+
+- 连接、超时、simulator reset/step 和网络错误是 infrastructure failure；相同 seed 最多重试两次。
+- 非法 action shape、NaN/Inf、BSP 解码失败是 policy failure，计入成功率的失败 episode。
+- 两次基础设施重试仍失败、视频 artifact 写入失败或 manifest 不完整时，整个 run
+  `acceptance_complete=false`。
+- client 不应把异常吞掉并返回零动作；server 也不应为 shape 不匹配自动截断。
+
+如果 policy server 与 simulator 不在同一主机，只开放明确的受控网络路径。当前服务没有把
+WebSocket 当作公网鉴权边界，不应直接暴露到互联网。

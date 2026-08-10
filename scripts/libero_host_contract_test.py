@@ -117,7 +117,7 @@ class LiberoHostContractTest(unittest.TestCase):
         self.assertIn("HOST_RUNTIME_DIGEST", readme)
         self.assertIn("--args.container-digest ${HOST_RUNTIME_DIGEST}", readme)
         self.assertIn("${EXPERIMENTS_DIR}", readme)
-        self.assertNotIn("../../docs/pi05_libero_bsp_phase1_server.md", readme)
+        self.assertIn("../../docs/pi05_libero_bsp_phase1_server.md", readme)
 
     def test_readme_evaluator_flags_match_retained_args_and_protocols(self):
         readme = _README.read_text(encoding="utf-8")
