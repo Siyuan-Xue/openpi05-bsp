@@ -1,9 +1,8 @@
 import copy
 import csv
 import hashlib
+import importlib
 import json
-from pathlib import Path
-import tempfile
 
 import pytest
 
@@ -37,19 +36,13 @@ _VERIFICATION_FLAGS = (
 
 def _manifest(variant, step, *, family="full"):
     baseline = variant == "baseline"
-    config_names = {
-        ("baseline", "full"): "pi05_libero_baseline_h16",
-        ("bsp", "full"): "pi05_libero_bsp_h16",
-        ("baseline", "lora"): "pi05_libero_baseline_lora_h16",
-        ("bsp", "lora"): "pi05_libero_bsp_lora_h16",
-    }
     return {
         "schema_version": 2,
         "native_control_hz": 10,
         "replan_steps": 8,
         "code_sha": _CODE_SHA,
         "dataset_revision": "v2.0",
-        "config_name": config_names[(variant, family)],
+        "config_name": "pi05_libero_{}{}_h16".format(variant, "_lora" if family == "lora" else ""),
         "checkpoint_step": step,
         "bsp_cache_hash": None if baseline else _CACHE_SHA,
         "bsp_cache_manifest_fingerprint": None if baseline else _CACHE_FINGERPRINT,
@@ -77,6 +70,10 @@ def _manifest(variant, step, *, family="full"):
         "inference_timeout_s": 120.0,
         "infrastructure_retries": 2,
     }
+
+
+def _write_json(path, payload):
+    path.write_text(json.dumps(payload, allow_nan=False, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _episode(suite, task_id, init_index, success):
@@ -113,17 +110,11 @@ def _write_run(path, variant, step, *, family="full"):
         for task_id in range(10):
             for init_index in range(50):
                 records.append(_episode(suite, task_id, init_index, variant == "bsp"))
-    (path / "manifest.json").write_text(
-        json.dumps(_manifest(variant, step, family=family), allow_nan=False, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    _write_json(path / "manifest.json", _manifest(variant, step, family=family))
     with (path / "episodes.jsonl").open("w", encoding="utf-8") as output:
         for record in records:
             output.write(json.dumps(record.to_dict(), allow_nan=False, sort_keys=True) + "\n")
-    (path / "summary.json").write_text(
-        json.dumps(libero_eval.aggregate_records(records), allow_nan=False, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    _write_json(path / "summary.json", libero_eval.aggregate_records(records))
 
 
 def _bsp_diagnostics():
@@ -167,84 +158,51 @@ def _norm_diagnostics():
 
 def _write_diagnostics(root):
     bsp = root / "bsp-verification.json"
-    bsp.write_text(
-        json.dumps(
-            _bsp_diagnostics(),
-            allow_nan=False,
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
     norm = root / "norm-comparison.json"
-    norm.write_text(
-        json.dumps(
-            _norm_diagnostics(),
-            allow_nan=False,
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    _write_json(bsp, _bsp_diagnostics())
+    _write_json(norm, _norm_diagnostics())
     return bsp, norm
 
 
 class TestLiberoPhaseOneReport:
-    def test_full_20000_rollout_comparison_emits_all_five_fixed_milestone_artifacts(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            run_dirs = []
-            # Deliberately shuffled and opaque: classification must come only from manifests.
-            identities = [
-                ("bsp", 2000),
-                ("baseline", 0),
-                ("bsp", 10000),
-                ("baseline", 10000),
-                ("bsp", 5000),
-                ("baseline", 2000),
-                ("bsp", 0),
-                ("baseline", 1000),
-                ("bsp", 1000),
-                ("baseline", 5000),
-            ]
-            for index, (variant, step) in enumerate(identities):
-                path = root / "opaque-run-{}".format(index)
-                _write_run(path, variant, step)
-                run_dirs.append(path)
-            bsp_diagnostics, norm_diagnostics = _write_diagnostics(root)
-            output_dir = root / "comparison"
+    def test_full_20000_rollout_comparison_emits_all_five_fixed_milestone_artifacts(self, tmp_path):
+        run_dirs = []
+        identities = list(reversed([(variant, step) for variant in ("baseline", "bsp") for step in _STEPS]))
+        for index, (variant, step) in enumerate(identities):
+            path = tmp_path / "opaque-run-{}".format(index)
+            _write_run(path, variant, step)
+            run_dirs.append(path)
+        bsp_diagnostics, norm_diagnostics = _write_diagnostics(tmp_path)
+        output_dir = tmp_path / "comparison"
 
-            comparison = libero_report.compare_phase_one(
-                run_dirs,
-                bsp_diagnostics_path=bsp_diagnostics,
-                norm_comparison_path=norm_diagnostics,
-                output_dir=output_dir,
-            )
+        comparison = libero_report.compare_phase_one(
+            run_dirs,
+            bsp_diagnostics_path=bsp_diagnostics,
+            norm_comparison_path=norm_diagnostics,
+            output_dir=output_dir,
+        )
 
-            assert {path.name for path in output_dir.iterdir()} == {
-                "task_comparison.csv",
-                "suite_comparison.csv",
-                "learning_curve.csv",
-                "comparison.json",
-                "report.md",
-                "learning_curve.svg",
-            }
-            assert [row["checkpoint_step"] for row in comparison["milestones"]] == list(_STEPS)
-            assert comparison["protocol"]["milestones"] == list(_STEPS)
-            assert comparison["protocol"]["total_episodes"] == 20000
-            assert comparison["protocol"]["training_family"] == "full"
-            for row in comparison["milestones"]:
-                assert row["bsp_minus_baseline"] == 1.0
-                assert row["bootstrap_95_ci"] == [1.0, 1.0]
-                assert row["bootstrap_resamples"] == 10000
-                assert row["bootstrap_seed"] == 42
-            with (output_dir / "task_comparison.csv").open(newline="", encoding="utf-8") as input_file:
-                assert len(list(csv.DictReader(input_file))) == 200
-            with (output_dir / "suite_comparison.csv").open(newline="", encoding="utf-8") as input_file:
-                assert len(list(csv.DictReader(input_file))) == 20
-            with (output_dir / "learning_curve.csv").open(newline="", encoding="utf-8") as input_file:
-                assert len(list(csv.DictReader(input_file))) == 5
-            assert "best" not in (output_dir / "report.md").read_text(encoding="utf-8").lower()
+        assert {path.name for path in output_dir.iterdir()} == {
+            "task_comparison.csv",
+            "suite_comparison.csv",
+            "learning_curve.csv",
+            "comparison.json",
+            "report.md",
+            "learning_curve.svg",
+        }
+        assert [row["checkpoint_step"] for row in comparison["milestones"]] == list(_STEPS)
+        assert comparison["protocol"]["milestones"] == list(_STEPS)
+        assert comparison["protocol"]["total_episodes"] == 20000
+        assert comparison["protocol"]["training_family"] == "full"
+        for row in comparison["milestones"]:
+            assert row["bsp_minus_baseline"] == 1.0
+            assert row["bootstrap_95_ci"] == [1.0, 1.0]
+            assert row["bootstrap_resamples"] == 10000
+            assert row["bootstrap_seed"] == 42
+        for filename, count in (("task_comparison.csv", 200), ("suite_comparison.csv", 20), ("learning_curve.csv", 5)):
+            with (output_dir / filename).open(newline="", encoding="utf-8") as input_file:
+                assert len(list(csv.DictReader(input_file))) == count
+        assert "best" not in (output_dir / "report.md").read_text(encoding="utf-8").lower()
 
     def test_manifest_classifier_accepts_one_lora_family_and_rejects_mixed_families(self):
         lora = [_manifest(variant, step, family="lora") for variant in ("baseline", "bsp") for step in _STEPS]
@@ -305,6 +263,7 @@ class TestLiberoPhaseOneReport:
             ("dataset_revision", "v2.1"),
             ("code_sha", "code-sha"),
             ("container_digest", "sha256:container"),
+            ("norm_hash", 123),
             ("connection_timeout_s", 0.0),
             ("inference_timeout_s", float("inf")),
         )
@@ -319,17 +278,29 @@ class TestLiberoPhaseOneReport:
         with pytest.raises(libero_report.ComparisonError):
             libero_report.classify_phase_one_manifests(mismatched)
 
-    def test_strict_json_rejects_nan_and_truncated_input(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            nan_path = root / "nan.json"
-            nan_path.write_text('{"value": NaN}\n', encoding="utf-8")
-            truncated_path = root / "truncated.jsonl"
-            truncated_path.write_text('{"value": 1}\n{"value":', encoding="utf-8")
+    def test_replan_protocol_is_not_mutable_through_public_bsp_parameters(self):
+        original_parameters = dict(libero_eval.BSP_PARAMETERS)
+        try:
+            libero_eval.BSP_PARAMETERS["executed_actions"] = 9
+            reloaded_report = importlib.reload(libero_report)
+            canonical = _manifest("baseline", 0)
+            reloaded_report._validate_manifest(canonical)
             with pytest.raises(libero_report.ComparisonError):
-                libero_report.load_strict_json(nan_path)
-            with pytest.raises(libero_report.ComparisonError):
-                libero_report.load_strict_jsonl(truncated_path)
+                reloaded_report._validate_manifest(dict(canonical, replan_steps=9, execution_horizon=9))
+        finally:
+            libero_eval.BSP_PARAMETERS.clear()
+            libero_eval.BSP_PARAMETERS.update(original_parameters)
+            importlib.reload(libero_report)
+
+    def test_strict_json_rejects_nan_and_truncated_input(self, tmp_path):
+        nan_path = tmp_path / "nan.json"
+        nan_path.write_text('{"value": NaN}\n', encoding="utf-8")
+        truncated_path = tmp_path / "truncated.jsonl"
+        truncated_path.write_text('{"value": 1}\n{"value":', encoding="utf-8")
+        with pytest.raises(libero_report.ComparisonError):
+            libero_report.load_strict_json(nan_path)
+        with pytest.raises(libero_report.ComparisonError):
+            libero_report.load_strict_jsonl(truncated_path)
 
     def test_pair_validator_rejects_duplicate_missing_or_identity_mismatch(self):
         baseline = [
@@ -381,42 +352,37 @@ class TestLiberoPhaseOneReport:
         assert first[0] < 0.0
         assert first[1] > 0.0
 
-    def test_run_loader_rejects_artifact_errors_infrastructure_and_summary_mismatch(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+    def test_run_loader_rejects_artifact_errors_infrastructure_and_summary_mismatch(self, tmp_path):
+        artifact_run = tmp_path / "artifact"
+        _write_run(artifact_run, "baseline", 10000)
+        (artifact_run / "artifact_errors.jsonl").write_text('{"error": "ffmpeg failed"}\n', encoding="utf-8")
+        with pytest.raises(libero_report.ComparisonError):
+            libero_report.load_run(artifact_run)
 
-            artifact_run = root / "artifact"
-            _write_run(artifact_run, "baseline", 10000)
-            (artifact_run / "artifact_errors.jsonl").write_text('{"error": "ffmpeg failed"}\n', encoding="utf-8")
-            with pytest.raises(libero_report.ComparisonError):
-                libero_report.load_run(artifact_run)
+        infrastructure_run = tmp_path / "infrastructure"
+        _write_run(infrastructure_run, "baseline", 10000)
+        lines = (infrastructure_run / "episodes.jsonl").read_text(encoding="utf-8").splitlines()
+        first_record = json.loads(lines[0])
+        first_record.update(
+            {
+                "status": "infrastructure_incomplete",
+                "success": None,
+                "include_in_success_rate": False,
+                "infrastructure_kind": "network",
+            }
+        )
+        lines[0] = json.dumps(first_record, allow_nan=False, sort_keys=True)
+        (infrastructure_run / "episodes.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        with pytest.raises(libero_report.ComparisonError):
+            libero_report.load_run(infrastructure_run)
 
-            infrastructure_run = root / "infrastructure"
-            _write_run(infrastructure_run, "baseline", 10000)
-            lines = (infrastructure_run / "episodes.jsonl").read_text(encoding="utf-8").splitlines()
-            first_record = json.loads(lines[0])
-            first_record.update(
-                {
-                    "status": "infrastructure_incomplete",
-                    "success": None,
-                    "include_in_success_rate": False,
-                    "infrastructure_kind": "network",
-                }
-            )
-            lines[0] = json.dumps(first_record, allow_nan=False, sort_keys=True)
-            (infrastructure_run / "episodes.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
-            with pytest.raises(libero_report.ComparisonError):
-                libero_report.load_run(infrastructure_run)
-
-            summary_run = root / "summary"
-            _write_run(summary_run, "baseline", 10000)
-            summary = json.loads((summary_run / "summary.json").read_text(encoding="utf-8"))
-            summary["successes"] = 1
-            (summary_run / "summary.json").write_text(
-                json.dumps(summary, allow_nan=False, sort_keys=True) + "\n", encoding="utf-8"
-            )
-            with pytest.raises(libero_report.ComparisonError):
-                libero_report.load_run(summary_run)
+        summary_run = tmp_path / "summary"
+        _write_run(summary_run, "baseline", 10000)
+        summary = json.loads((summary_run / "summary.json").read_text(encoding="utf-8"))
+        summary["successes"] = 1
+        _write_json(summary_run / "summary.json", summary)
+        with pytest.raises(libero_report.ComparisonError):
+            libero_report.load_run(summary_run)
 
     def test_episode_validation_rejects_noncanonical_or_internally_inconsistent_records(self):
         manifest = _manifest("baseline", 10000)

@@ -531,17 +531,19 @@ class EvaluationManifest:
             raise ValueError("Evaluation checkpoint_step must be an integer")
         if self.checkpoint_step < 0:
             raise ValueError("Evaluation checkpoint_step must be non-negative")
-        if not libero_artifacts.is_sha256(self.norm_hash):
+        if not libero_artifacts.is_sha256(self.norm_hash, require_string=False):
             raise ValueError("norm_hash must be the lowercase SHA256 of norm_stats.json")
         cache_identities_present = (self.bsp_cache_hash is not None, self.bsp_cache_manifest_fingerprint is not None)
         if self.policy_variant == "bsp" and cache_identities_present != (True, True):
             raise ValueError("BSP evaluation requires both the sidecar NPZ SHA256 and manifest fingerprint")
         if self.policy_variant == "baseline" and cache_identities_present != (False, False):
             raise ValueError("Baseline evaluation must record null BSP cache identities")
-        if self.bsp_cache_hash is not None and not libero_artifacts.is_sha256(self.bsp_cache_hash):
+        if self.bsp_cache_hash is not None and not libero_artifacts.is_sha256(
+            self.bsp_cache_hash, require_string=False
+        ):
             raise ValueError("bsp_cache_hash must be the lowercase SHA256 of the actual sidecar NPZ")
         if self.bsp_cache_manifest_fingerprint is not None and not libero_artifacts.is_sha256(
-            self.bsp_cache_manifest_fingerprint
+            self.bsp_cache_manifest_fingerprint, require_string=False
         ):
             raise ValueError("bsp_cache_manifest_fingerprint must be a lowercase SHA256")
         if not self.bsp_parameters:

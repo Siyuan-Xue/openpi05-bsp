@@ -11,8 +11,12 @@ import tempfile
 from typing import Any
 
 
-def is_sha256(value: Any) -> bool:
-    return isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+def is_sha256(value: Any, *, require_string: bool = True) -> bool:
+    return (
+        (not require_string or isinstance(value, str))
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def json_text(payload: Mapping[str, Any]) -> str:

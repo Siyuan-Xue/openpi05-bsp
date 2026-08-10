@@ -24,7 +24,7 @@ TASKS_PER_SUITE = 10
 TRIALS_PER_TASK = 50
 EPISODES_PER_RUN = len(libero_eval.SUPPORTED_SUITES) * TASKS_PER_SUITE * TRIALS_PER_TASK
 TOTAL_EPISODES = EPISODES_PER_RUN * 2 * len(MILESTONES)
-_REPLAN_STEPS = libero_eval.BSP_PARAMETERS["executed_actions"]
+_REPLAN_STEPS = libero_eval.resolve_policy_protocol("bsp", None).expected_action_horizon
 OUTPUT_FILENAMES = (
     "task_comparison.csv",
     "suite_comparison.csv",

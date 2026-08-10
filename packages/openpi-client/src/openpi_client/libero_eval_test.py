@@ -1,11 +1,11 @@
 import ast
 import dataclasses
 import json
-import tempfile
 from pathlib import Path
 
 import pytest
 
+from openpi_client import libero_artifacts
 from openpi_client import libero_eval
 
 
@@ -199,27 +199,26 @@ class TestLiberoEvaluation:
         assert summary["all_four_suites_evaluated"]
         assert summary["four_suite_macro_success_rate"] == 1.0
 
-    def test_video_selector_keeps_only_first_success_and_first_counted_failure_per_task(self):
-        with tempfile.TemporaryDirectory() as directory:
-            selector = libero_eval.VideoSelector(Path(directory))
-            success = libero_eval.EpisodeRecord.from_attempt(_identity(init_index=2), 42, 1, success=True)
-            later_success = libero_eval.EpisodeRecord.from_attempt(_identity(init_index=3), 42, 1, success=True)
-            failure = libero_eval.EpisodeRecord.from_attempt(
-                _identity(init_index=4), 42, 1, success=False, failure_kind="timeout"
-            )
-            infra = libero_eval.EpisodeRecord.infrastructure_incomplete(
-                _identity(init_index=5), 42, 3, "network", "dropped"
-            )
+    def test_video_selector_keeps_only_first_success_and_first_counted_failure_per_task(self, tmp_path):
+        selector = libero_eval.VideoSelector(tmp_path)
+        success = libero_eval.EpisodeRecord.from_attempt(_identity(init_index=2), 42, 1, success=True)
+        later_success = libero_eval.EpisodeRecord.from_attempt(_identity(init_index=3), 42, 1, success=True)
+        failure = libero_eval.EpisodeRecord.from_attempt(
+            _identity(init_index=4), 42, 1, success=False, failure_kind="timeout"
+        )
+        infra = libero_eval.EpisodeRecord.infrastructure_incomplete(
+            _identity(init_index=5), 42, 3, "network", "dropped"
+        )
 
-            success_path = selector.claim(success)
-            assert success_path is not None
-            assert "success-init-002" in str(success_path)
-            assert selector.claim(later_success) is None
-            failure_path = selector.claim(failure)
-            assert failure_path is not None
-            assert "failure-init-004" in str(failure_path)
-            assert success_path != failure_path
-            assert selector.claim(infra) is None
+        success_path = selector.claim(success)
+        assert success_path is not None
+        assert "success-init-002" in str(success_path)
+        assert selector.claim(later_success) is None
+        failure_path = selector.claim(failure)
+        assert failure_path is not None
+        assert "failure-init-004" in str(failure_path)
+        assert success_path != failure_path
+        assert selector.claim(infra) is None
 
     def test_manifest_preserves_all_audit_identities_and_bsp_parameters(self):
         manifest = _manifest(
@@ -264,6 +263,21 @@ class TestLiberoEvaluation:
 
     def test_manifest_rejects_unverifiable_source_identities_or_nonfinite_timeouts(self):
         manifest = _manifest()
+        bsp_manifest = _manifest(
+            config_name="pi05_libero_bsp_h16",
+            bsp_cache_hash="a" * 64,
+            bsp_cache_manifest_fingerprint="c" * 64,
+            policy_variant="bsp",
+            policy_protocol="bsp_decoded_h8",
+            expected_action_horizon=8,
+        )
+        for candidate, field in (
+            (manifest, "norm_hash"),
+            (bsp_manifest, "bsp_cache_hash"),
+            (bsp_manifest, "bsp_cache_manifest_fingerprint"),
+        ):
+            with pytest.raises(TypeError):
+                dataclasses.replace(candidate, **{field: 123})
         for field, value in (
             ("code_sha", "abc"),
             ("code_sha", 123),
@@ -276,60 +290,71 @@ class TestLiberoEvaluation:
             with pytest.raises(ValueError):
                 dataclasses.replace(manifest, **{field: value})
 
+    def test_shared_artifact_helpers_preserve_wire_bytes_and_clean_failed_replacements(self, tmp_path):
+        assert libero_artifacts.json_text({"z": 2, "a": 1}) == '{\n  "a": 1,\n  "z": 2\n}\n'
+        with pytest.raises(ValueError):
+            libero_artifacts.json_text({"value": float("nan")})
+        assert libero_artifacts.csv_text(({"b": 2, "a": 1},)) == "b,a\r\n2,1\r\n"
+
+        jsonl_path = tmp_path / "records.jsonl"
+        libero_artifacts.append_jsonl(jsonl_path, {"b": 2, "a": 1})
+        libero_artifacts.append_jsonl(jsonl_path, {"c": 3})
+        assert jsonl_path.read_text(encoding="utf-8") == '{"a": 1, "b": 2}\n{"c": 3}\n'
+
+        occupied = tmp_path / "occupied"
+        occupied.mkdir()
+        with pytest.raises(OSError):
+            libero_artifacts.atomic_text(occupied, "replacement")
+        assert not list(tmp_path.glob(".occupied.*.tmp"))
+
     def test_client_evaluation_module_parses_as_python_37(self):
         source = Path(libero_eval.__file__).read_text(encoding="utf-8")
         ast.parse(source, filename=str(libero_eval.__file__), feature_version=(3, 7))
 
-    def test_artifact_writer_emits_jsonl_csv_and_summary(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            writer = libero_eval.ArtifactWriter(root)
-            record = libero_eval.EpisodeRecord.from_attempt(_identity(), 42, 1, success=True)
-            writer.append_episode(record)
-            summary = writer.write_summary([record])
+    def test_artifact_writer_emits_jsonl_csv_and_summary(self, tmp_path):
+        writer = libero_eval.ArtifactWriter(tmp_path)
+        record = libero_eval.EpisodeRecord.from_attempt(_identity(), 42, 1, success=True)
+        writer.append_episode(record)
+        summary = writer.write_summary([record])
 
-            episode = json.loads((root / "episodes.jsonl").read_text())
-            assert episode["paired_key"] == record.identity.paired_key
-            assert (root / "tasks.csv").is_file()
-            assert (root / "suites.csv").is_file()
-            assert json.loads((root / "summary.json").read_text()) == summary
+        episode = json.loads((tmp_path / "episodes.jsonl").read_text())
+        assert episode["paired_key"] == record.identity.paired_key
+        assert (tmp_path / "tasks.csv").is_file()
+        assert (tmp_path / "suites.csv").is_file()
+        assert json.loads((tmp_path / "summary.json").read_text()) == summary
 
-    def test_summary_write_preserves_existing_csv_if_serialization_fails(self):
+    def test_summary_write_preserves_existing_csv_if_serialization_fails(self, tmp_path):
         class UnserializableTaskName:
             def __str__(self):
                 raise RuntimeError("cannot serialize task name")
 
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            tasks_path = root / "tasks.csv"
-            tasks_path.write_text("previous artifact\n", encoding="utf-8")
-            identity = dataclasses.replace(_identity(), task_name=UnserializableTaskName())
-            record = libero_eval.EpisodeRecord.from_attempt(identity, 42, 1, success=True)
+        tasks_path = tmp_path / "tasks.csv"
+        tasks_path.write_text("previous artifact\n", encoding="utf-8")
+        identity = dataclasses.replace(_identity(), task_name=UnserializableTaskName())
+        record = libero_eval.EpisodeRecord.from_attempt(identity, 42, 1, success=True)
 
-            with pytest.raises(RuntimeError, match="cannot serialize task name"):
-                libero_eval.ArtifactWriter(root).write_summary([record])
+        with pytest.raises(RuntimeError, match="cannot serialize task name"):
+            libero_eval.ArtifactWriter(tmp_path).write_summary([record])
 
-            assert tasks_path.read_text(encoding="utf-8") == "previous artifact\n"
+        assert tasks_path.read_text(encoding="utf-8") == "previous artifact\n"
 
-    def test_artifact_failure_is_separately_audited_and_marks_summary_incomplete(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            writer = libero_eval.ArtifactWriter(root)
-            record = libero_eval.EpisodeRecord.from_attempt(_identity(), 42, 1, success=True)
-            error = libero_eval.ArtifactError(
-                episode_id=record.identity.episode_id,
-                artifact_type="video",
-                path="videos/example.mp4",
-                error="ffmpeg exited 1",
-            )
+    def test_artifact_failure_is_separately_audited_and_marks_summary_incomplete(self, tmp_path):
+        writer = libero_eval.ArtifactWriter(tmp_path)
+        record = libero_eval.EpisodeRecord.from_attempt(_identity(), 42, 1, success=True)
+        error = libero_eval.ArtifactError(
+            episode_id=record.identity.episode_id,
+            artifact_type="video",
+            path="videos/example.mp4",
+            error="ffmpeg exited 1",
+        )
 
-            writer.append_episode(record)
-            writer.append_artifact_error(error)
-            summary = writer.write_summary([record], artifact_errors=[error])
+        writer.append_episode(record)
+        writer.append_artifact_error(error)
+        summary = writer.write_summary([record], artifact_errors=[error])
 
-            persisted_episode = json.loads((root / "episodes.jsonl").read_text())
-            persisted_error = json.loads((root / "artifact_errors.jsonl").read_text())
-            assert persisted_episode["success"]
-            assert persisted_error["artifact_type"] == "video"
-            assert summary["artifact_error_count"] == 1
-            assert not summary["acceptance_complete"]
+        persisted_episode = json.loads((tmp_path / "episodes.jsonl").read_text())
+        persisted_error = json.loads((tmp_path / "artifact_errors.jsonl").read_text())
+        assert persisted_episode["success"]
+        assert persisted_error["artifact_type"] == "video"
+        assert summary["artifact_error_count"] == 1
+        assert not summary["acceptance_complete"]
