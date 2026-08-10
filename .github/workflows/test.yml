@@ -36,7 +36,7 @@ jobs:
       - name: Ruff format
         run: uvx --from ruff==0.11.12 ruff format --check .
       - name: Run every offline CPU test selected by the default marker policy
-        run: uv run --frozen pytest -q
+        run: uv run --frozen pytest -x -vv
 
   openpi-client:
     name: Isolated openpi-client tests (Python 3.8)

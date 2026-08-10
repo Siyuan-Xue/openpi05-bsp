@@ -491,7 +491,7 @@ def test_pr_workflows_are_read_only_bounded_and_commit_pinned():
                 assert re.search(r"(?m)^\s+persist-credentials:\s*false\s*$", step)
 
 
-def test_default_cpu_ci_invokes_pytest_discovery_without_a_file_whitelist():
+def test_default_cpu_ci_invokes_fail_fast_verbose_discovery_without_a_file_whitelist():
     commands = filter(None, (_step_run(step) for step in _workflow_steps(_ROOT / ".github/workflows/test.yml")))
     root_commands = [
         shlex.split(command) for command in commands if command.startswith("uv run") and "pytest" in command
@@ -501,5 +501,8 @@ def test_default_cpu_ci_invokes_pytest_discovery_without_a_file_whitelist():
     command = root_commands[0]
     assert "--frozen" in command
     pytest_arguments = command[command.index("pytest") + 1 :]
+    assert "-x" in pytest_arguments
+    assert "-vv" in pytest_arguments
+    assert "-q" not in pytest_arguments
     assert "-m" not in pytest_arguments
     assert not [argument for argument in pytest_arguments if not argument.startswith("-")]
