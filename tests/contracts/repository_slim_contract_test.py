@@ -467,10 +467,9 @@ def test_generated_experiment_and_tool_artifacts_are_ignored(relative_path: str)
 
 def test_pr_workflows_are_read_only_bounded_and_commit_pinned():
     expected_actions = {
-        "actions/checkout": ("11d5960a326750d5838078e36cf38b85af677262", "v4.4.0"),
-        "actions/setup-python": ("a26af69be951a213d495a4c3e4e4022e16d87065", "v5.6.0"),
-        "astral-sh/setup-uv": ("d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86", "v5.4.2"),
-        "pre-commit/action": ("2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd", "v3.0.1"),
+        "actions/checkout": ("3d3c42e5aac5ba805825da76410c181273ba90b1", "v7.0.1"),
+        "actions/setup-python": ("5fda3b95a4ea91299a34e894583c3862153e4b97", "v7.0.0"),
+        "astral-sh/setup-uv": ("c771a70e6277c0a99b617c7a806ffedaca235ff9", "v9.0.0"),
     }
     for workflow in sorted((_ROOT / ".github/workflows").glob("*.yml")):
         scalars = _yaml_scalars(workflow)
@@ -491,7 +490,7 @@ def test_pr_workflows_are_read_only_bounded_and_commit_pinned():
                 assert re.search(r"(?m)^\s+persist-credentials:\s*false\s*$", step)
 
 
-def test_default_cpu_ci_invokes_fail_fast_verbose_discovery_without_a_file_whitelist():
+def test_default_cpu_ci_invokes_quiet_discovery_without_marker_or_file_whitelists():
     commands = filter(None, (_step_run(step) for step in _workflow_steps(_ROOT / ".github/workflows/test.yml")))
     root_commands = [
         shlex.split(command) for command in commands if command.startswith("uv run") and "pytest" in command
@@ -501,8 +500,13 @@ def test_default_cpu_ci_invokes_fail_fast_verbose_discovery_without_a_file_white
     command = root_commands[0]
     assert "--frozen" in command
     pytest_arguments = command[command.index("pytest") + 1 :]
-    assert "-x" in pytest_arguments
-    assert "-vv" in pytest_arguments
-    assert "-q" not in pytest_arguments
-    assert "-m" not in pytest_arguments
-    assert not [argument for argument in pytest_arguments if not argument.startswith("-")]
+    assert pytest_arguments == ["-q"]
+
+
+def test_pre_commit_ci_runs_the_locked_tool_through_uvx():
+    workflow = _ROOT / ".github/workflows/pre-commit.yml"
+    commands = filter(None, (_step_run(step) for step in _workflow_steps(workflow)))
+
+    assert [shlex.split(command) for command in commands] == [
+        ["uvx", "--from", "pre-commit==4.2.0", "pre-commit", "run", "--all-files"]
+    ]
