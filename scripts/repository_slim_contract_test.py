@@ -15,6 +15,7 @@ import unittest
 _ROOT = Path(__file__).resolve().parents[1]
 _REMOVED_DISTRIBUTIONS = {
     "chex",
+    "dm-tree",
     "equinox",
     "flatbuffers",
     "gym-aloha",
@@ -33,6 +34,7 @@ _IMPORT_TO_DISTRIBUTION = {
     "lerobot": "lerobot",
     "openpi_client": "openpi-client",
     "orbax": "orbax-checkpoint",
+    "tree": "dm-tree",
     "tqdm_loggable": "tqdm-loggable",
 }
 
@@ -64,6 +66,18 @@ def _production_imports(paths: tuple[Path, ...]) -> set[str]:
     return imports
 
 
+def _file_imports(paths: tuple[Path, ...]) -> set[str]:
+    imports = set()
+    for path in paths:
+        module = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(module):
+            if isinstance(node, ast.Import):
+                imports.update(alias.name.split(".", 1)[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imports.add(node.module.split(".", 1)[0])
+    return imports
+
+
 def _undeclared_imports(imports: set[str], dependencies: set[str], local_modules: set[str]) -> set[str]:
     third_party = imports.difference(sys.stdlib_module_names, local_modules, {"__future__"})
     return {
@@ -87,6 +101,20 @@ class RepositorySlimContractTest(unittest.TestCase):
         )
         self.assertEqual(
             _undeclared_imports(client_imports, _dependency_names(client_project), {"openpi_client"}),
+            set(),
+        )
+
+    def test_openpi_client_test_imports_are_declared(self):
+        client_project = _project(_ROOT / "packages/openpi-client/pyproject.toml")
+        dependencies = _dependency_names(client_project)
+        dependencies.update(
+            _distribution_name(requirement) for requirement in client_project["dependency-groups"]["dev"]
+        )
+        tests = tuple(sorted((_ROOT / "packages/openpi-client/src/openpi_client").glob("*_test.py")))
+
+        self.assertTrue(tests)
+        self.assertEqual(
+            _undeclared_imports(_file_imports(tests), dependencies, {"openpi_client"}),
             set(),
         )
 

@@ -1,6 +1,5 @@
 import numpy as np
 import pytest
-import tree
 
 from openpi_client import msgpack_numpy
 
@@ -12,6 +11,22 @@ def _check(expected, actual):
         assert np.array_equal(expected, actual, equal_nan=expected.dtype.kind == "f")
     else:
         assert expected == actual
+
+
+def _check_structure(expected, actual):
+    if isinstance(expected, dict):
+        assert isinstance(actual, dict)
+        assert expected.keys() == actual.keys()
+        for key in expected:
+            _check_structure(expected[key], actual[key])
+        return
+    if isinstance(expected, (list, tuple)):
+        assert isinstance(actual, type(expected))
+        assert len(expected) == len(actual)
+        for index, expected_item in enumerate(expected):
+            _check_structure(expected_item, actual[index])
+        return
+    _check(expected, actual)
 
 
 @pytest.mark.parametrize(
@@ -42,4 +57,4 @@ def _check(expected, actual):
 def test_pack_unpack(data):
     packed = msgpack_numpy.packb(data)
     unpacked = msgpack_numpy.unpackb(packed)
-    tree.map_structure(_check, data, unpacked)
+    _check_structure(data, unpacked)
