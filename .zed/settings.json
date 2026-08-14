@@ -1,0 +1,26 @@
+{
+  "lsp": {
+    "basedpyright": {
+      "settings": {
+        "python.analysis": {
+          "diagnosticSeverityOverrides": {
+            "reportMissingImports": "none",
+            "reportMissingModuleSource": "none",
+            "reportMissingTypeStubs": "none"
+          }
+        }
+      }
+    },
+    "pyright": {
+      "settings": {
+        "python.analysis": {
+          "diagnosticSeverityOverrides": {
+            "reportMissingImports": "none",
+            "reportMissingModuleSource": "none",
+            "reportMissingTypeStubs": "none"
+          }
+        }
+      }
+    }
+  }
+}
