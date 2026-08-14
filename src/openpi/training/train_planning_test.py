@@ -2,12 +2,33 @@
 
 import pytest
 
+from openpi.training import loader_resume
 from openpi.training import train_planning as train_planning_module
 from openpi.training.train_planning import add_trees
 from openpi.training.train_planning import average_tree_sum
 from openpi.training.train_planning import optimizer_step_numbers
 from openpi.training.train_planning import plan_gradient_accumulation
 from openpi.training.train_planning import should_save_checkpoint
+
+
+def _loader_identity() -> loader_resume.LoaderIdentity:
+    return loader_resume.LoaderIdentity(
+        repo_id="physical-intelligence/libero",
+        revision="v2.0",
+        dataset_length=273_465,
+        dataset_fingerprint="de4a79e770bcac3f",
+        bsp_cache_fingerprint="db8fe671",
+        action_horizon=16,
+        action_keys=("actions",),
+        seed=42,
+        shuffle=True,
+        global_micro_batch_size=64,
+        local_batch_size=64,
+        accumulation_steps=4,
+        process_count=1,
+        num_workers=2,
+        drop_last=True,
+    )
 
 
 def _tree_map(function, *trees):
@@ -148,6 +169,97 @@ def test_resume_begins_after_the_completed_checkpoint_boundary():
     assert resumed_steps.start == 10_001
     assert resumed_steps.stop == 30_001
     assert len(resumed_steps) == 20_000
+
+
+def test_fresh_training_starts_at_the_first_loader_batch():
+    plan = train_planning_module.plan_loader_resume(
+        restored_step=0,
+        accumulation_steps=4,
+        num_train_steps=10_000,
+        resuming=False,
+        stored_cursor=None,
+    )
+
+    assert plan.start_batch == 0
+    assert plan.cursor_source == "fresh"
+
+
+def test_legacy_checkpoint_derives_the_consumed_micro_batches():
+    plan = train_planning_module.plan_loader_resume(
+        restored_step=2_000,
+        accumulation_steps=4,
+        num_train_steps=10_000,
+        resuming=True,
+        stored_cursor=None,
+    )
+
+    assert plan.start_batch == 8_000
+    assert plan.cursor_source == "legacy-derived"
+
+
+def test_checkpoint_cursor_supplies_the_consumed_micro_batches():
+    cursor = loader_resume.cursor_for_step(2_000, _loader_identity())
+
+    plan = train_planning_module.plan_loader_resume(
+        restored_step=2_000,
+        accumulation_steps=4,
+        num_train_steps=10_000,
+        resuming=True,
+        stored_cursor=cursor,
+    )
+
+    assert plan.start_batch == 8_000
+    assert plan.cursor_source == "checkpoint"
+
+
+def test_checkpoint_cursor_must_match_the_restored_step():
+    cursor = loader_resume.cursor_for_step(1_000, _loader_identity())
+
+    with pytest.raises(ValueError, match="completed_step"):
+        train_planning_module.plan_loader_resume(
+            restored_step=2_000,
+            accumulation_steps=4,
+            num_train_steps=10_000,
+            resuming=True,
+            stored_cursor=cursor,
+        )
+
+
+def test_resume_planning_rejects_steps_beyond_the_training_target():
+    with pytest.raises(ValueError, match="exceeds requested training steps"):
+        train_planning_module.plan_loader_resume(
+            restored_step=10_001,
+            accumulation_steps=4,
+            num_train_steps=10_000,
+            resuming=True,
+            stored_cursor=None,
+        )
+
+
+def test_stored_cursor_must_match_the_current_accumulation_geometry():
+    cursor = loader_resume.cursor_for_step(2_000, _loader_identity())
+
+    with pytest.raises(ValueError, match="accumulation_steps"):
+        train_planning_module.plan_loader_resume(
+            restored_step=2_000,
+            accumulation_steps=8,
+            num_train_steps=10_000,
+            resuming=True,
+            stored_cursor=cursor,
+        )
+
+
+def test_fresh_training_rejects_checkpoint_state():
+    cursor = loader_resume.cursor_for_step(0, _loader_identity())
+
+    with pytest.raises(ValueError, match="Fresh training"):
+        train_planning_module.plan_loader_resume(
+            restored_step=0,
+            accumulation_steps=4,
+            num_train_steps=10_000,
+            resuming=False,
+            stored_cursor=cursor,
+        )
 
 
 def test_exact_phase_one_short10k_milestones_are_preserved():

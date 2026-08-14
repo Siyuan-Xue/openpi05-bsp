@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import dataclasses
-from typing import TypeVar
+from typing import Literal, TypeVar
+
+from openpi.training import loader_resume
 
 Tree = TypeVar("Tree")
 
@@ -22,6 +24,15 @@ class GradientAccumulationPlan:
     def accumulation_indices(self) -> range:
         """Indices folded into the RNG for the consecutive micro-batches."""
         return range(self.accumulation_steps)
+
+
+@dataclasses.dataclass(frozen=True)
+class LoaderResumePlan:
+    """Absolute loader position and the evidence used to derive it."""
+
+    restored_step: int
+    start_batch: int
+    cursor_source: Literal["fresh", "legacy-derived", "checkpoint"]
 
 
 def _require_positive_integer(name: str, value: int) -> None:
@@ -75,6 +86,46 @@ def plan_gradient_accumulation(
         micro_batch_size=resolved_micro_batch_size,
         local_micro_batch_size=resolved_micro_batch_size // process_count,
         accumulation_steps=batch_size // resolved_micro_batch_size,
+    )
+
+
+def plan_loader_resume(
+    *,
+    restored_step: int,
+    accumulation_steps: int,
+    num_train_steps: int,
+    resuming: bool,
+    stored_cursor: loader_resume.LoaderCursor | None,
+) -> LoaderResumePlan:
+    """Plan the exact absolute micro-batch at which loader iteration begins."""
+    optimizer_step_numbers(restored_step, num_train_steps)
+    _require_positive_integer("accumulation_steps", accumulation_steps)
+    if not isinstance(resuming, bool):
+        raise ValueError(f"resuming must be a boolean, got {resuming!r}")
+    if not resuming:
+        if restored_step != 0:
+            raise ValueError("Fresh training must start at optimizer step 0.")
+        if stored_cursor is not None:
+            raise ValueError("Fresh training cannot use a stored loader cursor.")
+        return LoaderResumePlan(restored_step=0, start_batch=0, cursor_source="fresh")
+
+    if stored_cursor is None:
+        return LoaderResumePlan(
+            restored_step=restored_step,
+            start_batch=restored_step * accumulation_steps,
+            cursor_source="legacy-derived",
+        )
+
+    stored_cursor.validate(stored_cursor.identity, expected_step=restored_step)
+    if stored_cursor.identity.accumulation_steps != accumulation_steps:
+        raise ValueError(
+            "Loader cursor accumulation_steps mismatch: "
+            f"stored={stored_cursor.identity.accumulation_steps!r}, requested={accumulation_steps!r}"
+        )
+    return LoaderResumePlan(
+        restored_step=restored_step,
+        start_batch=stored_cursor.consumed_batches,
+        cursor_source="checkpoint",
     )
 
 
