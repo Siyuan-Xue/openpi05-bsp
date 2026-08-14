@@ -2,7 +2,16 @@
   "lsp": {
     "basedpyright": {
       "settings": {
+        "basedpyright.analysis": {
+          "typeCheckingMode": "off",
+          "diagnosticSeverityOverrides": {
+            "reportMissingImports": "none",
+            "reportMissingModuleSource": "none",
+            "reportMissingTypeStubs": "none"
+          }
+        },
         "python.analysis": {
+          "typeCheckingMode": "off",
           "diagnosticSeverityOverrides": {
             "reportMissingImports": "none",
             "reportMissingModuleSource": "none",
@@ -14,6 +23,7 @@
     "pyright": {
       "settings": {
         "python.analysis": {
+          "typeCheckingMode": "off",
           "diagnosticSeverityOverrides": {
             "reportMissingImports": "none",
             "reportMissingModuleSource": "none",

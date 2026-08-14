@@ -1,0 +1,7 @@
+{
+  "typeCheckingMode": "off",
+  "reportMissingImports": "none",
+  "reportMissingModuleSource": "none",
+  "reportMissingTypeStubs": "none",
+  "exclude": ["**/__pycache__", ".venv", "third_party"]
+}
