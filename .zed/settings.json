@@ -1,45 +1,7 @@
 {
-  "lsp": {
-    "basedpyright": {
-      "settings": {
-        "basedpyright.analysis": {
-          "typeCheckingMode": "off",
-          "diagnosticSeverityOverrides": {
-            "reportMissingImports": "none",
-            "reportMissingModuleSource": "none",
-            "reportMissingTypeStubs": "none",
-            "reportInvalidTypeForm": "none",
-            "reportInvalidTypeArguments": "none",
-            "reportGeneralTypeIssues": "none"
-          }
-        },
-        "python.analysis": {
-          "typeCheckingMode": "off",
-          "diagnosticSeverityOverrides": {
-            "reportMissingImports": "none",
-            "reportMissingModuleSource": "none",
-            "reportMissingTypeStubs": "none",
-            "reportInvalidTypeForm": "none",
-            "reportInvalidTypeArguments": "none",
-            "reportGeneralTypeIssues": "none"
-          }
-        }
-      }
-    },
-    "pyright": {
-      "settings": {
-        "python.analysis": {
-          "typeCheckingMode": "off",
-          "diagnosticSeverityOverrides": {
-            "reportMissingImports": "none",
-            "reportMissingModuleSource": "none",
-            "reportMissingTypeStubs": "none",
-            "reportInvalidTypeForm": "none",
-            "reportInvalidTypeArguments": "none",
-            "reportGeneralTypeIssues": "none"
-          }
-        }
-      }
+  "languages": {
+    "Python": {
+      "language_servers": ["!basedpyright", "!pyright", "ruff"]
     }
   }
 }
