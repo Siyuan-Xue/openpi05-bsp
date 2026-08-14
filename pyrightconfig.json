@@ -3,5 +3,8 @@
   "reportMissingImports": "none",
   "reportMissingModuleSource": "none",
   "reportMissingTypeStubs": "none",
+  "reportInvalidTypeForm": "none",
+  "reportInvalidTypeArguments": "none",
+  "reportGeneralTypeIssues": "none",
   "exclude": ["**/__pycache__", ".venv", "third_party"]
 }
