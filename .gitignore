@@ -137,6 +137,7 @@ celerybeat.pid
 .env
 .venv
 .worktrees/
+.vscode/
 env/
 venv/
 ENV/

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ast
 from email.parser import Parser
-import json
 from pathlib import Path
 import re
 import runpy
@@ -398,22 +397,13 @@ def test_retained_runtime_dependency_families_remain_explicit():
 
 def test_metadata_ownership_and_test_discovery_target_the_specialized_fork():
     project = _project(_ROOT / "pyproject.toml")
-    vscode_source = (_ROOT / ".vscode/settings.json").read_text(encoding="utf-8")
-    vscode = json.loads(re.sub(r",(\s*[}\]])", r"\1", vscode_source))
     codeowners = (_ROOT / ".github/CODEOWNERS").read_text(encoding="utf-8")
 
     assert "pi0.5" in project["project"]["description"].lower()
     assert "libero" in project["project"]["description"].lower()
     assert project["project"]["urls"]["Repository"] == "https://github.com/Siyuan-Xue/openpi05-bsp"
     assert re.search("(?m)^\\*\\s+@Siyuan-Xue\\s*$", codeowners) is not None
-    assert vscode["python.testing.pytestArgs"] == [
-        "src/openpi",
-        "scripts",
-        "tests/contracts",
-        "packages/openpi-client/src/openpi_client",
-    ]
-    assert vscode["python.testing.pytestEnabled"] is True
-    assert vscode["python.testing.unittestEnabled"] is False
+    assert not (_ROOT / ".vscode").exists()
 
     test_roots = tuple((_ROOT / path).resolve() for path in project["tool"]["pytest"]["ini_options"]["testpaths"])
     assert all(any(path.resolve().is_relative_to(root) for root in test_roots) for path in _tracked_pytest_modules())

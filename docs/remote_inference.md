@@ -70,7 +70,7 @@ observation = {
     "observation/wrist_image": wrist_rgb_uint8,
     "observation/state": state_float_array,
     "prompt": task_description,
-    "inference_seed": deterministic_uint32,
+    "__openpi_inference_seed": deterministic_uint32,  # request envelope; not a model observation
 }
 result = client.infer(observation)
 actions = result["actions"]
