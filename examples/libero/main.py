@@ -320,6 +320,7 @@ def _run_attempt(
     episode_started_ns = time.monotonic_ns()
     action_plan = collections.deque()
     replay_images = []
+    stall_source_frames = []
     inference_ms = []
     inference_requests = []
     control_stalls = []
@@ -368,6 +369,7 @@ def _run_attempt(
                         reason=_video_timing.STALL_REASON_SYNCHRONOUS_INFERENCE,
                     )
                 )
+                stall_source_frames.append((control_steps, image))
                 return _eval.AttemptResult(
                     success=False,
                     steps=control_steps,
@@ -378,6 +380,7 @@ def _run_attempt(
                     inference_requests=tuple(inference_requests),
                     control_stalls=tuple(control_stalls),
                     replay_frames=tuple(replay_images),
+                    stall_source_frames=tuple(stall_source_frames),
                 )
             request_completed_ns = time.monotonic_ns()
             request_duration_ns = request_completed_ns - request_started_ns
@@ -463,6 +466,7 @@ def _build_video_frames(
     control_frames,
     stalls: tuple[_video_timing.ControlStall, ...],
     *,
+    stall_source_frames=(),
     control_hz: int,
     video_fps: int,
     inference_schedule: str,
@@ -478,6 +482,16 @@ def _build_video_frames(
     )
     hold_count = video_fps // control_hz
     frame_count = len(control_frames)
+    stall_source_by_step = {}
+    for entry in stall_source_frames:
+        if not isinstance(entry, tuple) or len(entry) != 2:
+            raise TypeError("stall_source_frames must contain (control_step, frame) tuples")
+        control_step, source_frame = entry
+        if isinstance(control_step, bool) or not isinstance(control_step, int):
+            raise TypeError("stall source control_step must be an integer")
+        if control_step < 0 or control_step > frame_count or control_step in stall_source_by_step:
+            raise ValueError("stall source control_step must be unique and within the replay timeline")
+        stall_source_by_step[control_step] = source_frame
     stall_frames_by_step = {}
     for stall, stall_frame_count in zip(
         stalls,
@@ -495,6 +509,8 @@ def _build_video_frames(
                 inference_schedule=inference_schedule,
             ),
         )
+    if set(stall_source_by_step) - set(stall_frames_by_step):
+        raise ValueError("Every transient stall source must correspond to a measured control stall")
 
     video_frames = []
     for control_step, frame in enumerate(control_frames):
@@ -503,7 +519,7 @@ def _build_video_frames(
             _, stall_frame_count, overlay_lines = stall_event
             if stall_frame_count:
                 rendered_stall = _video_timing.render_overlay(
-                    frame,
+                    stall_source_by_step.get(control_step, frame),
                     overlay_lines,
                     renderer=renderer,
                 )
@@ -513,11 +529,13 @@ def _build_video_frames(
 
     trailing_stall = stall_frames_by_step.get(frame_count)
     if trailing_stall is not None:
-        if not control_frames:
-            raise ValueError("Cannot render a control stall without a replay frame")
         _, stall_frame_count, overlay_lines = trailing_stall
-        frame = control_frames[-1]
+        frame = stall_source_by_step.get(frame_count)
+        if frame is None and control_frames:
+            frame = control_frames[-1]
         if stall_frame_count:
+            if frame is None:
+                raise ValueError("Cannot render a control stall without its request-time source frame")
             rendered_stall = _video_timing.render_overlay(
                 frame,
                 overlay_lines,
@@ -552,7 +570,8 @@ def _persist_episode_artifacts(
 ) -> tuple[_eval.EpisodeRecord, _eval.ArtifactError | None]:
     """Persist the rollout first, then encode or separately audit its video."""
     replay_frames = record.replay_frames
-    persisted_record = dataclasses.replace(record, replay_frames=())
+    stall_source_frames = record.stall_source_frames
+    persisted_record = dataclasses.replace(record, replay_frames=(), stall_source_frames=())
     writer.append_episode(persisted_record)
 
     video_path = video_selector.claim(persisted_record)
@@ -560,40 +579,20 @@ def _persist_episode_artifacts(
         return persisted_record, None
 
     artifact_error = None
-    if not replay_frames:
-        artifact_error = _eval.ArtifactError(
-            episode_id=persisted_record.identity.episode_id,
-            artifact_type="video",
-            path=str(video_path),
-            error="selected rollout has no replay frames",
+    encoder = imageio.mimwrite if video_encoder is None else video_encoder
+    try:
+        included_stalls = (
+            persisted_record.control_stalls if video_show_inference_waits else ()
         )
-    else:
-        encoder = imageio.mimwrite if video_encoder is None else video_encoder
-        try:
-            included_stalls = (
-                persisted_record.control_stalls if video_show_inference_waits else ()
-            )
-            planned_audit = _video_timing.build_video_audit(
-                control_frame_count=len(replay_frames),
-                requests=persisted_record.inference_requests,
-                stalls=included_stalls,
-                control_hz=control_hz,
-                video_fps=video_fps,
-            )
-            video_frames = _build_video_frames(
-                replay_frames,
-                included_stalls,
-                control_hz=control_hz,
-                video_fps=video_fps,
-                inference_schedule=inference_schedule,
-            )
-            encoder(
-                video_path,
-                [np.asarray(frame) for frame in video_frames],
-                fps=video_fps,
-            )
-            encoded_fps, encoded_frame_count, encoded_duration_s = _read_encoded_video(video_path)
-            video_audit = _eval.build_video_artifact_audit(
+        planned_audit = _video_timing.build_video_audit(
+            control_frame_count=len(replay_frames),
+            requests=persisted_record.inference_requests,
+            stalls=included_stalls,
+            control_hz=control_hz,
+            video_fps=video_fps,
+        )
+        if planned_audit.video_frame_count == 0:
+            video_audit = _eval.build_omitted_video_artifact_audit(
                 episode_id=persisted_record.identity.episode_id,
                 path=str(video_path),
                 planned=planned_audit,
@@ -601,24 +600,56 @@ def _persist_episode_artifacts(
                 included_stalls=included_stalls,
                 video_show_inference_waits=video_show_inference_waits,
                 inference_schedule=inference_schedule,
-                encoded_fps=encoded_fps,
-                encoded_frame_count=encoded_frame_count,
-                encoded_duration_s=encoded_duration_s,
             )
-            if video_audit.warning is not None:
-                logging.warning(
-                    "Video timing warning for %s: %s",
-                    persisted_record.identity.episode_id,
-                    video_audit.warning,
-                )
             writer.append_video_audit(video_audit)
-        except Exception as error:
-            artifact_error = _eval.ArtifactError(
-                episode_id=persisted_record.identity.episode_id,
-                artifact_type="video",
-                path=str(video_path),
-                error=f"{type(error).__name__}: {error}",
+            logging.warning(
+                "Video omitted for %s: %s",
+                persisted_record.identity.episode_id,
+                video_audit.omission_reason,
             )
+            return persisted_record, None
+        video_frames = _build_video_frames(
+            replay_frames,
+            included_stalls,
+            stall_source_frames=stall_source_frames,
+            control_hz=control_hz,
+            video_fps=video_fps,
+            inference_schedule=inference_schedule,
+        )
+        if len(video_frames) != planned_audit.video_frame_count:
+            raise ValueError("Expanded video frame count does not match planned audit")
+        encoder(
+            video_path,
+            [np.asarray(frame) for frame in video_frames],
+            fps=video_fps,
+        )
+        encoded_fps, encoded_frame_count, encoded_duration_s = _read_encoded_video(video_path)
+        video_audit = _eval.build_video_artifact_audit(
+            episode_id=persisted_record.identity.episode_id,
+            path=str(video_path),
+            planned=planned_audit,
+            measured_stalls=persisted_record.control_stalls,
+            included_stalls=included_stalls,
+            video_show_inference_waits=video_show_inference_waits,
+            inference_schedule=inference_schedule,
+            encoded_fps=encoded_fps,
+            encoded_frame_count=encoded_frame_count,
+            encoded_duration_s=encoded_duration_s,
+        )
+        if video_audit.warning is not None:
+            logging.warning(
+                "Video timing warning for %s: %s",
+                persisted_record.identity.episode_id,
+                video_audit.warning,
+            )
+        writer.append_video_audit(video_audit)
+    except Exception as error:
+        artifact_error = _eval.ArtifactError(
+            episode_id=persisted_record.identity.episode_id,
+            artifact_type="video",
+            path=str(video_path),
+            error=f"{type(error).__name__}: {error}",
+        )
 
     if artifact_error is not None:
         writer.append_artifact_error(artifact_error)

@@ -38,6 +38,12 @@ class _Environment:
         pass
 
 
+class _ContinuingEnvironment(_Environment):
+    def step(self, action):
+        self.actions.append(action)
+        return {"raw": "observation-{}".format(len(self.actions))}, 0.0, False, {}
+
+
 class _Client:
     def __init__(self, responses):
         self.responses = iter(responses)
@@ -277,6 +283,65 @@ def test_run_attempt_records_synchronous_request_and_stall_without_extra_steps(m
     assert result.inference_ms == (0.002,)
     assert result.replay_frames == ("frame",)
     assert len(environment.actions) == result.steps == 1
+
+
+def test_first_request_policy_failure_keeps_current_frame_without_counting_a_step(monkeypatch):
+    environment = _Environment()
+    holder = _ClientHolder([])
+    monkeypatch.setattr(holder.client, "infer", lambda request: {})
+    clock = iter((1_000, 2_000, 50_002_000))
+    monkeypatch.setattr(libero_main.time, "monotonic_ns", lambda: next(clock))
+    monkeypatch.setattr(
+        libero_main,
+        "_prepare_observation",
+        lambda obs, prompt, size: ({}, "current-request-frame"),
+    )
+
+    result = libero_main._run_attempt(
+        environment=environment,
+        client_holder=holder,
+        initial_state=object(),
+        identity=_identity(),
+        task_description="pick up the block",
+        args=_args(),
+        max_steps=1,
+    )
+
+    assert not result.success
+    assert result.failure_kind == "policy"
+    assert result.steps == result.replans == 0
+    assert environment.actions == []
+    assert result.replay_frames == ()
+    assert result.stall_source_frames == ((0, "current-request-frame"),)
+
+
+def test_later_replan_policy_failure_uses_latest_observation_without_extra_action(monkeypatch):
+    environment = _ContinuingEnvironment()
+    holder = _ClientHolder([_actions(), [[float("nan")] * 7 for _ in range(16)]])
+    clock = iter((1_000, 2_000, 3_000, 4_000, 50_004_000))
+    monkeypatch.setattr(libero_main.time, "monotonic_ns", lambda: next(clock))
+    monkeypatch.setattr(
+        libero_main,
+        "_prepare_observation",
+        lambda obs, prompt, size: ({}, "frame-{}".format(obs["raw"])),
+    )
+
+    result = libero_main._run_attempt(
+        environment=environment,
+        client_holder=holder,
+        initial_state=object(),
+        identity=_identity(),
+        task_description="pick up the block",
+        args=_args(),
+        max_steps=9,
+    )
+
+    assert not result.success
+    assert result.failure_kind == "policy"
+    assert result.steps == len(environment.actions) == 8
+    assert result.replans == 1
+    assert result.replay_frames[-1] == "frame-observation-7"
+    assert result.stall_source_frames == ((8, "frame-observation-8"),)
 
 
 def test_synchronous_stall_overlay_uses_exact_current_mode_text():
@@ -543,6 +608,148 @@ def test_multi_frame_stall_renders_one_overlay_and_reuses_the_same_array_referen
     ]
     assert all(frame is rendered_overlay for frame in frames[:4])
     assert frames[4:] == ("frame", "frame")
+
+
+def test_trailing_stall_uses_transient_request_frame_instead_of_last_control_frame():
+    renderer_calls = []
+    stall = timing.ControlStall(1, 1, 0, 50_000_000)
+
+    frames = libero_main._build_video_frames(
+        ("previous-control-frame",),
+        (stall,),
+        stall_source_frames=((1, "current-request-frame"),),
+        control_hz=20,
+        video_fps=40,
+        inference_schedule="synchronous",
+        overlay_renderer=lambda frame, lines: renderer_calls.append((frame, lines)) or "overlay",
+    )
+
+    assert frames == ("previous-control-frame", "previous-control-frame", "overlay", "overlay")
+    assert renderer_calls == [
+        (
+            "current-request-frame",
+            ("Synchronous inference", "Control stalled: 0.05 s"),
+        )
+    ]
+
+
+def test_zero_step_policy_failure_encodes_only_quantized_wait_and_show_off_omits_cleanly(
+    monkeypatch, tmp_path
+):
+    encoded = []
+    audits = []
+
+    class Writer:
+        def append_episode(self, record):
+            pass
+
+        def append_video_audit(self, audit):
+            audits.append(audit)
+
+        def append_artifact_error(self, error):
+            pytest.fail("valid zero-step policy failure became an artifact error")
+
+    class Selector:
+        def claim(self, record):
+            return tmp_path / "failure.mp4"
+
+    class Reader:
+        def get_meta_data(self):
+            return {"fps": 40.0, "duration": len(encoded[-1]) / 40.0}
+
+        def count_frames(self):
+            return len(encoded[-1])
+
+        def close(self):
+            pass
+
+    def encoder(path, frames, *, fps):
+        encoded.append(tuple(frames))
+
+    monkeypatch.setattr(libero_main.imageio, "get_reader", lambda path: Reader())
+    monkeypatch.setattr(libero_main, "_draw_video_overlay", lambda frame, lines: "wait-overlay")
+    result = libero_eval.AttemptResult(
+        success=False,
+        steps=0,
+        replans=0,
+        failure_kind="policy",
+        inference_requests=(timing.InferenceRequest(0, 0, 50_000_000),),
+        control_stalls=(timing.ControlStall(0, 0, 0, 50_000_000),),
+        stall_source_frames=((0, "current-request-frame"),),
+    )
+    record = libero_eval.EpisodeRecord.from_attempt(
+        _identity(), 42, 1, success=False, failure_kind="policy", result=result
+    )
+
+    enabled, enabled_error = libero_main._persist_episode_artifacts(
+        record,
+        Writer(),
+        Selector(),
+        video_show_inference_waits=True,
+        video_encoder=encoder,
+    )
+    disabled, disabled_error = libero_main._persist_episode_artifacts(
+        record,
+        Writer(),
+        Selector(),
+        video_show_inference_waits=False,
+        video_encoder=encoder,
+    )
+
+    assert enabled_error is disabled_error is None
+    assert enabled.steps == disabled.steps == record.steps == 0
+    assert enabled.replans == disabled.replans == record.replans == 0
+    assert enabled.success == disabled.success == record.success is False
+    assert encoded == [("wait-overlay", "wait-overlay")]
+    assert audits[0].encoded_frame_count == 2
+    assert audits[1].artifact_status == "omitted_empty_timeline"
+    assert audits[1].encoded_frame_count == 0
+
+
+def test_zero_quantized_first_wait_is_omitted_without_fabricating_a_control_frame(
+    monkeypatch, tmp_path
+):
+    audits = []
+
+    class Writer:
+        def append_episode(self, record):
+            pass
+
+        def append_video_audit(self, audit):
+            audits.append(audit)
+
+        def append_artifact_error(self, error):
+            pytest.fail("sub-frame policy failure became an artifact error")
+
+    class Selector:
+        def claim(self, record):
+            return tmp_path / "failure.mp4"
+
+    result = libero_eval.AttemptResult(
+        success=False,
+        steps=0,
+        replans=0,
+        failure_kind="policy",
+        inference_requests=(timing.InferenceRequest(0, 0, 1),),
+        control_stalls=(timing.ControlStall(0, 0, 0, 1),),
+        stall_source_frames=((0, "current-request-frame"),),
+    )
+    record = libero_eval.EpisodeRecord.from_attempt(
+        _identity(), 42, 1, success=False, failure_kind="policy", result=result
+    )
+
+    _, artifact_error = libero_main._persist_episode_artifacts(
+        record,
+        Writer(),
+        Selector(),
+        video_show_inference_waits=True,
+        video_encoder=lambda *args, **kwargs: pytest.fail("empty timeline was encoded"),
+    )
+
+    assert artifact_error is None
+    assert audits[0].artifact_status == "omitted_empty_timeline"
+    assert audits[0].control_frame_count == 0
+    assert audits[0].video_frame_count == 0
 
 
 def test_async_latency_without_underflow_adds_no_frames_but_partial_stall_uses_async_label():
