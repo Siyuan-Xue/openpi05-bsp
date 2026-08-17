@@ -1,6 +1,7 @@
 # ruff: noqa: SLF001 -- focused integration tests exercise private controller seams.
 
 import dataclasses
+from pathlib import Path
 import threading
 from types import SimpleNamespace
 
@@ -39,19 +40,22 @@ class ManualClock:
             self.now_ns = max(self.now_ns, target_ns)
 
 
-def _metadata_payload(*, revision="same"):
+def _metadata_payload(*, revision="same", policy_variant="baseline"):
+    if policy_variant == "baseline":
+        representation = "native"
+        protocols = ["baseline_h16_n5_v1", "baseline_rtc_h16_v1"]
+    else:
+        representation = "bsp"
+        protocols = ["bsp_spline_h8_v1"]
     return msgpack_numpy.packb(
         {
             "server_revision": revision,
             inference.INFERENCE_CAPABILITIES_KEY: {
                 "schema_version": 1,
-                "action_representation": "native",
+                "action_representation": representation,
                 "model_action_horizon": 16,
                 "model_action_dim": 32,
-                "supported_protocols": [
-                    "baseline_h16_n5_v1",
-                    "baseline_rtc_h16_v1",
-                ],
+                "supported_protocols": protocols,
             },
         }
     )
@@ -64,6 +68,47 @@ def _rtc_response(offset=0.0):
         "actions": actions,
         "rtc": {"schema_version": 1, "model_actions": model_actions},
     }
+
+
+def _bsp_response(offset=0.0):
+    parameters = np.zeros((16, 8), dtype=np.float32)
+    parameters[:, :7] = offset
+    parameters[:, 7] = np.arange(16, dtype=np.float32) / 8.0
+    return {
+        "actions": np.full((8, 7), offset, dtype=np.float32),
+        "bsp": {
+            "schema_version": 1,
+            "parameters": parameters,
+            "origin_hz": 10,
+            "degree": 3,
+            "speedup": 1,
+            "alignment": "disabled_delta_eff",
+        },
+    }
+
+
+def _calibration(mode_name, *, latency_ns=0):
+    mode = control.EXECUTION_MODES[mode_name]
+    canonical_request = {"observation/index": 0}
+    identity = control.CalibrationObservationIdentityV1(
+        suite="libero_spatial",
+        task_id=0,
+        init_state_index=0,
+        init_state_fingerprint="a" * 64,
+        request_fingerprint=control.canonical_fingerprint(canonical_request),
+    )
+    return control.LatencyCalibrationV1.create(
+        execution_mode=mode.name,
+        checkpoint_identity_fingerprint="b" * 64,
+        server_metadata_fingerprint="c" * 64,
+        canonical_observation_identity=identity,
+        seed_namespace="openpi-libero-calibration-v1/{}/{}".format(mode.name, "b" * 64),
+        bootstrap_request_fingerprint=("d" * 64 if mode.calibration_kind == "rtc" else None),
+        warmup_request_fingerprints=["e" * 64] * 5,
+        measurement_request_fingerprints=["f" * 64] * 20,
+        warmup_latency_ns=[latency_ns] * 5,
+        measurement_latency_ns=[latency_ns] * 20,
+    )
 
 
 @dataclasses.dataclass
@@ -424,6 +469,177 @@ def test_current_background_policy_error_stops_before_old_plan_action():
     assert not result.action_underflows
 
 
+def test_completed_policy_error_is_polled_before_next_observation_preparation():
+    clock = ManualClock()
+    worker = FakeWorker(
+        clock,
+        [
+            _ScriptedCall(0, {"ok": True}),
+            _ScriptedCall(50 * NS_PER_MS, error=ValueError("current policy failure")),
+        ],
+    )
+    environment = FakeEnvironment(done_after_real_steps=20, step_advance_ns=20 * NS_PER_MS)
+    prepared_indices = []
+
+    def prepare(obs, task_description, resize_size):
+        del task_description, resize_size
+        prepared_indices.append(obs["index"])
+        if obs["index"] > 1:
+            raise RuntimeError("preparation must not mask a completed policy failure")
+        return {"observation/index": obs["index"]}, np.zeros((2, 2, 3), dtype=np.uint8)
+
+    result = main_v4._run_attempt_v4(
+        environment=environment,
+        worker=worker,
+        scheduler=_BackgroundScheduler(),
+        initial_state=np.array([1.0], dtype=np.float32),
+        identity=_identity(),
+        task_description="pick up the block",
+        args=_args(execution_mode="baseline_rtc"),
+        max_steps=20,
+        expected_server_metadata_fingerprint=control.validate_server_metadata(
+            control.EXECUTION_MODES["baseline_rtc"],
+            msgpack_numpy.unpackb(worker.connect_payload),
+        ),
+        clock=clock,
+        prepare_observation=prepare,
+    )
+
+    assert result.failure_kind == "policy"
+    assert "current policy failure" in result.error
+    assert prepared_indices == [0, 1]
+
+
+class _WaitFailureWorker(FakeWorker):
+    def wait(self, job, timeout=None):
+        del job, timeout
+        raise ConnectionError("blocked request transport failed")
+
+
+def test_blocking_wait_failure_keeps_pending_owned_until_reset_acknowledgement():
+    clock = ManualClock()
+    worker = _WaitFailureWorker(clock, [_ScriptedCall(100 * NS_PER_MS, _rtc_response())])
+    environment = FakeEnvironment(done_after_real_steps=1)
+
+    with pytest.raises(evaluation.InfrastructureFailure, match="transport failed"):
+        _run(clock, worker, environment)
+
+    assert worker.reset_calls == 2
+    assert worker.ready_calls == [1, 2]
+
+
+def test_infrastructure_exhaustion_resets_and_acknowledges_every_attempt():
+    clock = ManualClock()
+    worker = _WaitFailureWorker(
+        clock,
+        [_ScriptedCall(100 * NS_PER_MS, _rtc_response()) for _ in range(3)],
+    )
+    environment = FakeEnvironment(done_after_real_steps=1)
+
+    record = evaluation.run_episode_with_retries_v4(
+        _identity(),
+        lambda _attempt: _run(clock, worker, environment),
+        eval_seed=42,
+        execution_mode="baseline_sync_n5",
+    )
+
+    assert record.status == "infrastructure_incomplete"
+    assert record.attempts == 3
+    assert worker.reset_calls == 6
+    assert worker.ready_calls == [1, 2, 3, 4, 5, 6]
+
+
+def test_real_rtc_scheduler_bootstraps_then_installs_guided_result():
+    clock = ManualClock()
+    worker = FakeWorker(
+        clock,
+        [_ScriptedCall(0, _rtc_response()), _ScriptedCall(0, _rtc_response(1000.0))],
+    )
+    environment = FakeEnvironment(done_after_real_steps=9)
+    calibration = _calibration("baseline_rtc")
+
+    result = _run(
+        clock,
+        worker,
+        environment,
+        args=_args(execution_mode="baseline_rtc"),
+        scheduler=control.make_scheduler_v4(control.EXECUTION_MODES["baseline_rtc"], calibration),
+    )
+
+    assert result.success
+    assert [event.trigger for event in result.inference_requests] == ["initial_plan", "rtc_launch"]
+    assert result.inference_requests[1].scheduler_context == {"s": 8, "d": 0}
+    assert [event.activation for event in result.plan_activations] == ["initial", "immediate_swap"]
+    assert np.array_equal(environment.actions[8], _rtc_response(1000.0)["actions"][0])
+
+
+def test_real_bsp_sync_blocks_only_after_closed_endpoint_is_exhausted():
+    clock = ManualClock()
+    payload = _metadata_payload(policy_variant="bsp")
+    worker = FakeWorker(
+        clock,
+        [
+            _ScriptedCall(0, _bsp_response(), metadata_payload=payload),
+            _ScriptedCall(25 * NS_PER_MS, _bsp_response(2.0), metadata_payload=payload),
+        ],
+        connect_payload=payload,
+    )
+    environment = FakeEnvironment(done_after_real_steps=5)
+
+    result = _run(
+        clock,
+        worker,
+        environment,
+        args=_args(execution_mode="bsp_spline_sync"),
+        scheduler=control.make_scheduler_v4(control.EXECUTION_MODES["bsp_spline_sync"], None),
+    )
+
+    assert result.success
+    assert [event.trigger for event in result.inference_requests] == [
+        "initial_plan",
+        "bsp_curve_exhausted",
+    ]
+    assert result.inference_requests[1].submitted_offset_ns == 200 * NS_PER_MS
+    assert result.control_stalls[1].duration_ns == 25 * NS_PER_MS
+    assert np.allclose(environment.actions[-1], 2.0)
+
+
+def test_real_bsp_async_underflow_waits_then_swaps_at_zero_curve_elapsed():
+    clock = ManualClock()
+    payload = _metadata_payload(policy_variant="bsp")
+    worker = FakeWorker(
+        clock,
+        [
+            _ScriptedCall(0, _bsp_response(), metadata_payload=payload),
+            _ScriptedCall(120 * NS_PER_MS, _bsp_response(3.0), metadata_payload=payload),
+        ],
+        connect_payload=payload,
+    )
+    environment = FakeEnvironment(done_after_real_steps=5)
+    calibration = _calibration("bsp_spline_async", latency_ns=50 * NS_PER_MS)
+
+    result = _run(
+        clock,
+        worker,
+        environment,
+        args=_args(execution_mode="bsp_spline_async"),
+        scheduler=control.make_scheduler_v4(
+            control.EXECUTION_MODES["bsp_spline_async"], calibration
+        ),
+    )
+
+    assert result.success
+    assert result.inference_requests[1].trigger == "bsp_prefetch"
+    assert result.inference_requests[1].scheduler_context == {
+        "remaining_plan_ns": 50 * NS_PER_MS,
+        "budget_ns": 50 * NS_PER_MS,
+    }
+    assert result.action_underflows[0].started_offset_ns == 200 * NS_PER_MS
+    assert result.action_underflows[0].duration_ns == 20 * NS_PER_MS
+    assert result.plan_activations[1].activation_context == {"curve_elapsed_ns": 0}
+    assert np.allclose(environment.actions[-1], 3.0)
+
+
 class _UnderflowScheduler(_BackgroundScheduler):
     def take_action(self, now_ns):
         if self.phase == 1 and self.action_index == 1:
@@ -558,3 +774,158 @@ def test_worker_shutdown_failure_preserves_primary_exception():
 
     assert caught.value.primary_error is primary
     assert isinstance(caught.value.cleanup_error, TimeoutError)
+
+
+def test_async_calibration_failure_occurs_before_manifest_writer_creation(monkeypatch, tmp_path):
+    args = _args(
+        execution_mode="baseline_rtc",
+        output_dir=str(tmp_path / "run"),
+        config_name="pi05_libero",
+        checkpoint_step=0,
+        checkpoint="checkpoint/0",
+        norm_hash="1" * 64,
+        container_digest="sha256:" + "2" * 64,
+    )
+    mode = control.EXECUTION_MODES["baseline_rtc"]
+    worker = FakeWorker(ManualClock(), [], connect_payload=_metadata_payload())
+    canonical_request = {"observation/index": 0}
+    canonical_identity = control.CalibrationObservationIdentityV1(
+        suite="libero_spatial",
+        task_id=0,
+        init_state_index=0,
+        init_state_fingerprint="a" * 64,
+        request_fingerprint=control.canonical_fingerprint(canonical_request),
+    )
+    writer_creations = []
+
+    monkeypatch.setattr(main_v4, "_resolve_code_sha_v4", lambda: "3" * 40)
+    monkeypatch.setattr(
+        main_v4,
+        "_calibration_request_v4",
+        lambda **_kwargs: (canonical_request, canonical_identity),
+    )
+
+    def fail_calibration(*_args, **_kwargs):
+        raise control.CalibrationPolicyError("calibration response malformed")
+
+    class WriterMustNotExist:
+        def __init__(self, output_dir):
+            writer_creations.append(Path(output_dir))
+
+    monkeypatch.setattr(main_v4._control, "calibrate_async_mode", fail_calibration)
+    monkeypatch.setattr(main_v4._eval, "ArtifactWriterV4", WriterMustNotExist)
+
+    with pytest.raises(control.CalibrationPolicyError, match="malformed"):
+        main_v4._evaluate_run_v4(
+            args=args,
+            suites=("libero_spatial",),
+            task_ids=(0,),
+            mode=mode,
+            worker=worker,
+            clock=worker.clock,
+        )
+
+    assert writer_creations == []
+    assert not (tmp_path / "run").exists()
+
+
+def test_selected_zero_frame_video_persists_episode_before_padding_and_audit(
+    monkeypatch, tmp_path
+):
+    clock = ManualClock()
+    worker = FakeWorker(
+        clock,
+        [_ScriptedCall(0, {"actions": np.zeros((16, 7), dtype=np.float32)})],
+    )
+    attempt = _run(clock, worker, FakeEnvironment(done_after_real_steps=1))
+    record = evaluation.EpisodeRecordV4.from_attempt(
+        _identity(),
+        42,
+        1,
+        execution_mode="baseline_sync_n5",
+        result=attempt,
+    )
+    order = []
+
+    class Writer:
+        def append_episode(self, persisted):
+            order.append(("episode", persisted))
+
+        def append_video_audit(self, audit):
+            order.append(("audit", audit))
+
+        def append_artifact_error(self, error):
+            order.append(("error", error))
+
+    class Selector:
+        def claim(self, persisted):
+            assert order == [("episode", persisted)]
+            return tmp_path / "selected.mp4"
+
+    def encode(path, frames, *, fps):
+        order.append(("encode", (path, tuple(frames), fps)))
+
+    monkeypatch.setattr(main_v4, "_read_encoded_video", lambda _path: (40.0, 1, 0.025))
+
+    persisted, artifact_error = main_v4._persist_episode_artifacts_v4(
+        record,
+        Writer(),
+        Selector(),
+        video_show_inference_waits=True,
+        video_encoder=encode,
+    )
+
+    assert artifact_error is None
+    assert persisted.replay_frames == ()
+    assert [entry[0] for entry in order] == ["episode", "encode", "audit"]
+    audit = order[-1][1]
+    assert audit.artifact_padding_frame_count == 1
+    assert audit.encoded_frame_count == 1
+    assert audit.planned.video_frame_count == 0
+
+
+@pytest.mark.parametrize("failure", (None, KeyboardInterrupt("stop")))
+def test_eval_entrypoint_closes_single_worker_on_normal_and_exception_exit(
+    monkeypatch, failure
+):
+    workers = []
+
+    class Worker:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            self.generation = 0
+            self.reset_calls = 0
+            self.ready_calls = []
+            self.close_calls = 0
+            workers.append(self)
+
+        def reset_generation(self):
+            self.generation += 1
+            self.reset_calls += 1
+            return self.generation
+
+        def wait_until_ready(self, generation, timeout=None):
+            self.ready_calls.append((generation, timeout))
+
+        def close(self):
+            self.close_calls += 1
+
+    def evaluate(**_kwargs):
+        if failure is not None:
+            raise failure
+        return {"acceptance_complete": True}
+
+    monkeypatch.setattr(main_v4._async, "AsyncInferenceWorker", Worker)
+    monkeypatch.setattr(main_v4, "_evaluate_run_v4", evaluate)
+    args = _args()
+
+    if failure is None:
+        assert main_v4.eval_libero_v4(args) == {"acceptance_complete": True}
+    else:
+        with pytest.raises(KeyboardInterrupt, match="stop"):
+            main_v4.eval_libero_v4(args)
+
+    assert len(workers) == 1
+    assert workers[0].reset_calls == 1
+    assert workers[0].ready_calls == [(1, args.connection_timeout_s)]
+    assert workers[0].close_calls == 1
