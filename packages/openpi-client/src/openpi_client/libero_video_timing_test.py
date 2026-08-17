@@ -19,9 +19,7 @@ def test_frequency_validation_requires_20_hz_control_and_integral_video_holds():
 
 def test_synchronous_and_async_request_stall_records_keep_latency_separate_from_stall():
     request = timing.InferenceRequest(replan_index=3, started_offset_ns=100, duration_ns=250)
-    synchronous_stall = timing.ControlStall(
-        control_step=24, replan_index=3, started_offset_ns=100, duration_ns=250
-    )
+    synchronous_stall = timing.ControlStall(control_step=24, replan_index=3, started_offset_ns=100, duration_ns=250)
     future_async_request = timing.InferenceRequest(replan_index=4, started_offset_ns=400, duration_ns=300)
     future_async_stall = timing.ControlStall(
         control_step=32,
@@ -99,12 +97,8 @@ def test_control_frames_hold_exactly_twice_at_40_fps_without_dataset_rate_input(
 def test_stall_quantization_carries_fractional_frames_across_events():
     stalls = (
         timing.ControlStall(control_step=0, replan_index=0, started_offset_ns=0, duration_ns=12_500_000),
-        timing.ControlStall(
-            control_step=1, replan_index=1, started_offset_ns=20_000_000, duration_ns=12_500_000
-        ),
-        timing.ControlStall(
-            control_step=2, replan_index=2, started_offset_ns=40_000_000, duration_ns=12_500_000
-        ),
+        timing.ControlStall(control_step=1, replan_index=1, started_offset_ns=20_000_000, duration_ns=12_500_000),
+        timing.ControlStall(control_step=2, replan_index=2, started_offset_ns=40_000_000, duration_ns=12_500_000),
     )
 
     assert timing.quantize_stall_frames(stalls, video_fps=40) == (0, 1, 0)
@@ -113,9 +107,7 @@ def test_stall_quantization_carries_fractional_frames_across_events():
 def test_stall_quantization_requires_chronological_non_overlapping_control_steps():
     chronological = (
         timing.ControlStall(control_step=8, replan_index=1, started_offset_ns=0, duration_ns=18_750_000),
-        timing.ControlStall(
-            control_step=9, replan_index=2, started_offset_ns=18_750_000, duration_ns=6_250_000
-        ),
+        timing.ControlStall(control_step=9, replan_index=2, started_offset_ns=18_750_000, duration_ns=6_250_000),
     )
 
     assert timing.quantize_stall_frames(chronological, video_fps=40) == (0, 1)
@@ -123,9 +115,7 @@ def test_stall_quantization_requires_chronological_non_overlapping_control_steps
         tuple(reversed(chronological)),
         (
             chronological[0],
-            timing.ControlStall(
-                control_step=9, replan_index=2, started_offset_ns=18_000_000, duration_ns=6_250_000
-            ),
+            timing.ControlStall(control_step=9, replan_index=2, started_offset_ns=18_000_000, duration_ns=6_250_000),
         ),
     ):
         try:
@@ -159,9 +149,7 @@ def test_audit_uses_exact_integer_durations_and_cumulative_stall_frames():
     )
     stalls = (
         timing.ControlStall(control_step=0, replan_index=0, started_offset_ns=0, duration_ns=12_500_000),
-        timing.ControlStall(
-            control_step=1, replan_index=1, started_offset_ns=12_500_000, duration_ns=12_500_000
-        ),
+        timing.ControlStall(control_step=1, replan_index=1, started_offset_ns=12_500_000, duration_ns=12_500_000),
     )
 
     audit = timing.build_video_audit(

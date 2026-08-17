@@ -40,9 +40,7 @@ def _require_nonnegative_integer(value: int, *, name: str) -> None:
         raise ValueError(f"{name} must be a non-negative integer")
 
 
-def validate_video_frequencies(
-    *, control_hz: int = CONTROL_HZ, video_fps: int = DEFAULT_VIDEO_FPS
-) -> int:
+def validate_video_frequencies(*, control_hz: int = CONTROL_HZ, video_fps: int = DEFAULT_VIDEO_FPS) -> int:
     """Return output frames per control frame for the fixed 20 Hz protocol."""
     if isinstance(control_hz, bool) or not isinstance(control_hz, int) or control_hz != CONTROL_HZ:
         raise ValueError(f"LIBERO control frequency must be exactly {CONTROL_HZ} Hz")
@@ -126,8 +124,7 @@ def stall_overlay_lines(
     )
     if stall.reason != expected_reason:
         raise ValueError(
-            f"Control stall reason {stall.reason} does not match inference schedule "
-            f"{inference_schedule}"
+            f"Control stall reason {stall.reason} does not match inference schedule " f"{inference_schedule}"
         )
     duration_seconds = stall.duration_ns / NANOSECONDS_PER_SECOND
     label = (
@@ -146,9 +143,7 @@ def expand_control_frames(
     return tuple(frame for frame in control_frames for _ in range(hold_count))
 
 
-def quantize_stall_frames(
-    stalls: Sequence[ControlStall], *, video_fps: int = DEFAULT_VIDEO_FPS
-) -> tuple[int, ...]:
+def quantize_stall_frames(stalls: Sequence[ControlStall], *, video_fps: int = DEFAULT_VIDEO_FPS) -> tuple[int, ...]:
     """Quantize stalls cumulatively, preserving sub-frame time across events."""
     validate_video_frequencies(video_fps=video_fps)
     accumulated_ns = 0

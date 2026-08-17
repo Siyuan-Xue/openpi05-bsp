@@ -342,10 +342,7 @@ def test_video_artifact_audit_warns_but_does_not_error_on_duration_only_mismatch
 
     assert not audit.timing_gate_pass
     assert audit.encoded_duration_deviation_ns == 75_000_000
-    assert audit.warning == (
-        "encoded duration deviates from expected duration by 0.075000 s "
-        "(tolerance 0.025000 s)"
-    )
+    assert audit.warning == ("encoded duration deviates from expected duration by 0.075000 s " "(tolerance 0.025000 s)")
 
 
 def test_video_artifact_audit_rejects_invalid_or_mismatched_readback_metadata():
