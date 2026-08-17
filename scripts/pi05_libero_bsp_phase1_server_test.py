@@ -1,9 +1,11 @@
 """Dependency-free contracts for the phase-one H20 server runbook."""
 
 import ast
+import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import unittest
 
 
@@ -192,12 +194,61 @@ class PhaseOneServerRunbookContractTest(unittest.TestCase):
         for document in (readme, self.runbook):
             with self.subTest(document="README" if document is readme else "runbook"):
                 self.assertIn("--name libero-git-identity-preflight", document)
+                self.assertIn('-e EXPECTED_REPO_SHA="$EXPECTED_REPO_SHA"', document)
                 self.assertIn("git -C /app rev-parse HEAD", document)
                 self.assertIn(
                     "git -C /app status --porcelain --untracked-files=all", document
                 )
+                self.assertIn(
+                    'if ! container_status="$(git -C /app status '
+                    '--porcelain --untracked-files=all)"; then',
+                    document,
+                )
+                self.assertIn('test -z "$container_status"', document)
+                self.assertIn('test "$container_sha" = "$EXPECTED_REPO_SHA"', document)
                 bash = "\n".join(re.findall(r"```bash\n(.*?)```", document, flags=re.DOTALL))
                 self.assertNotIn("--args.code-sha", bash)
+
+        self.assertIn(
+            'EXPECTED_REPO_SHA="$(git -C "$BSP_REPO_DIR" rev-parse HEAD)"', readme
+        )
+
+    def test_runtime_git_preflight_propagates_clean_status_failure(self):
+        for path in (
+            _ROOT / "examples" / "libero" / "README.md",
+            _ROOT / "docs" / "pi05_libero_bsp_phase1_server.md",
+        ):
+            document = path.read_text()
+            match = re.search(
+                r"--name libero-git-identity-preflight .*?runtime -ceu '(.*?)\n\s*'",
+                document,
+                re.DOTALL,
+            )
+            self.assertIsNotNone(match, path)
+            with tempfile.TemporaryDirectory() as directory:
+                fake_git = Path(directory) / "git"
+                fake_git.write_text(
+                    "#!/bin/sh\n"
+                    "case \"$*\" in\n"
+                    "  *'rev-parse HEAD'*) printf '%040d\\n' 0; exit 0 ;;\n"
+                    "  *'status --porcelain --untracked-files=all'*) exit 17 ;;\n"
+                    "  *) exit 19 ;;\n"
+                    "esac\n"
+                )
+                fake_git.chmod(0o755)
+                environment = os.environ.copy()
+                environment["PATH"] = f"{directory}:{environment['PATH']}"
+                environment["EXPECTED_REPO_SHA"] = "0" * 40
+                result = subprocess.run(
+                    ["bash", "-ceu", match.group(1)],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    env=environment,
+                )
+                with self.subTest(document=path.name):
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn("runtime_evaluator_sha=", result.stdout)
 
     def test_final_audit_names_ten_runs_and_three_diagnostic_artifacts(self):
         self.assertNotIn("六个 h16/BSP 评测输入", self.runbook)

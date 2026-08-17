@@ -415,13 +415,21 @@ export MUJOCO_GL=egl
 docker compose -f examples/libero/compose.yml config --quiet
 docker compose -f examples/libero/compose.yml build
 
+export EXPECTED_REPO_SHA="$BSP_CODE_SHA"
 docker compose -f examples/libero/compose.yml run --no-deps \
   --name libero-git-identity-preflight \
-  -e EXPECTED_REPO_SHA="$BSP_CODE_SHA" \
+  -e EXPECTED_REPO_SHA="$EXPECTED_REPO_SHA" \
   --entrypoint /bin/bash runtime -ceu '
-    container_sha="$(git -C /app rev-parse HEAD)"
+    if ! container_sha="$(git -C /app rev-parse HEAD)"; then
+      echo "STOP: runtime cannot resolve evaluator SHA" >&2
+      exit 2
+    fi
     test "$container_sha" = "$EXPECTED_REPO_SHA"
-    test -z "$(git -C /app status --porcelain --untracked-files=all)"
+    if ! container_status="$(git -C /app status --porcelain --untracked-files=all)"; then
+      echo "STOP: runtime cannot inspect evaluator checkout" >&2
+      exit 2
+    fi
+    test -z "$container_status"
     printf "runtime_evaluator_sha=%s\n" "$container_sha"
   '
 ```

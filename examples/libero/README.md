@@ -54,12 +54,34 @@ python3 scripts/libero_compose_preflight.py
 docker compose -f examples/libero/compose.yml config >/dev/null
 docker compose -f examples/libero/compose.yml build
 
+if ! EXPECTED_REPO_SHA="$(git -C "$BSP_REPO_DIR" rev-parse HEAD)"; then
+  echo "STOP: unable to resolve the selected host checkout" >&2
+  exit 2
+fi
+case "$EXPECTED_REPO_SHA" in
+  *[!0-9a-f]*|'') echo "STOP: invalid host checkout SHA" >&2; exit 2 ;;
+esac
+test "${#EXPECTED_REPO_SHA}" -eq 40
+if ! host_status="$(git -C "$BSP_REPO_DIR" status --porcelain --untracked-files=all)"; then
+  echo "STOP: unable to inspect the selected host checkout" >&2
+  exit 2
+fi
+test -z "$host_status"
+
 docker compose -f examples/libero/compose.yml run --no-deps \
   --name libero-git-identity-preflight \
+  -e EXPECTED_REPO_SHA="$EXPECTED_REPO_SHA" \
   --entrypoint /bin/bash runtime -ceu '
-    container_sha="$(git -C /app rev-parse HEAD)"
-    test "${#container_sha}" -eq 40
-    test -z "$(git -C /app status --porcelain --untracked-files=all)"
+    if ! container_sha="$(git -C /app rev-parse HEAD)"; then
+      echo "STOP: runtime cannot resolve evaluator SHA" >&2
+      exit 2
+    fi
+    test "$container_sha" = "$EXPECTED_REPO_SHA"
+    if ! container_status="$(git -C /app status --porcelain --untracked-files=all)"; then
+      echo "STOP: runtime cannot inspect evaluator checkout" >&2
+      exit 2
+    fi
+    test -z "$container_status"
     printf "runtime_evaluator_sha=%s\n" "$container_sha"
   '
 
