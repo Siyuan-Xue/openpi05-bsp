@@ -100,10 +100,35 @@ def test_save_cursor_rejects_internally_inconsistent_cursor(tmp_path):
         loader_resume.save_cursor(tmp_path / "data_loader_cursor.json", malformed)
 
 
+@pytest.mark.parametrize("action_keys", ["actions", ["actions"]])
+def test_identity_rejects_non_tuple_action_keys(action_keys):
+    with pytest.raises(ValueError, match="action_keys"):
+        _identity(action_keys=action_keys).validate()
+
+
+def test_identity_rejects_non_exact_string_action_key():
+    class StringSubclass(str):
+        pass
+
+    with pytest.raises(ValueError, match="action_keys"):
+        _identity(action_keys=(StringSubclass("actions"),)).validate()
+
+
 def test_cursor_rejects_unsupported_format_version():
     malformed = dataclasses.replace(
         loader_resume.cursor_for_step(2_000, _identity()),
         format_version=2,
+    )
+
+    with pytest.raises(ValueError, match="format_version"):
+        malformed.validate(_identity(), expected_step=2_000)
+
+
+@pytest.mark.parametrize("format_version", [True, 1.0])
+def test_cursor_rejects_non_integer_format_version(format_version):
+    malformed = dataclasses.replace(
+        loader_resume.cursor_for_step(2_000, _identity()),
+        format_version=format_version,
     )
 
     with pytest.raises(ValueError, match="format_version"):

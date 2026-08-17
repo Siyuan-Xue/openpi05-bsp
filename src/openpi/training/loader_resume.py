@@ -58,7 +58,11 @@ class LoaderIdentity:
             not isinstance(self.bsp_cache_fingerprint, str) or not self.bsp_cache_fingerprint
         ):
             raise ValueError("bsp_cache_fingerprint must be None or a non-empty string")
-        if not self.action_keys or not all(isinstance(key, str) and key for key in self.action_keys):
+        if (
+            type(self.action_keys) is not tuple
+            or not self.action_keys
+            or not all(type(key) is str and key for key in self.action_keys)
+        ):
             raise ValueError("action_keys must contain non-empty strings")
         if not isinstance(self.shuffle, bool):
             raise ValueError("shuffle must be a boolean")
@@ -76,7 +80,9 @@ class LoaderIdentity:
             raise ValueError("Loader identity fields do not match cursor format")
         parsed = dict(value)
         action_keys = parsed.get("action_keys")
-        if not isinstance(action_keys, list) or not all(isinstance(key, str) for key in action_keys):
+        if type(action_keys) is not list or not all(
+            type(key) is str and key for key in action_keys
+        ):
             raise ValueError("Loader identity action_keys must be a list of strings")
         parsed["action_keys"] = tuple(action_keys)
         identity = cls(**parsed)
@@ -92,6 +98,7 @@ class LoaderCursor:
     identity: LoaderIdentity
 
     def _validate_internal(self) -> None:
+        _require_nonnegative_integer("format_version", self.format_version)
         if self.format_version != CURSOR_FORMAT_VERSION:
             raise ValueError(
                 f"format_version={self.format_version!r} is unsupported; expected {CURSOR_FORMAT_VERSION}"
