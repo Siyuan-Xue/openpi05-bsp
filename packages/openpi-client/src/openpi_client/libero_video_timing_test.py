@@ -1,0 +1,116 @@
+"""Pure contracts for LIBERO video timing; executable without pytest."""
+
+from copy import deepcopy
+
+from openpi_client import libero_video_timing as timing
+
+
+def test_frequency_validation_requires_20_hz_control_and_integral_video_holds():
+    assert timing.validate_video_frequencies() == 2
+    assert timing.validate_video_frequencies(control_hz=20, video_fps=60) == 3
+    for control_hz, video_fps in ((10, 40), (20, 0), (20, 30), (True, 40)):
+        try:
+            timing.validate_video_frequencies(control_hz=control_hz, video_fps=video_fps)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError((control_hz, video_fps))
+
+
+def test_synchronous_and_async_request_stall_records_keep_latency_separate_from_stall():
+    request = timing.InferenceRequest(replan_index=3, started_ns=100, completed_ns=350)
+    synchronous_stall = timing.ControlStall(replan_index=3, started_ns=100, completed_ns=350)
+    future_async_stall = timing.ControlStall(replan_index=4, started_ns=900, completed_ns=900)
+
+    assert request.duration_ns == 250
+    assert synchronous_stall.duration_ns == 250
+    assert future_async_stall.duration_ns == 0
+    assert request.to_dict() == {
+        "replan_index": 3,
+        "started_ns": 100,
+        "completed_ns": 350,
+        "latency_ns": 250,
+    }
+    assert future_async_stall.to_dict()["stall_ns"] == 0
+
+
+def test_control_frames_hold_exactly_twice_at_40_fps_without_dataset_rate_input():
+    frames = ("control-0", "control-1", "control-2")
+
+    assert timing.expand_control_frames(frames, control_hz=20, video_fps=40) == (
+        "control-0",
+        "control-0",
+        "control-1",
+        "control-1",
+        "control-2",
+        "control-2",
+    )
+
+
+def test_stall_quantization_carries_fractional_frames_across_events():
+    stalls = (
+        timing.ControlStall(replan_index=0, started_ns=0, completed_ns=12_500_000),
+        timing.ControlStall(replan_index=1, started_ns=20_000_000, completed_ns=32_500_000),
+        timing.ControlStall(replan_index=2, started_ns=40_000_000, completed_ns=52_500_000),
+    )
+
+    assert timing.quantize_stall_frames(stalls, video_fps=40) == (0, 1, 0)
+
+
+def test_overlay_renderer_receives_a_copy_and_cannot_mutate_the_source_frame():
+    source = {"pixels": [[1, 2], [3, 4]], "labels": []}
+
+    def renderer(frame, lines):
+        frame["pixels"][0][0] = 99
+        frame["labels"].extend(lines)
+        return frame
+
+    rendered = timing.render_overlay(source, ("latency: 25 ms",), renderer=renderer)
+
+    assert source == {"pixels": [[1, 2], [3, 4]], "labels": []}
+    assert rendered == {"pixels": [[99, 2], [3, 4]], "labels": ["latency: 25 ms"]}
+    assert rendered is not source
+    assert deepcopy(source) == source
+
+
+def test_audit_uses_exact_integer_durations_and_cumulative_stall_frames():
+    requests = (
+        timing.InferenceRequest(replan_index=0, started_ns=100, completed_ns=125_000_100),
+        timing.InferenceRequest(replan_index=1, started_ns=200, completed_ns=225_000_200),
+    )
+    stalls = (
+        timing.ControlStall(replan_index=0, started_ns=100, completed_ns=12_500_100),
+        timing.ControlStall(replan_index=1, started_ns=200, completed_ns=12_500_200),
+    )
+
+    audit = timing.build_video_audit(
+        control_frame_count=3,
+        requests=requests,
+        stalls=stalls,
+        control_hz=20,
+        video_fps=40,
+    )
+
+    assert audit.to_dict() == {
+        "control_hz": 20,
+        "video_fps": 40,
+        "control_frame_count": 3,
+        "held_frame_count": 6,
+        "stall_frame_count": 1,
+        "video_frame_count": 7,
+        "control_duration_ns": 150_000_000,
+        "request_count": 2,
+        "request_latency_ns": 350_000_000,
+        "stall_count": 2,
+        "control_stall_ns": 25_000_000,
+        "video_duration_ns": 175_000_000,
+        "expected_duration_ns": 175_000_000,
+        "duration_deviation_ns": 0,
+    }
+
+
+if __name__ == "__main__":
+    for name, value in sorted(globals().items()):
+        if name.startswith("test_") and callable(value):
+            value()
+            print("PASS", name)
