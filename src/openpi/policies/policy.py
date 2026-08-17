@@ -221,13 +221,21 @@ def _canonicalize_rtc_noise(noise) -> jax.Array:
         raise ValueError("RTC noise must be a finite numeric array") from error
     if array.shape not in ((16, 32), (1, 16, 32)):
         raise ValueError("RTC noise must have shape (16, 32) or (1, 16, 32)")
-    if np.issubdtype(array.dtype, np.bool_) or not np.issubdtype(array.dtype, np.number):
-        raise ValueError("RTC noise must be a finite numeric array")
+    if (
+        np.issubdtype(array.dtype, np.bool_)
+        or not np.issubdtype(array.dtype, np.number)
+        or np.issubdtype(array.dtype, np.complexfloating)
+    ):
+        raise ValueError("RTC noise must be a finite real numeric array")
     if not np.isfinite(array).all():
         raise ValueError("RTC noise must be finite")
-    if array.ndim == 2:
-        array = array[None, ...]
-    return jnp.asarray(array)
+    with np.errstate(over="ignore", invalid="ignore"):
+        canonical = np.asarray(array, dtype=np.float32).copy()
+    if not np.isfinite(canonical).all():
+        raise ValueError("RTC noise must be representable as finite float32 values")
+    if canonical.ndim == 2:
+        canonical = canonical[None, ...]
+    return jnp.asarray(canonical)
 
 
 class PolicyRecorder(_base_policy.BasePolicy):

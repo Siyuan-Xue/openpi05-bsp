@@ -221,8 +221,10 @@ def test_guided_request_rejects_unrelated_sampler_kwargs(monkeypatch):
     [
         np.zeros((16, 32), dtype=np.bool_),
         np.full((16, 32), "noise", dtype=object),
+        np.full((16, 32), 1 + 2j, dtype=np.complex64),
         np.full((16, 32), np.nan, dtype=np.float32),
         np.full((1, 16, 32), np.inf, dtype=np.float32),
+        np.full((16, 32), np.finfo(np.float64).max, dtype=np.float64),
         np.zeros((15, 32), dtype=np.float32),
         np.zeros((1, 16, 31), dtype=np.float32),
         np.zeros((2, 16, 32), dtype=np.float32),
@@ -256,9 +258,16 @@ def test_rtc_noise_is_strictly_validated_before_rng_advance(
 
 @pytest.mark.parametrize("shape", [(16, 32), (1, 16, 32)])
 @pytest.mark.parametrize("source", ["explicit", "configured"])
-def test_rtc_noise_accepts_both_exact_shapes_and_canonicalizes_one_batch(monkeypatch, shape, source):
+@pytest.mark.parametrize("dtype", [np.float32, np.int64])
+def test_rtc_noise_accepts_real_numeric_shapes_as_defensive_float32_batch(
+    monkeypatch,
+    shape,
+    source,
+    dtype,
+):
     policy_instance, seen = _fake_policy()
-    supplied = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+    supplied = np.arange(np.prod(shape), dtype=dtype).reshape(shape)
+    expected = supplied.astype(np.float32).reshape(1, 16, 32)
     call_kwargs = {}
     if source == "explicit":
         call_kwargs["noise"] = supplied
@@ -273,7 +282,9 @@ def test_rtc_noise_accepts_both_exact_shapes_and_canonicalizes_one_batch(monkeyp
 
     canonical = seen["legacy"][0][1]["noise"]
     assert canonical.shape == (1, 16, 32)
-    np.testing.assert_array_equal(canonical, supplied.reshape(1, 16, 32))
+    assert canonical.dtype == np.float32
+    supplied[...] = -1
+    np.testing.assert_array_equal(canonical, expected)
 
 
 def test_absent_rtc_preserves_legacy_configured_noise_without_new_validation(monkeypatch):

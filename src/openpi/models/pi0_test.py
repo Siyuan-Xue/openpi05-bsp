@@ -3,7 +3,6 @@ import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 from openpi.models import model as _model
 import openpi.models.pi0_config as _pi0_config
@@ -326,7 +325,6 @@ def _five_step_rtc_reference(model, rng, observation, *, target, weights, noise)
     return x_t
 
 
-@pytest.mark.gpu
 def test_actual_jitted_pi0_legacy_sampler_matches_frozen_pre_refactor_reference():
     key = jax.random.key(314)
     model = _TinySamplerPi0(key)
@@ -350,7 +348,6 @@ def test_actual_jitted_pi0_legacy_sampler_matches_frozen_pre_refactor_reference(
     np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
 
 
-@pytest.mark.gpu
 def test_actual_jitted_pi0_rtc_sampler_runs_fixed_five_step_vjp_with_shared_prefix_cache():
     key = jax.random.key(2718)
     model = _TinySamplerPi0(key)
