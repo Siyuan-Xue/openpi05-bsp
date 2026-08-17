@@ -358,7 +358,9 @@ def _write_formal_run(root: Path, mode: str, step: int = 1000) -> Path:
     )
     (root / "summary.json").write_text(_json_text(_summary()), encoding="utf-8")
     (root / "video_audit.jsonl").write_text(
-        "".join(_json_text(_video_audit(episode)) for episode in episodes[:3]),
+        "".join(
+            _json_text(_video_audit(episode)) for episode in episodes[::50][:3]
+        ),
         encoding="utf-8",
     )
     (root / "artifact_errors.jsonl").write_text("", encoding="utf-8")
