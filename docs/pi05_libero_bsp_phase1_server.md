@@ -414,9 +414,29 @@ export MUJOCO_GL=egl
 "$OPENPI_PY" scripts/libero_compose_preflight.py
 docker compose -f examples/libero/compose.yml config --quiet
 docker compose -f examples/libero/compose.yml build
+
+export EXPECTED_REPO_SHA="$BSP_CODE_SHA"
+docker compose -f examples/libero/compose.yml run --no-deps \
+  --name libero-git-identity-preflight \
+  -e EXPECTED_REPO_SHA="$EXPECTED_REPO_SHA" \
+  --entrypoint /bin/bash runtime -ceu '
+    if ! container_sha="$(git -C /app rev-parse HEAD)"; then
+      echo "STOP: runtime cannot resolve evaluator SHA" >&2
+      exit 2
+    fi
+    test "$container_sha" = "$EXPECTED_REPO_SHA"
+    if ! container_status="$(git -C /app status --porcelain --untracked-files=all)"; then
+      echo "STOP: runtime cannot inspect evaluator checkout" >&2
+      exit 2
+    fi
+    test -z "$container_status"
+    printf "runtime_evaluator_sha=%s\n" "$container_sha"
+  '
 ```
 
 preflight 会拒绝空值、相对路径、不存在路径、根目录、普通文件和彼此重叠的 bind root。源码在两个容器内都只读；只有 simulator 的 `/experiments` 和 policy server 的 OpenPI/JAX cache 可写。policy 镜像运行时直接执行 `/.venv/bin/python`，不会再调用 uv。
+
+runtime 镜像显式安装 Git。Compose 只为只读 `/app` 和其锁定的 `third_party/libero` 子模块配置两个精确的 `safe.directory`，并通过 `GIT_OPTIONAL_LOCKS=0` 禁止可选 index refresh lock。上面的实际 runtime 容器门禁执行 evaluator 使用的同一组 `rev-parse` 和 clean-status 命令，并要求容器内 SHA 精确等于冻结的 `$BSP_CODE_SHA`。它不会恢复手工 `--args.code-sha`。预检容器会保留作审计；同名碰撞时停止，不删除旧容器。
 
 记录两张镜像的真实内容 ID，并按 `openpi_server` 后 `libero` 的固定顺序生成 manifest 要求的单一容器栈摘要：
 
@@ -473,7 +493,6 @@ PY
 
 ```bash
 cd "$BSP_REPO_DIR"
-export BSP_CODE_SHA="$(git rev-parse HEAD)"
 export OFFICIAL_CONTAINER_CKPT=/openpi_assets/openpi-assets/checkpoints/pi05_libero
 export SERVER_ARGS="--env LIBERO policy:checkpoint --policy.config pi05_libero --policy.dir $OFFICIAL_CONTAINER_CKPT"
 
@@ -491,10 +510,12 @@ export CLIENT_ARGS="\
 --args.policy-variant baseline \
 --args.expected-action-horizon 10 \
 --args.num-trials-per-task 1 \
+--args.control-freq 20 \
+--args.video-fps 40 \
+--args.video-show-inference-waits \
 --args.output-dir /experiments/eval/official-h10-task0-smoke \
 --args.config-name pi05_libero \
 --args.checkpoint-step 30000 \
---args.code-sha $BSP_CODE_SHA \
 --args.dataset-revision v2.0 \
 --args.norm-hash $OFFICIAL_NORM_HASH \
 --args.checkpoint $OFFICIAL_CONTAINER_CKPT \
@@ -552,10 +573,12 @@ export CLIENT_ARGS="\
 --args.policy-variant baseline \
 --args.expected-action-horizon 10 \
 --args.num-trials-per-task 5 \
+--args.control-freq 20 \
+--args.video-fps 40 \
+--args.video-show-inference-waits \
 --args.output-dir /experiments/eval/official-h10-calibration-all-5 \
 --args.config-name pi05_libero \
 --args.checkpoint-step 30000 \
---args.code-sha $BSP_CODE_SHA \
 --args.dataset-revision v2.0 \
 --args.norm-hash $OFFICIAL_NORM_HASH \
 --args.checkpoint $OFFICIAL_CONTAINER_CKPT \
@@ -585,7 +608,7 @@ print("official h10 calibration gate passed", expected)
 PY
 ```
 
-校准成功率只用来发现环境、图像、动作或版本的明显错误，不进入第一阶段 A/B 比较，也不得作为六个 h16/BSP 评测输入。
+校准成功率只用来发现环境、图像、动作或版本的明显错误，不进入第一阶段 A/B 比较，也不得作为十个 h16/BSP 评测输入。
 
 ## 7. 仅在嵌套 Docker 不可用时：隔离双环境备选
 
@@ -680,10 +703,12 @@ env \
   --args.policy-variant baseline \
   --args.expected-action-horizon 10 \
   --args.num-trials-per-task 1 \
+  --args.control-freq 20 \
+  --args.video-fps 40 \
+  --args.video-show-inference-waits \
   --args.output-dir "$EVAL_BASE/official-h10-task0-smoke-host" \
   --args.config-name pi05_libero \
   --args.checkpoint-step 30000 \
-  --args.code-sha "$BSP_CODE_SHA" \
   --args.dataset-revision v2.0 \
   --args.norm-hash "$OFFICIAL_NORM_HASH" \
   --args.checkpoint "$OFFICIAL_CKPT_LOCAL" \
@@ -708,10 +733,12 @@ env \
   --args.policy-variant baseline \
   --args.expected-action-horizon 10 \
   --args.num-trials-per-task 5 \
+  --args.control-freq 20 \
+  --args.video-fps 40 \
+  --args.video-show-inference-waits \
   --args.output-dir "$OFFICIAL_CAL_HOST" \
   --args.config-name pi05_libero \
   --args.checkpoint-step 30000 \
-  --args.code-sha "$BSP_CODE_SHA" \
   --args.dataset-revision v2.0 \
   --args.norm-hash "$OFFICIAL_NORM_HASH" \
   --args.checkpoint "$OFFICIAL_CKPT_LOCAL" \
@@ -737,7 +764,7 @@ print("official host h10 calibration gate passed")
 PY
 ```
 
-必须先完成 task-0 × 1 的真实 host EGL 冒烟，再完成上述 200 回合校准；随后回到 policy server shell 按 `Ctrl-C` 正常停止服务。两个门禁都通过前不进入数据拟合/训练。后面的六次评测同理调用这两个直接 Python 进程，参数与第 12 节一致。
+必须先完成 task-0 × 1 的真实 host EGL 冒烟，再完成上述 200 回合校准；随后回到 policy server shell 按 `Ctrl-C` 正常停止服务。两个门禁都通过前不进入数据拟合/训练。后面的十次正式 schema-v3 评测同理调用这两个直接 Python 进程，参数与第 12 节一致，并分别写入新的空输出目录。
 
 ## 8. 构建并全量验证 BSP sidecar
 
@@ -798,7 +825,7 @@ print("BSP full verification gate passed")
 PY
 ```
 
-`$BSP_VERIFY` 是第 13 节比较器必须直接读取的 Task-6 原始诊断产物。
+`$BSP_VERIFY` 是 Task-6 原始历史诊断产物，必须保留且不得覆盖。若正式评测代码 SHA 与其记录的 `code_sha` 不同，第 12.4 节会对同一个现有 sidecar 做非破坏性 verify，并为第 13 节生成与 schema-v3 evaluator SHA 一致的新诊断产物。
 
 ## 9. 分别计算 A/B norm stats 并通过 state gate
 
@@ -1151,7 +1178,13 @@ done | tee "$LOG_BASE/phase1-checkpoints.sha256"
 
 ### 12.2 Docker 路线的十次正式评测
 
-每次评测是 4 suites × 10 tasks × 50 initial states = 2,000 episodes，共 20,000 episodes。baseline server 输出严格 horizon 16，执行前 8 步；BSP server 在反归一化后解码为严格 horizon 8。两者均在 10 Hz 下每 8 步重规划。
+每次评测是 4 suites × 10 tasks × 50 initial states = 2,000 episodes，共 20,000 episodes。baseline server 输出严格 horizon 16，执行前 8 步；BSP server 在反归一化后解码为严格 horizon 8。两者均在 20 Hz 下每 8 步重规划。
+
+正式评测使用 schema v3，并明确区分四个时钟：LeRobot dataset FPS 为 10（只负责训练时间戳和索引），来源专家示范环境为 20 Hz（来源身份），评测环境 `control_freq_hz` 固定 20 Hz（MuJoCo 动力学），MP4 默认 40 FPS（仅录像编码）。dataset/source 频率不参与视频帧数计算；录像只使用控制步数、20 Hz 控制频率、视频 FPS 和实测 `control_stalls`。同步模式下 request latency 与 stall 使用同一实测区间；未来异步模式可以有 latency 而没有 stall，只有 stall 才冻结画面。
+
+所有正式 evaluator 命令使用 `--args.control-freq 20 --args.video-fps 40 --args.video-show-inference-waits`。该开关只改变被 `VideoSelector` 选中的 MP4 和 `video_audit.jsonl`，不会增加 `env.step`、dummy action 或 sleep，不改变动作、done 或成功率。期望时长为 `control_steps / 20 + included_control_stall_seconds`，允许误差为一个输出帧（`1 / video_fps`）；编码或回读失败仍是 artifact error。
+
+schema v2 结果（包括历史 baseline-0）仅作不可变归档，不能与 v3 混合、自动升级或送入正式 comparator。已有 checkpoint 不需要重训，但十个正式输入必须由 clean schema-v3 checkout 重新评测，并写到全新的空输出目录。命令不再手工传 `--args.code-sha`；evaluator 会从 clean HEAD 自动记录 `manifest.code_sha`，源码冻结与恢复用的 `BSP_CODE_SHA` 门禁仍保留。
 
 定义通用完整性检查：
 
@@ -1166,7 +1199,11 @@ root, expected = pathlib.Path(sys.argv[1]), int(sys.argv[2])
 manifest = json.loads((root / "manifest.json").read_text())
 summary = json.loads((root / "summary.json").read_text())
 records = (root / "episodes.jsonl").read_text().splitlines()
-assert manifest["schema_version"] == 2
+assert manifest["schema_version"] == 3
+assert manifest["dataset_fps"] == 10
+assert manifest["source_demo_control_hz"] == 20
+assert manifest["control_freq_hz"] == 20
+assert manifest["inference_schedule"] == "synchronous"
 assert len(records) == expected
 assert summary["requested_episodes"] == expected
 assert summary["eligible_episodes"] == expected
@@ -1232,10 +1269,12 @@ run_phase1_eval() {
 --args.policy-variant $variant \
 --args.expected-action-horizon $expected_horizon \
 --args.num-trials-per-task 50 \
+--args.control-freq 20 \
+--args.video-fps 40 \
+--args.video-show-inference-waits \
 --args.output-dir /experiments/eval/$output_name \
 --args.config-name $config \
 --args.checkpoint-step $step \
---args.code-sha $BSP_CODE_SHA \
 --args.dataset-revision v2.0 \
 --args.norm-hash $norm_hash \
 --args.checkpoint $container_checkpoint \
@@ -1359,10 +1398,12 @@ run_phase1_eval_host() {
     --args.policy-variant "$variant" \
     --args.expected-action-horizon "$expected_horizon" \
     --args.num-trials-per-task 50 \
+    --args.control-freq 20 \
+    --args.video-fps 40 \
+    --args.video-show-inference-waits \
     --args.output-dir "$output" \
     --args.config-name "$config" \
     --args.checkpoint-step "$step" \
-    --args.code-sha "$BSP_CODE_SHA" \
     --args.dataset-revision v2.0 \
     --args.norm-hash "$norm_hash" \
     --args.checkpoint "$checkpoint" \
@@ -1395,11 +1436,87 @@ run_phase1_eval_host baseline 10000
 run_phase1_eval_host bsp 10000
 ```
 
+### 12.4 为 schema-v3 正式报告刷新 sidecar diagnostics 身份
+
+schema v2 历史诊断和 checkpoint 全部保留，不重训模型、不重建 sidecar，也不覆盖第 8 节的 `$BSP_VERIFY`。正式 comparator 要求 BSP diagnostics 的 `code_sha` 与十个 schema-v3 manifest 的自动 clean-HEAD 身份一致，因此必须从运行十次正式评测的**同一个 clean schema-v3 checkout**，对现有 `$BSP_CACHE` 再执行一次 `--mode verify`，写入带 SHA 的全新路径：
+
+```bash
+cd "$BSP_REPO_DIR"
+if ! schema3_git_status="$(git status --porcelain --untracked-files=all)"; then
+  echo "STOP: cannot inspect schema-v3 checkout" >&2
+  exit 2
+fi
+if test -n "$schema3_git_status"; then
+  echo "STOP: schema-v3 checkout is not clean" >&2
+  printf '%s\n' "$schema3_git_status" >&2
+  exit 2
+fi
+export SCHEMA3_CODE_SHA="$(git rev-parse HEAD)"
+case "$SCHEMA3_CODE_SHA" in
+  *[!0-9a-f]*|'') echo "STOP: SCHEMA3_CODE_SHA must be lowercase hex" >&2; exit 2 ;;
+esac
+test "${#SCHEMA3_CODE_SHA}" -eq 40
+
+export BSP_VERIFY_SCHEMA3="$BSP_ROOT/data/bspline-targets/libero-v2.0-bsp-v2.schema-v3-${SCHEMA3_CODE_SHA:0:12}.verification.json"
+export BSP_VERIFY_SCHEMA3_LOG="$LOG_BASE/bsp-verify-schema-v3-${SCHEMA3_CODE_SHA:0:12}.log"
+test -s "$BSP_CACHE"
+test -s "$BSP_VERIFY"
+test ! -e "$BSP_VERIFY_SCHEMA3"
+test ! -e "$BSP_VERIFY_SCHEMA3_LOG"
+
+"$OPENPI_PY" scripts/prepare_libero_bsp.py \
+  --mode verify \
+  --dataset-root "$LIBERO_DATASET_DIR" \
+  --cache-path "$BSP_CACHE" \
+  --diagnostics-path "$BSP_VERIFY_SCHEMA3" \
+  --repo-id physical-intelligence/libero \
+  --revision v2.0 \
+  --action-key actions \
+  2>&1 | tee "$BSP_VERIFY_SCHEMA3_LOG"
+```
+
+只读核对旧、新 diagnostics 和现有 NPZ 的 SHA、fingerprint、内容身份完全一致；唯一允许随验证 checkout 改变的身份是新 diagnostics 的 `code_sha`：
+
+```bash
+"$OPENPI_PY" - \
+  "$BSP_VERIFY" \
+  "$BSP_VERIFY_SCHEMA3" \
+  "$BSP_CACHE" \
+  "$SCHEMA3_CODE_SHA" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+old_path, new_path, cache_path = map(pathlib.Path, sys.argv[1:4])
+code_sha = sys.argv[4]
+old = json.loads(old_path.read_text())
+new = json.loads(new_path.read_text())
+hasher = hashlib.sha256()
+with cache_path.open("rb") as source:
+    for block in iter(lambda: source.read(1024 * 1024), b""):
+        hasher.update(block)
+cache_sha = hasher.hexdigest()
+
+assert old["verification_passed"] is True
+assert new["verification_passed"] is True
+assert new["code_sha"] == code_sha
+assert old["cache_sha256"] == new["cache_sha256"] == cache_sha
+assert old["cache_manifest_fingerprint"] == new["cache_manifest_fingerprint"]
+assert old["cache_contents_sha256"] == new["cache_contents_sha256"]
+assert old["rebuilt_contents_sha256"] == new["rebuilt_contents_sha256"]
+assert new["cache_contents_sha256"] == new["rebuilt_contents_sha256"]
+print("schema-v3 BSP diagnostics identity gate passed", new_path)
+PY
+```
+
+如果新路径碰撞、verify 失败或任一身份不一致，立即停止；不得删除旧诊断、改写 NPZ、切换 revision 或重新 build 来绕过门禁。
+
 ## 13. 严格生成第一阶段比较报告
 
 比较器只接受恰好十个 run，并且只根据 manifest 的 variant/step 识别它们。它会拒绝 official h10、缺失 0k/1k/2k/5k/10k、重复/额外里程碑、混合全量/LoRA 训练家族、不完整 20,000 回合、非配对初始状态、截断/NaN JSON、summary 不一致、infrastructure/artifact error 或任何身份不一致。
 
-直接传入第 8 节 prepare verify 生成的原始 `$BSP_VERIFY` 和第 9 节生成的原始 `$NORM_COMPARISON`：
+传入第 12.4 节由同一个 clean schema-v3 SHA 生成的 `$BSP_VERIFY_SCHEMA3`；第 8 节原始 `$BSP_VERIFY` 仅保留作历史审计。norm 身份未绑定代码 SHA，继续传第 9 节生成的原始 `$NORM_COMPARISON`：
 
 ```bash
 cd "$BSP_REPO_DIR"
@@ -1418,7 +1535,7 @@ PYTHONPATH="$BSP_REPO_DIR/packages/openpi-client/src" \
   "$EVAL_BASE/bsp-step-5000" \
   "$EVAL_BASE/baseline-step-10000" \
   "$EVAL_BASE/bsp-step-10000" \
-  --bsp-verification "$BSP_VERIFY" \
+  --bsp-verification "$BSP_VERIFY_SCHEMA3" \
   --norm-comparison "$NORM_COMPARISON" \
   --output-dir "$REPORT_DIR"
 
@@ -1459,7 +1576,7 @@ learning_curve.svg
 - `{1,2,4,8}` 在 A/B 中全部以独立进程探测，选择共同稳定且有余量的最大值；有效 batch 一直为 256。
 - A/B 各 100 optimizer-step pilot 通过，随后从同一 `pi05_base` 用 seed 42 分别完成 10k。
 - 十个不同 checkpoint 的 0k/1k/2k/5k/10k 评测各 2,000 回合，总计 20,000，且全部可审计/可配对。
-- 比较器直接读取原始 BSP/norm diagnostics，返回 0 并且只生成六个固定报告产物。
+- 比较器直接读取与十次 schema-v3 评测同一 clean SHA 生成的 schema-v3 BSP diagnostics，以及原始 norm diagnostics；历史 BSP diagnostics 只作不可变审计，返回 0 并且只生成六个固定报告产物。
 - seed 43/44 只有预留目录，没有实际运行；没有评测 2×/4×，没有选择 best checkpoint。
 
-保留 `${BSP_ROOT}/experiments/logs`、十个评测目录、两个原始 diagnostics、十个 checkpoint 和六个报告文件。它们共同构成第一阶段验收证据，不要在报告生成后重写其中任何身份文件。
+保留 `${BSP_ROOT}/experiments/logs`、十个评测目录、历史 BSP diagnostics、同一 clean SHA 刷新的 schema-v3 BSP diagnostics、原始 norm diagnostics、十个 checkpoint 和六个报告文件。这三类 diagnostics 与其余产物共同构成第一阶段验收证据，不要在报告生成后重写其中任何身份文件。

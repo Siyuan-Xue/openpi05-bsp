@@ -17,8 +17,16 @@ import re
 import tempfile
 from typing import Any
 
+from openpi_client import libero_video_timing as _video_timing
+
 
 SUPPORTED_SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
+_MAX_STEPS_BY_SUITE = {
+    "libero_spatial": 220,
+    "libero_object": 280,
+    "libero_goal": 300,
+    "libero_10": 520,
+}
 _SUITE_ALIASES = {
     "spatial": "libero_spatial",
     "object": "libero_object",
@@ -27,6 +35,15 @@ _SUITE_ALIASES = {
     **{suite: suite for suite in SUPPORTED_SUITES},
 }
 _INFRASTRUCTURE_KINDS = ("simulator", "container", "network")
+_STALL_REASONS = (
+    _video_timing.STALL_REASON_SYNCHRONOUS_INFERENCE,
+    _video_timing.STALL_REASON_ASYNC_ACTION_UNDERFLOW,
+)
+_OVERLAY_TYPE_BY_STALL_REASON = {
+    _video_timing.STALL_REASON_SYNCHRONOUS_INFERENCE: "synchronous_inference",
+    _video_timing.STALL_REASON_ASYNC_ACTION_UNDERFLOW: "waiting_for_policy_actions",
+}
+_OVERLAY_TYPES = tuple(_OVERLAY_TYPE_BY_STALL_REASON.values())
 _REPLAN_ACTIONS = 8
 _ACTION_DIM = 7
 BSP_PARAMETERS = {
@@ -52,6 +69,59 @@ BSP_PARAMETERS = {
     "model_action_horizon": 16,
     "executed_actions": 8,
 }
+
+
+def _require_exact_integer(value: Any, *, name: str, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"{name} must be an integer greater than or equal to {minimum}")
+    return value
+
+
+def _require_exact_string_tuple(
+    value: Any,
+    *,
+    name: str,
+    allowed_values: tuple[str, ...],
+    expected_count: int | None = None,
+) -> tuple[str, ...]:
+    if type(value) is not tuple:
+        raise TypeError(f"{name} must be a tuple")
+    if expected_count is not None and len(value) != expected_count:
+        raise ValueError(f"{name} must contain exactly {expected_count} entries")
+    if any(type(entry) is not str or entry not in allowed_values for entry in value):
+        raise ValueError(f"{name} contains an unsupported value")
+    return value
+
+
+def _require_exact_nonnegative_integer_tuple(
+    value: Any,
+    *,
+    name: str,
+    expected_count: int,
+) -> tuple[int, ...]:
+    if type(value) is not tuple:
+        raise TypeError(f"{name} must be a tuple")
+    if len(value) != expected_count:
+        raise ValueError(f"{name} must contain exactly {expected_count} entries")
+    for entry in value:
+        _require_exact_integer(entry, name=f"{name} entry")
+    return value
+
+
+def _validate_stall_source_frames(
+    stall_source_frames: Sequence[tuple[int, Any]], *, steps: int
+) -> None:
+    previous_step = -1
+    for entry in stall_source_frames:
+        if not isinstance(entry, tuple) or len(entry) != 2:
+            raise TypeError("stall_source_frames must contain (control_step, frame) tuples")
+        control_step, _ = entry
+        _require_exact_integer(control_step, name="stall source control_step")
+        if control_step <= previous_step:
+            raise ValueError("stall source control steps must be unique and strictly increasing")
+        if control_step > steps:
+            raise ValueError("stall source control_step cannot exceed executed rollout steps")
+        previous_step = control_step
 
 
 def resolve_suites(selection: str) -> tuple[str, ...]:
@@ -243,7 +313,12 @@ class AttemptResult:
     failure_kind: str | None = None
     error: str | None = None
     inference_ms: tuple[float, ...] = ()
+    inference_requests: tuple[_video_timing.InferenceRequest, ...] = ()
+    control_stalls: tuple[_video_timing.ControlStall, ...] = ()
     replay_frames: tuple[Any, ...] = dataclasses.field(default=(), repr=False, compare=False)
+    stall_source_frames: tuple[tuple[int, Any], ...] = dataclasses.field(
+        default=(), repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if self.steps < 0 or self.replans < 0:
@@ -252,6 +327,11 @@ class AttemptResult:
             raise ValueError("A successful rollout cannot have a failure kind")
         if not self.success and self.failure_kind not in {"policy", "timeout"}:
             raise ValueError("A counted failure must be classified as policy or timeout")
+        if any(not isinstance(event, _video_timing.InferenceRequest) for event in self.inference_requests):
+            raise TypeError("inference_requests must contain InferenceRequest records")
+        if any(not isinstance(event, _video_timing.ControlStall) for event in self.control_stalls):
+            raise TypeError("control_stalls must contain ControlStall records")
+        _validate_stall_source_frames(self.stall_source_frames, steps=self.steps)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -268,8 +348,16 @@ class EpisodeRecord:
     steps: int = 0
     replans: int = 0
     inference_ms: tuple[float, ...] = ()
+    inference_requests: tuple[_video_timing.InferenceRequest, ...] = ()
+    control_stalls: tuple[_video_timing.ControlStall, ...] = ()
     infrastructure_history: tuple[Mapping[str, Any], ...] = ()
     replay_frames: tuple[Any, ...] = dataclasses.field(default=(), repr=False, compare=False)
+    stall_source_frames: tuple[tuple[int, Any], ...] = dataclasses.field(
+        default=(), repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        _validate_stall_source_frames(self.stall_source_frames, steps=self.steps)
 
     @classmethod
     def from_attempt(
@@ -302,8 +390,11 @@ class EpisodeRecord:
             steps=result.steps if result else 0,
             replans=result.replans if result else 0,
             inference_ms=result.inference_ms if result else (),
+            inference_requests=result.inference_requests if result else (),
+            control_stalls=result.control_stalls if result else (),
             infrastructure_history=tuple(infrastructure_history),
             replay_frames=result.replay_frames if result else (),
+            stall_source_frames=result.stall_source_frames if result else (),
         )
 
     @classmethod
@@ -351,6 +442,8 @@ class EpisodeRecord:
             "replans": self.replans,
             "inference_ms": timings,
             "mean_inference_ms": sum(timings) / len(timings) if timings else None,
+            "inference_requests": [event.to_dict() for event in self.inference_requests],
+            "control_stalls": [event.to_dict() for event in self.control_stalls],
             "infrastructure_history": [dict(entry) for entry in self.infrastructure_history],
         }
 
@@ -499,19 +592,27 @@ class EvaluationManifest:
     policy_protocol: str
     expected_action_horizon: int
     execution_horizon: int
-    suites: Sequence[str] = ()
+    suites: Sequence[str] = SUPPORTED_SUITES
     task_ids: Sequence[int] = tuple(range(10))
     trials_per_task: int = 50
     num_steps_wait: int = 10
-    max_steps_by_suite: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    max_steps_by_suite: Mapping[str, int] = dataclasses.field(
+        default_factory=lambda: dict(_MAX_STEPS_BY_SUITE)
+    )
     connection_timeout_s: float = 30.0
     inference_timeout_s: float = 120.0
     infrastructure_retries: int = 2
+    dataset_fps: int = 10
+    source_demo_control_hz: int = 20
+    control_freq_hz: int = _video_timing.CONTROL_HZ
+    video_fps: int = _video_timing.DEFAULT_VIDEO_FPS
+    video_show_inference_waits: bool = False
+    inference_schedule: str = _video_timing.SYNCHRONOUS_INFERENCE_SCHEDULE
 
     def __post_init__(self) -> None:
         if self.policy_variant not in {"baseline", "bsp"}:
             raise ValueError("Policy variant must be baseline or bsp")
-        required = {
+        required_text = {
             "code_sha": self.code_sha,
             "dataset_revision": self.dataset_revision,
             "config_name": self.config_name,
@@ -519,24 +620,43 @@ class EvaluationManifest:
             "checkpoint": self.checkpoint,
             "container_digest": self.container_digest,
         }
-        missing = sorted(key for key, value in required.items() if not value)
+        missing = sorted(
+            key
+            for key, value in required_text.items()
+            if not isinstance(value, str) or not value
+        )
         if missing:
-            raise ValueError(f"Evaluation manifest is missing required identities: {missing}")
+            raise ValueError(f"Evaluation manifest has missing or non-string identities: {missing}")
         if not isinstance(self.code_sha, str) or re.fullmatch(
             r"(?:[0-9a-f]{40}|[0-9a-f]{64})", self.code_sha
         ) is None:
             raise ValueError("Evaluation code_sha must be a lowercase 40- or 64-character Git SHA")
         if self.dataset_revision != "v2.0":
             raise ValueError("Physical Intelligence LIBERO evaluation requires dataset revision v2.0")
+        for name, value, expected in (
+            ("dataset_fps", self.dataset_fps, 10),
+            ("source_demo_control_hz", self.source_demo_control_hz, 20),
+            ("control_freq_hz", self.control_freq_hz, _video_timing.CONTROL_HZ),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+                raise ValueError(f"Evaluation {name} must be exactly {expected}")
+        _video_timing.validate_video_frequencies(
+            control_hz=self.control_freq_hz,
+            video_fps=self.video_fps,
+        )
+        if not isinstance(self.video_show_inference_waits, bool):
+            raise ValueError("Evaluation video_show_inference_waits must be a boolean")
+        _video_timing.validate_inference_schedule(self.inference_schedule)
         if not isinstance(self.container_digest, str) or re.fullmatch(
             r"sha256:[0-9a-f]{64}", self.container_digest
         ) is None:
             raise ValueError("Evaluation container_digest must be a lowercase sha256 digest")
-        if isinstance(self.checkpoint_step, bool) or not isinstance(self.checkpoint_step, int):
-            raise ValueError("Evaluation checkpoint_step must be an integer")
-        if self.checkpoint_step < 0:
-            raise ValueError("Evaluation checkpoint_step must be non-negative")
-        if len(self.norm_hash) != 64 or any(character not in "0123456789abcdef" for character in self.norm_hash):
+        _require_exact_integer(self.checkpoint_step, name="Evaluation checkpoint_step")
+        _require_exact_integer(self.train_seed, name="Evaluation train_seed")
+        _require_exact_integer(self.eval_seed, name="Evaluation eval_seed")
+        if not isinstance(self.norm_hash, str) or len(self.norm_hash) != 64 or any(
+            character not in "0123456789abcdef" for character in self.norm_hash
+        ):
             raise ValueError("norm_hash must be the lowercase SHA256 of norm_stats.json")
         cache_identities_present = (self.bsp_cache_hash is not None, self.bsp_cache_manifest_fingerprint is not None)
         if self.policy_variant == "bsp" and cache_identities_present != (True, True):
@@ -544,20 +664,38 @@ class EvaluationManifest:
         if self.policy_variant == "baseline" and cache_identities_present != (False, False):
             raise ValueError("Baseline evaluation must record null BSP cache identities")
         if self.bsp_cache_hash is not None and (
-            len(self.bsp_cache_hash) != 64
+            not isinstance(self.bsp_cache_hash, str)
+            or len(self.bsp_cache_hash) != 64
             or any(character not in "0123456789abcdef" for character in self.bsp_cache_hash)
         ):
             raise ValueError("bsp_cache_hash must be the lowercase SHA256 of the actual sidecar NPZ")
         if self.bsp_cache_manifest_fingerprint is not None and (
-            len(self.bsp_cache_manifest_fingerprint) != 64
+            not isinstance(self.bsp_cache_manifest_fingerprint, str)
+            or len(self.bsp_cache_manifest_fingerprint) != 64
             or any(
                 character not in "0123456789abcdef"
                 for character in self.bsp_cache_manifest_fingerprint
             )
         ):
             raise ValueError("bsp_cache_manifest_fingerprint must be a lowercase SHA256")
-        if not self.bsp_parameters:
-            raise ValueError("Evaluation manifest must record the fixed BSP parameters")
+        if not isinstance(self.bsp_parameters, dict) or set(self.bsp_parameters) != set(BSP_PARAMETERS):
+            raise ValueError("Evaluation manifest must record the exact fixed BSP parameters")
+        if any(
+            type(self.bsp_parameters[field]) is not type(expected)
+            or self.bsp_parameters[field] != expected
+            for field, expected in BSP_PARAMETERS.items()
+        ):
+            raise ValueError("Evaluation manifest must record the exact fixed BSP parameters")
+        _require_exact_integer(
+            self.expected_action_horizon,
+            name="Evaluation expected_action_horizon",
+            minimum=1,
+        )
+        _require_exact_integer(
+            self.execution_horizon,
+            name="Evaluation execution_horizon",
+            minimum=1,
+        )
         protocol = resolve_policy_protocol(self.policy_variant, self.expected_action_horizon)
         if self.policy_protocol != protocol.name:
             raise ValueError(
@@ -565,13 +703,28 @@ class EvaluationManifest:
             )
         if self.execution_horizon != _REPLAN_ACTIONS:
             raise ValueError(f"LIBERO evaluation must execute exactly {_REPLAN_ACTIONS} actions per replan")
-        if self.suites and any(suite not in SUPPORTED_SUITES for suite in self.suites):
-            raise ValueError("Evaluation manifest contains an unsupported suite")
+        if isinstance(self.suites, (str, bytes)) or not isinstance(self.suites, (tuple, list)):
+            raise ValueError("Evaluation manifest suites must be a list or tuple")
+        suites = tuple(self.suites)
+        if suites not in tuple((suite,) for suite in SUPPORTED_SUITES) + (SUPPORTED_SUITES,):
+            raise ValueError("Evaluation manifest suites must be one suite or all four in canonical order")
+        if not isinstance(self.task_ids, (tuple, list)):
+            raise ValueError("Evaluation manifest task_ids must be a list or tuple")
         canonical_task_ids = resolve_task_ids(self.task_ids)
         if tuple(self.task_ids) != canonical_task_ids:
             raise ValueError("Evaluation manifest task_ids must be unique and sorted")
-        if self.trials_per_task < 1 or self.num_steps_wait < 0:
-            raise ValueError("Evaluation rollout counts are invalid")
+        _require_exact_integer(
+            self.trials_per_task,
+            name="Evaluation trials_per_task",
+            minimum=1,
+        )
+        _require_exact_integer(self.num_steps_wait, name="Evaluation num_steps_wait")
+        if not isinstance(self.max_steps_by_suite, dict) or set(self.max_steps_by_suite) != set(suites):
+            raise ValueError("Evaluation max_steps_by_suite must exactly match selected suites")
+        for suite, max_steps in self.max_steps_by_suite.items():
+            _require_exact_integer(max_steps, name=f"Evaluation max steps for {suite}", minimum=1)
+            if max_steps != _MAX_STEPS_BY_SUITE[suite]:
+                raise ValueError(f"Evaluation max steps for {suite} must be {_MAX_STEPS_BY_SUITE[suite]}")
         for name, timeout in (
             ("connection_timeout_s", self.connection_timeout_s),
             ("inference_timeout_s", self.inference_timeout_s),
@@ -583,17 +736,20 @@ class EvaluationManifest:
                 or timeout <= 0
             ):
                 raise ValueError(f"Evaluation {name} must be positive and finite")
+        _require_exact_integer(self.infrastructure_retries, name="Evaluation infrastructure_retries")
         if self.infrastructure_retries != 2:
             raise ValueError("LIBERO evaluation protocol requires exactly two infrastructure retries")
 
     def to_dict(self) -> dict[str, Any]:
+        # frozen=True prevents attribute assignment, not mutation of caller-owned
+        # list/dict values. Revalidate immediately before schema-v3 serialization.
+        self.__post_init__()
         payload = dataclasses.asdict(self)
         payload["suites"] = list(self.suites)
         payload["task_ids"] = list(self.task_ids)
         return {
             **payload,
-            "schema_version": 2,
-            "native_control_hz": 10,
+            "schema_version": 3,
             "replan_steps": _REPLAN_ACTIONS,
         }
 
@@ -639,6 +795,291 @@ class ArtifactError:
         return dataclasses.asdict(self)
 
 
+@dataclasses.dataclass(frozen=True)
+class VideoArtifactAudit:
+    """Planned and encoded timing for one selected video artifact."""
+
+    episode_id: str
+    path: str
+    planned: _video_timing.VideoTimingAudit
+    inference_schedule: str
+    video_show_inference_waits: bool
+    measured_stall_count: int
+    measured_control_stall_ns: int
+    measured_stall_reasons: tuple[str, ...]
+    included_stall_reasons: tuple[str, ...]
+    included_stall_frame_counts: tuple[int, ...]
+    inserted_overlay_types: tuple[str, ...]
+    encoded_fps: float
+    encoded_frame_count: int
+    encoded_duration_ns: int
+    encoded_duration_deviation_ns: int
+    timing_tolerance_ns: int
+    timing_gate_pass: bool
+    artifact_padding_frame_count: int = 0
+    warning: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.planned, _video_timing.VideoTimingAudit):
+            raise TypeError("planned must be a VideoTimingAudit")
+        if type(self.video_show_inference_waits) is not bool:
+            raise TypeError("video_show_inference_waits must be a boolean")
+        _video_timing.validate_inference_schedule(self.inference_schedule)
+        _require_exact_integer(self.measured_stall_count, name="video measured_stall_count")
+        _require_exact_integer(
+            self.measured_control_stall_ns,
+            name="video measured_control_stall_ns",
+        )
+        _require_exact_integer(self.included_stall_count, name="video included_stall_count")
+        _require_exact_integer(
+            self.included_control_stall_ns,
+            name="video included_control_stall_ns",
+        )
+        _require_exact_integer(self.planned.stall_frame_count, name="video stall_frame_count")
+        _require_exact_integer(
+            self.artifact_padding_frame_count,
+            name="video artifact_padding_frame_count",
+        )
+        if self.artifact_padding_frame_count not in {0, 1}:
+            raise ValueError("Video artifact padding must contain at most one frame")
+        if self.planned.video_frame_count == 0:
+            if self.artifact_padding_frame_count != 1:
+                raise ValueError("An empty planned timeline requires one encoded padding frame")
+        elif self.artifact_padding_frame_count:
+            raise ValueError("Non-empty planned timelines cannot add artifact padding")
+        _require_exact_string_tuple(
+            self.measured_stall_reasons,
+            name="video measured_stall_reasons",
+            allowed_values=_STALL_REASONS,
+            expected_count=self.measured_stall_count,
+        )
+        _require_exact_string_tuple(
+            self.included_stall_reasons,
+            name="video included_stall_reasons",
+            allowed_values=_STALL_REASONS,
+            expected_count=self.included_stall_count,
+        )
+        _require_exact_nonnegative_integer_tuple(
+            self.included_stall_frame_counts,
+            name="video included_stall_frame_counts",
+            expected_count=self.included_stall_count,
+        )
+        if sum(self.included_stall_frame_counts) != self.planned.stall_frame_count:
+            raise ValueError("Included stall frame counts do not match the planned timeline")
+        _require_exact_string_tuple(
+            self.inserted_overlay_types,
+            name="video inserted_overlay_types",
+            allowed_values=_OVERLAY_TYPES,
+        )
+        expected_reason = (
+            _video_timing.STALL_REASON_SYNCHRONOUS_INFERENCE
+            if self.inference_schedule == _video_timing.SYNCHRONOUS_INFERENCE_SCHEDULE
+            else _video_timing.STALL_REASON_ASYNC_ACTION_UNDERFLOW
+        )
+        if any(reason != expected_reason for reason in self.measured_stall_reasons):
+            raise ValueError("Measured stall reason does not match inference schedule")
+        if self.video_show_inference_waits:
+            if self.included_stall_reasons != self.measured_stall_reasons:
+                raise ValueError("Included stall reasons must match measured stall reasons")
+        elif self.included_stall_reasons or self.inserted_overlay_types:
+            raise ValueError("Disabled inference waits cannot include stalls or overlays")
+        expected_overlay_types = tuple(
+            _OVERLAY_TYPE_BY_STALL_REASON[reason]
+            for reason, frame_count in zip(  # noqa: B905 -- LIBERO client runs on Python 3.8.
+                self.included_stall_reasons,
+                self.included_stall_frame_counts,
+            )
+            if frame_count
+        )
+        if (
+            self.artifact_padding_frame_count
+            and self.video_show_inference_waits
+            and self.included_stall_reasons
+        ):
+            expected_overlay_types = (
+                _OVERLAY_TYPE_BY_STALL_REASON[self.included_stall_reasons[0]],
+            )
+        if self.inserted_overlay_types != expected_overlay_types:
+            raise ValueError("Inserted overlay audit does not match the encoded video timeline")
+
+    @property
+    def included_stall_count(self) -> int:
+        return self.planned.included_stall_count
+
+    @property
+    def included_control_stall_ns(self) -> int:
+        return self.planned.included_control_stall_ns
+
+    @property
+    def expected_duration_ns(self) -> int:
+        return self.planned.expected_duration_ns
+
+    @property
+    def expected_encoded_frame_count(self) -> int:
+        return self.planned.video_frame_count + self.artifact_padding_frame_count
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "episode_id": self.episode_id,
+            "path": self.path,
+            **self.planned.to_dict(),
+            "inference_schedule": self.inference_schedule,
+            "video_show_inference_waits": self.video_show_inference_waits,
+            "measured_stall_count": self.measured_stall_count,
+            "measured_control_stall_ns": self.measured_control_stall_ns,
+            "measured_stall_reasons": list(self.measured_stall_reasons),
+            "included_stall_reasons": list(self.included_stall_reasons),
+            "included_stall_frame_counts": list(self.included_stall_frame_counts),
+            "inserted_overlay_types": list(self.inserted_overlay_types),
+            "encoded_fps": self.encoded_fps,
+            "encoded_frame_count": self.encoded_frame_count,
+            "encoded_duration_ns": self.encoded_duration_ns,
+            "encoded_duration_deviation_ns": self.encoded_duration_deviation_ns,
+            "timing_tolerance_ns": self.timing_tolerance_ns,
+            "timing_gate_pass": self.timing_gate_pass,
+            "artifact_padding_frame_count": self.artifact_padding_frame_count,
+            "expected_encoded_frame_count": self.expected_encoded_frame_count,
+            "warning": self.warning,
+        }
+
+
+def build_video_artifact_audit(
+    *,
+    episode_id: str,
+    path: str,
+    planned: _video_timing.VideoTimingAudit,
+    measured_stalls: Sequence[_video_timing.ControlStall],
+    included_stalls: Sequence[_video_timing.ControlStall],
+    video_show_inference_waits: bool,
+    inference_schedule: str,
+    artifact_padding_frame_count: int = 0,
+    encoded_fps: float,
+    encoded_frame_count: int,
+    encoded_duration_s: float,
+) -> VideoArtifactAudit:
+    """Validate MP4 readback and classify duration-only drift as a warning."""
+    if not episode_id or not path:
+        raise ValueError("Video audit identity and path must be non-empty")
+    if not isinstance(planned, _video_timing.VideoTimingAudit):
+        raise TypeError("planned must be a VideoTimingAudit")
+    if not isinstance(video_show_inference_waits, bool):
+        raise ValueError("video_show_inference_waits must be a boolean")
+    _video_timing.validate_inference_schedule(inference_schedule)
+    measured_stalls = tuple(measured_stalls)
+    included_stalls = tuple(included_stalls)
+    if any(not isinstance(stall, _video_timing.ControlStall) for stall in measured_stalls):
+        raise TypeError("measured_stalls must contain ControlStall records")
+    if any(not isinstance(stall, _video_timing.ControlStall) for stall in included_stalls):
+        raise TypeError("included_stalls must contain ControlStall records")
+    expected_included_stalls = measured_stalls if video_show_inference_waits else ()
+    if included_stalls != expected_included_stalls:
+        raise ValueError("Included stalls do not match video_show_inference_waits")
+    for stall in measured_stalls:
+        _video_timing.stall_overlay_lines(stall, inference_schedule=inference_schedule)
+    if planned.included_stall_count != len(included_stalls) or planned.included_control_stall_ns != sum(
+        stall.duration_ns for stall in included_stalls
+    ):
+        raise ValueError("Planned audit does not match included control stalls")
+    if (
+        isinstance(encoded_fps, bool)
+        or not isinstance(encoded_fps, (int, float))
+        or not math.isfinite(encoded_fps)
+        or encoded_fps <= 0
+    ):
+        raise ValueError("Encoded FPS must be positive and finite")
+    if not math.isclose(float(encoded_fps), float(planned.video_fps), rel_tol=0.0, abs_tol=1e-6):
+        raise ValueError(
+            f"Encoded FPS {encoded_fps} does not match requested video FPS {planned.video_fps}"
+        )
+    _require_exact_integer(
+        artifact_padding_frame_count,
+        name="video artifact_padding_frame_count",
+    )
+    if artifact_padding_frame_count not in {0, 1}:
+        raise ValueError("Video artifact padding must contain at most one frame")
+    if planned.video_frame_count == 0:
+        if artifact_padding_frame_count != 1:
+            raise ValueError("An empty planned timeline requires one encoded padding frame")
+    elif artifact_padding_frame_count:
+        raise ValueError("Non-empty planned timelines cannot add artifact padding")
+    if (
+        isinstance(encoded_frame_count, bool)
+        or not isinstance(encoded_frame_count, int)
+        or encoded_frame_count < 0
+    ):
+        raise ValueError("Encoded frame count must be a non-negative integer")
+    expected_encoded_frame_count = planned.video_frame_count + artifact_padding_frame_count
+    if encoded_frame_count != expected_encoded_frame_count:
+        raise ValueError(
+            f"Encoded frame count {encoded_frame_count} does not match planned frame count "
+            f"{expected_encoded_frame_count}"
+        )
+    if (
+        isinstance(encoded_duration_s, bool)
+        or not isinstance(encoded_duration_s, (int, float))
+        or not math.isfinite(encoded_duration_s)
+        or encoded_duration_s < 0
+    ):
+        raise ValueError("Encoded duration must be non-negative and finite")
+
+    encoded_duration_ns = round(float(encoded_duration_s) * _video_timing.NANOSECONDS_PER_SECOND)
+    deviation_ns = encoded_duration_ns - planned.expected_duration_ns
+    tolerance_ns = (
+        _video_timing.NANOSECONDS_PER_SECOND + planned.video_fps - 1
+    ) // planned.video_fps
+    timing_gate_pass = abs(deviation_ns) <= tolerance_ns
+    warning = None
+    if not timing_gate_pass:
+        warning = (
+            "encoded duration deviates from expected duration by "
+            f"{abs(deviation_ns) / _video_timing.NANOSECONDS_PER_SECOND:.6f} s "
+            f"(tolerance {tolerance_ns / _video_timing.NANOSECONDS_PER_SECOND:.6f} s)"
+        )
+    measured_stall_reasons = tuple(stall.reason for stall in measured_stalls)
+    included_stall_reasons = tuple(stall.reason for stall in included_stalls)
+    included_stall_frame_counts = _video_timing.quantize_stall_frames(
+        included_stalls,
+        video_fps=planned.video_fps,
+    )
+    inserted_overlay_types = tuple(
+        _OVERLAY_TYPE_BY_STALL_REASON[stall.reason]
+        for stall, frame_count in zip(
+            included_stalls,
+            included_stall_frame_counts,
+        )
+        if frame_count
+    )
+    if (
+        artifact_padding_frame_count
+        and video_show_inference_waits
+        and included_stall_reasons
+    ):
+        inserted_overlay_types = (
+            _OVERLAY_TYPE_BY_STALL_REASON[included_stall_reasons[0]],
+        )
+    return VideoArtifactAudit(
+        episode_id=episode_id,
+        path=path,
+        planned=planned,
+        inference_schedule=inference_schedule,
+        video_show_inference_waits=video_show_inference_waits,
+        measured_stall_count=len(measured_stalls),
+        measured_control_stall_ns=sum(stall.duration_ns for stall in measured_stalls),
+        measured_stall_reasons=measured_stall_reasons,
+        included_stall_reasons=included_stall_reasons,
+        included_stall_frame_counts=included_stall_frame_counts,
+        inserted_overlay_types=inserted_overlay_types,
+        encoded_fps=float(encoded_fps),
+        encoded_frame_count=encoded_frame_count,
+        encoded_duration_ns=encoded_duration_ns,
+        encoded_duration_deviation_ns=deviation_ns,
+        timing_tolerance_ns=tolerance_ns,
+        timing_gate_pass=timing_gate_pass,
+        artifact_padding_frame_count=artifact_padding_frame_count,
+        warning=warning,
+    )
+
+
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
@@ -672,6 +1113,7 @@ class ArtifactWriter:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.episodes_path = self.output_dir / "episodes.jsonl"
         self.artifact_errors_path = self.output_dir / "artifact_errors.jsonl"
+        self.video_audit_path = self.output_dir / "video_audit.jsonl"
 
     def write_manifest(self, manifest: EvaluationManifest) -> None:
         _atomic_json(self.output_dir / "manifest.json", manifest.to_dict())
@@ -685,6 +1127,12 @@ class ArtifactWriter:
     def append_artifact_error(self, error: ArtifactError) -> None:
         with self.artifact_errors_path.open("a", encoding="utf-8") as output:
             json.dump(error.to_dict(), output, sort_keys=True, allow_nan=False)
+            output.write("\n")
+            output.flush()
+
+    def append_video_audit(self, audit: VideoArtifactAudit) -> None:
+        with self.video_audit_path.open("a", encoding="utf-8") as output:
+            json.dump(audit.to_dict(), output, sort_keys=True, allow_nan=False)
             output.write("\n")
             output.flush()
 

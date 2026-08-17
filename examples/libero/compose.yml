@@ -27,6 +27,14 @@ services:
           create_host_path: false
     environment:
       - CLIENT_ARGS
+      # The evaluator resolves its identity from this exact read-only checkout.
+      # Disable optional index refresh locks and trust only the mounted repo.
+      - GIT_OPTIONAL_LOCKS=0
+      - GIT_CONFIG_COUNT=2
+      - GIT_CONFIG_KEY_0=safe.directory
+      - GIT_CONFIG_VALUE_0=/app
+      - GIT_CONFIG_KEY_1=safe.directory
+      - GIT_CONFIG_VALUE_1=/app/third_party/libero
       - MUJOCO_GL=${MUJOCO_GL:-egl}
       - MUJOCO_EGL_DEVICE_ID=0
       - NVIDIA_DRIVER_CAPABILITIES=all

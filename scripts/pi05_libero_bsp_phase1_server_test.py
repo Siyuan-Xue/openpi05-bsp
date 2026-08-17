@@ -1,9 +1,11 @@
 """Dependency-free contracts for the phase-one H20 server runbook."""
 
 import ast
+import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import unittest
 
 
@@ -63,7 +65,8 @@ class PhaseOneServerRunbookContractTest(unittest.TestCase):
 
     def test_evaluator_flags_are_real_nested_args(self):
         fields = _class_fields(_ROOT / "examples" / "libero" / "main.py", "Args")
-        flags = set(re.findall(r"--args\.([a-z0-9-]+)", self.runbook))
+        bash = "\n".join(self.bash_blocks)
+        flags = set(re.findall(r"--args\.([a-z0-9-]+)", bash))
         required = {
             "task-suite-name",
             "task-ids",
@@ -73,7 +76,6 @@ class PhaseOneServerRunbookContractTest(unittest.TestCase):
             "output-dir",
             "config-name",
             "checkpoint-step",
-            "code-sha",
             "dataset-revision",
             "norm-hash",
             "checkpoint",
@@ -82,10 +84,15 @@ class PhaseOneServerRunbookContractTest(unittest.TestCase):
             "eval-seed",
             "bsp-cache-hash",
             "bsp-cache-manifest-fingerprint",
+            "control-freq",
+            "video-fps",
+            "video-show-inference-waits",
         }
 
         self.assertTrue(required.issubset(flags))
         self.assertEqual(flags.difference(fields), set())
+        self.assertNotIn("code-sha", fields)
+        self.assertNotIn("--args.code-sha", bash)
 
     def test_training_overrides_match_current_config_fields(self):
         config_path = _ROOT / "src" / "openpi" / "training" / "config.py"
@@ -162,6 +169,150 @@ class PhaseOneServerRunbookContractTest(unittest.TestCase):
             self.runbook.index("--name libero-official-h10-task0-smoke runtime"),
         )
 
+    def test_docker_runtime_proves_automatic_git_identity(self):
+        dockerfile = (_ROOT / "examples" / "libero" / "Dockerfile").read_text()
+        compose = (_ROOT / "examples" / "libero" / "compose.yml").read_text()
+        readme = (_ROOT / "examples" / "libero" / "README.md").read_text()
+
+        apt_install = re.search(
+            r"apt-get install -y(?: --no-install-recommends)?(.*?)(?:\n\s*$|\n\s*&&)",
+            dockerfile,
+            re.DOTALL | re.MULTILINE,
+        )
+        self.assertIsNotNone(apt_install)
+        self.assertRegex(apt_install.group(1), r"(?:^|\s)git(?:\s|$)")
+
+        for value in (
+            "GIT_OPTIONAL_LOCKS=0",
+            "GIT_CONFIG_COUNT=2",
+            "GIT_CONFIG_KEY_0=safe.directory",
+            "GIT_CONFIG_VALUE_0=/app",
+            "GIT_CONFIG_KEY_1=safe.directory",
+            "GIT_CONFIG_VALUE_1=/app/third_party/libero",
+        ):
+            with self.subTest(compose_environment=value):
+                self.assertIn(value, compose)
+
+        for document in (readme, self.runbook):
+            with self.subTest(document="README" if document is readme else "runbook"):
+                self.assertIn("--name libero-git-identity-preflight", document)
+                self.assertIn('-e EXPECTED_REPO_SHA="$EXPECTED_REPO_SHA"', document)
+                self.assertIn("git -C /app rev-parse HEAD", document)
+                self.assertIn(
+                    "git -C /app status --porcelain --untracked-files=all", document
+                )
+                self.assertIn(
+                    'if ! container_status="$(git -C /app status '
+                    '--porcelain --untracked-files=all)"; then',
+                    document,
+                )
+                self.assertIn('test -z "$container_status"', document)
+                self.assertIn('test "$container_sha" = "$EXPECTED_REPO_SHA"', document)
+                bash = "\n".join(re.findall(r"```bash\n(.*?)```", document, flags=re.DOTALL))
+                self.assertNotIn("--args.code-sha", bash)
+
+        self.assertIn(
+            'EXPECTED_REPO_SHA="$(git -C "$BSP_REPO_DIR" rev-parse HEAD)"', readme
+        )
+
+    def test_runtime_git_preflight_propagates_clean_status_failure(self):
+        for path in (
+            _ROOT / "examples" / "libero" / "README.md",
+            _ROOT / "docs" / "pi05_libero_bsp_phase1_server.md",
+        ):
+            document = path.read_text()
+            match = re.search(
+                r"--name libero-git-identity-preflight .*?runtime -ceu '(.*?)\n\s*'",
+                document,
+                re.DOTALL,
+            )
+            self.assertIsNotNone(match, path)
+            with tempfile.TemporaryDirectory() as directory:
+                fake_git = Path(directory) / "git"
+                fake_git.write_text(
+                    "#!/bin/sh\n"
+                    "case \"$*\" in\n"
+                    "  *'rev-parse HEAD'*) printf '%040d\\n' 0; exit 0 ;;\n"
+                    "  *'status --porcelain --untracked-files=all'*) exit 17 ;;\n"
+                    "  *) exit 19 ;;\n"
+                    "esac\n"
+                )
+                fake_git.chmod(0o755)
+                environment = os.environ.copy()
+                environment["PATH"] = f"{directory}:{environment['PATH']}"
+                environment["EXPECTED_REPO_SHA"] = "0" * 40
+                result = subprocess.run(
+                    ["bash", "-ceu", match.group(1)],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    env=environment,
+                )
+                with self.subTest(document=path.name):
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn("runtime_evaluator_sha=", result.stdout)
+
+    def test_schema3_diagnostics_clean_gate_propagates_git_status_failure(self):
+        section = re.search(
+            r"### 12\.4 .*?```bash\n(.*?)\n```",
+            self.runbook,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(section)
+        block = section.group(1)
+        prefix = re.search(
+            r'(.*?test "\$\{#SCHEMA3_CODE_SHA\}" -eq 40)',
+            block,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(prefix)
+        self.assertIn(
+            'if ! schema3_git_status="$(git status '
+            '--porcelain --untracked-files=all)"; then',
+            block,
+        )
+        self.assertIn('if test -n "$schema3_git_status"; then', block)
+        self.assertNotIn(
+            'test -z "$(git status --porcelain --untracked-files=all)"',
+            block,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            fake_git = Path(directory) / "git"
+            fake_git.write_text(
+                "#!/bin/sh\n"
+                "case \"$*\" in\n"
+                "  *'status --porcelain --untracked-files=all'*) exit 17 ;;\n"
+                "  *'rev-parse HEAD'*) printf '%040d\\n' 0; exit 0 ;;\n"
+                "  *) exit 19 ;;\n"
+                "esac\n"
+            )
+            fake_git.chmod(0o755)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{directory}:{environment['PATH']}"
+            environment["BSP_REPO_DIR"] = directory
+            result = subprocess.run(
+                ["bash", "-ceu", prefix.group(1)],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=environment,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot inspect schema-v3 checkout", result.stderr)
+
+    def test_final_audit_names_ten_runs_and_three_diagnostic_artifacts(self):
+        self.assertNotIn("六个 h16/BSP 评测输入", self.runbook)
+        for fragment in (
+            "十个 h16/BSP 评测输入",
+            "历史 BSP diagnostics",
+            "schema-v3 BSP diagnostics",
+            "norm diagnostics",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, self.runbook)
+
     def test_fixed_protocol_and_audit_artifacts_are_complete(self):
         required_fragments = (
             "1,693 episodes",
@@ -180,9 +331,25 @@ class PhaseOneServerRunbookContractTest(unittest.TestCase):
             "official-h10-task0-smoke",
             "--args.task-suite-name all",
             "--args.num-trials-per-task 50",
-            '--bsp-verification "$BSP_VERIFY"',
+            '--bsp-verification "$BSP_VERIFY_SCHEMA3"',
             '--norm-comparison "$NORM_COMPARISON"',
             "20,000 episodes",
+            "schema v3",
+            "dataset FPS 为 10",
+            "评测环境 `control_freq_hz` 固定 20 Hz",
+            "MP4 默认 40 FPS",
+            "video_audit.jsonl",
+            "control_steps / 20 + included_control_stall_seconds",
+            "schema v2 结果",
+            "十次正式 schema-v3 评测",
+            "BSP_VERIFY_SCHEMA3",
+            'test ! -e "$BSP_VERIFY_SCHEMA3"',
+            '--diagnostics-path "$BSP_VERIFY_SCHEMA3"',
+            'old["cache_sha256"] == new["cache_sha256"] == cache_sha',
+            'old["cache_manifest_fingerprint"] == new["cache_manifest_fingerprint"]',
+            'old["cache_contents_sha256"] == new["cache_contents_sha256"]',
+            'new["code_sha"] == code_sha',
+            "不重训模型、不重建 sidecar",
             "permanent_checkpoint_steps",
             "0k/1k/2k/5k/10k",
             "phase1-short10k-seed42-baseline",

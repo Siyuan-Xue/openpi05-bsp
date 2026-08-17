@@ -12,7 +12,7 @@ from openpi_client import libero_report
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Validate and compare exactly ten phase-one LIBERO runs: "
+            "Validate and compare exactly ten formal schema-v3 phase-one LIBERO runs: "
             "baseline/BSP at 0k, 1k, 2k, 5k, and 10k optimizer steps."
         )
     )
@@ -21,7 +21,10 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="RUN_DIR",
         nargs=10,
         type=Path,
-        help="Ten run directories; manifest contents, never directory names, identify each run.",
+        help=(
+            "Ten schema-v3 run directories; manifest contents, never directory names, identify each run. "
+            "Schema-v2 results are archive-only and cannot be mixed or upgraded."
+        ),
     )
     parser.add_argument(
         "--bsp-verification",
