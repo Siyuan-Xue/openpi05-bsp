@@ -208,6 +208,16 @@ class _PendingRequestV4:
     trace: _RequestTraceV4
 
 
+@dataclasses.dataclass
+class _PendingSlotV4:
+    value: Optional[_PendingRequestV4] = None
+    owns_job: bool = False
+
+    def clear(self) -> None:
+        self.value = None
+        self.owns_job = False
+
+
 class _AttemptLedgerV4:
     def __init__(
         self,
@@ -475,6 +485,28 @@ def _cancel_preserving_v4(
         raise RunCleanupError(primary_error, cleanup_error) from primary_error
 
 
+def _return_policy_failure_v4(
+    error: BaseException,
+    *,
+    now_ns: int,
+    worker: Any,
+    pending_slot: _PendingSlotV4,
+    ledger: _AttemptLedgerV4,
+    cleanup_timeout_s: float,
+) -> _eval.AttemptResultV4:
+    pending = pending_slot.value
+    if pending is not None and pending.trace.disposition is None:
+        pending.trace.disposition = "abandoned"
+    if pending_slot.owns_job:
+        _cancel_preserving_v4(
+            worker,
+            timeout_s=cleanup_timeout_s,
+            primary_error=error,
+        )
+        pending_slot.clear()
+    return ledger.policy_failure(error, now_ns=now_ns)
+
+
 def _close_worker_v4(
     worker: Any,
     *,
@@ -507,6 +539,7 @@ def _submit_request_v4(
     prepared_observation: Mapping[str, Any],
     source_frame: Any,
     ledger: _AttemptLedgerV4,
+    pending_slot: _PendingSlotV4,
 ) -> _PendingRequestV4:
     for reserved_key in (_inference.INFERENCE_SEED_KEY, _inference.RTC_REQUEST_KEY):
         if reserved_key in prepared_observation:
@@ -523,6 +556,7 @@ def _submit_request_v4(
     except BaseException as error:
         classified = _classify_worker_exception(error)
         raise classified from error
+    pending_slot.owns_job = True
     submitted_ns = getattr(job, "submitted_monotonic_ns", None)
     if isinstance(submitted_ns, bool) or not isinstance(submitted_ns, int) or submitted_ns < 0:
         raise _eval.PolicyFailure("worker job is missing a valid submit timestamp")
@@ -535,7 +569,9 @@ def _submit_request_v4(
         source_frame=source_frame,
     )
     ledger.requests.append(trace)
-    return _PendingRequestV4(job=job, trace=trace)
+    pending = _PendingRequestV4(job=job, trace=trace)
+    pending_slot.value = pending
+    return pending
 
 
 def _outcome_timing_v4(
@@ -772,7 +808,7 @@ def _attempt_request_v4(
     at_due: bool,
     prepared_observation: Mapping[str, Any],
     source_frame: Any,
-    pending: Optional[_PendingRequestV4],
+    pending_slot: _PendingSlotV4,
     worker: Any,
     scheduler: _control.ModeSchedulerV4,
     ledger: _AttemptLedgerV4,
@@ -781,21 +817,34 @@ def _attempt_request_v4(
     pacer: _control.NoCatchupPacer,
     clock: _control.Clock,
     inference_timeout_s: float,
-) -> Tuple[Optional[_PendingRequestV4], Optional[_eval.AttemptResultV4]]:
+    cleanup_timeout_s: float,
+) -> Optional[_eval.AttemptResultV4]:
+    pending = pending_slot.value
     try:
         intent = scheduler.maybe_request(
             now_ns,
             at_due=at_due,
-            request_in_flight=pending is not None,
+            request_in_flight=pending_slot.owns_job,
         )
     except Exception as error:
-        return pending, ledger.policy_failure(error, now_ns=now_ns)
+        return _return_policy_failure_v4(
+            error,
+            now_ns=now_ns,
+            worker=worker,
+            pending_slot=pending_slot,
+            ledger=ledger,
+            cleanup_timeout_s=cleanup_timeout_s,
+        )
     if intent is None:
-        return pending, None
-    if pending is not None:
-        return pending, ledger.policy_failure(
+        return None
+    if pending_slot.owns_job:
+        return _return_policy_failure_v4(
             _async.BusyError("scheduler requested a second outstanding job"),
             now_ns=now_ns,
+            worker=worker,
+            pending_slot=pending_slot,
+            ledger=ledger,
+            cleanup_timeout_s=cleanup_timeout_s,
         )
     try:
         pending = _submit_request_v4(
@@ -804,11 +853,19 @@ def _attempt_request_v4(
             prepared_observation=prepared_observation,
             source_frame=source_frame,
             ledger=ledger,
+            pending_slot=pending_slot,
         )
     except _eval.PolicyFailure as error:
-        return None, ledger.policy_failure(error, now_ns=_require_nonnegative_clock(clock))
+        return _return_policy_failure_v4(
+            error,
+            now_ns=_require_nonnegative_clock(clock),
+            worker=worker,
+            pending_slot=pending_slot,
+            ledger=ledger,
+            cleanup_timeout_s=cleanup_timeout_s,
+        )
     if intent.dispatch == "background":
-        return pending, None
+        return None
     due_ns = pacer.next_deadline_ns
     outcome = _wait_for_request_v4(worker, pending, timeout_s=inference_timeout_s)
     activation_now_ns = _require_nonnegative_clock(clock)
@@ -822,7 +879,8 @@ def _attempt_request_v4(
         activation_now_ns=activation_now_ns,
         blocking_due_ns=due_ns,
     )
-    return None, result
+    pending_slot.clear()
+    return result
 
 
 def _run_attempt_v4(
@@ -868,10 +926,28 @@ def _run_attempt_v4(
         origin_ns=episode_origin_ns,
     )
     pacer = _control.NoCatchupPacer(clock)
-    pending = None  # type: Optional[_PendingRequestV4]
+    pending_slot = _PendingSlotV4()
 
     try:
         while ledger.steps < max_steps:
+            pending = pending_slot.value
+            if pending is not None:
+                outcome = _poll_request_v4(worker, pending)
+                if outcome is not None:
+                    activation_now_ns = _require_nonnegative_clock(clock)
+                    result = _complete_request_v4(
+                        pending=pending,
+                        outcome=outcome,
+                        scheduler=scheduler,
+                        ledger=ledger,
+                        mode=mode,
+                        expected_server_metadata_fingerprint=expected_server_metadata_fingerprint,
+                        activation_now_ns=activation_now_ns,
+                    )
+                    pending_slot.clear()
+                    if result is not None:
+                        return result
+
             try:
                 prepared_observation, image = prepare_observation(
                     obs, task_description, args.resize_size
@@ -885,31 +961,14 @@ def _run_attempt_v4(
                     raise RunCleanupError(error, cleanup_error) from error
                 raise _eval.classify_exception(error, phase="environment_step") from error
 
-            if pending is not None:
-                outcome = _poll_request_v4(worker, pending)
-                if outcome is not None:
-                    activation_now_ns = _require_nonnegative_clock(clock)
-                    result = _complete_request_v4(
-                        pending=pending,
-                        outcome=outcome,
-                        scheduler=scheduler,
-                        ledger=ledger,
-                        mode=mode,
-                        expected_server_metadata_fingerprint=expected_server_metadata_fingerprint,
-                        activation_now_ns=activation_now_ns,
-                    )
-                    pending = None
-                    if result is not None:
-                        return result
-
             now_ns = _require_nonnegative_clock(clock)
             next_deadline_ns = pacer.next_deadline_ns
-            pending, result = _attempt_request_v4(
+            result = _attempt_request_v4(
                 now_ns=now_ns,
                 at_due=next_deadline_ns is None or now_ns >= next_deadline_ns,
                 prepared_observation=prepared_observation,
                 source_frame=image,
-                pending=pending,
+                pending_slot=pending_slot,
                 worker=worker,
                 scheduler=scheduler,
                 ledger=ledger,
@@ -918,11 +977,13 @@ def _run_attempt_v4(
                 pacer=pacer,
                 clock=clock,
                 inference_timeout_s=args.inference_timeout_s,
+                cleanup_timeout_s=args.connection_timeout_s,
             )
             if result is not None:
                 return result
 
             due_now_ns = pacer.wait_until_due()
+            pending = pending_slot.value
             if pending is not None:
                 outcome = _poll_request_v4(worker, pending)
                 if outcome is not None:
@@ -936,17 +997,17 @@ def _run_attempt_v4(
                         expected_server_metadata_fingerprint=expected_server_metadata_fingerprint,
                         activation_now_ns=activation_now_ns,
                     )
-                    pending = None
+                    pending_slot.clear()
                     if result is not None:
                         return result
 
             boundary_now_ns = _require_nonnegative_clock(clock)
-            pending, result = _attempt_request_v4(
+            result = _attempt_request_v4(
                 now_ns=boundary_now_ns,
                 at_due=True,
                 prepared_observation=prepared_observation,
                 source_frame=image,
-                pending=pending,
+                pending_slot=pending_slot,
                 worker=worker,
                 scheduler=scheduler,
                 ledger=ledger,
@@ -955,6 +1016,7 @@ def _run_attempt_v4(
                 pacer=pacer,
                 clock=clock,
                 inference_timeout_s=args.inference_timeout_s,
+                cleanup_timeout_s=args.connection_timeout_s,
             )
             if result is not None:
                 return result
@@ -962,12 +1024,24 @@ def _run_attempt_v4(
             try:
                 action_decision = scheduler.take_action(_require_nonnegative_clock(clock))
             except Exception as error:
-                return ledger.policy_failure(error, now_ns=_require_nonnegative_clock(clock))
+                return _return_policy_failure_v4(
+                    error,
+                    now_ns=_require_nonnegative_clock(clock),
+                    worker=worker,
+                    pending_slot=pending_slot,
+                    ledger=ledger,
+                    cleanup_timeout_s=args.connection_timeout_s,
+                )
             if action_decision.underflow:
+                pending = pending_slot.value
                 if pending is None or pending.trace.intent.dispatch != "background":
-                    return ledger.policy_failure(
+                    return _return_policy_failure_v4(
                         _eval.PolicyFailure("action plan underflowed without a background request"),
                         now_ns=_require_nonnegative_clock(clock),
+                        worker=worker,
+                        pending_slot=pending_slot,
+                        ledger=ledger,
+                        cleanup_timeout_s=args.connection_timeout_s,
                     )
                 underflow_started_ns = _require_nonnegative_clock(clock)
                 ledger.record_stall_source(ledger.steps, image)
@@ -985,7 +1059,7 @@ def _run_attempt_v4(
                     activation_now_ns=activation_now_ns,
                     underflow_started_ns=underflow_started_ns,
                 )
-                pending = None
+                pending_slot.clear()
                 if result is not None:
                     return result
                 try:
@@ -993,20 +1067,33 @@ def _run_attempt_v4(
                         _require_nonnegative_clock(clock)
                     )
                 except Exception as error:
-                    return ledger.policy_failure(
-                        error, now_ns=_require_nonnegative_clock(clock)
+                    return _return_policy_failure_v4(
+                        error,
+                        now_ns=_require_nonnegative_clock(clock),
+                        worker=worker,
+                        pending_slot=pending_slot,
+                        ledger=ledger,
+                        cleanup_timeout_s=args.connection_timeout_s,
                     )
                 if action_decision.underflow:
-                    return ledger.policy_failure(
+                    return _return_policy_failure_v4(
                         _eval.PolicyFailure("installed plan remains underflowed"),
                         now_ns=_require_nonnegative_clock(clock),
+                        worker=worker,
+                        pending_slot=pending_slot,
+                        ledger=ledger,
+                        cleanup_timeout_s=args.connection_timeout_s,
                     )
 
             action_started_ns = _require_nonnegative_clock(clock)
             if action_started_ns < due_now_ns:
-                return ledger.policy_failure(
+                return _return_policy_failure_v4(
                     _eval.PolicyFailure("action start precedes controller due time"),
                     now_ns=action_started_ns,
+                    worker=worker,
+                    pending_slot=pending_slot,
+                    ledger=ledger,
+                    cleanup_timeout_s=args.connection_timeout_s,
                 )
             try:
                 pacer.mark_action_started(action_started_ns)
@@ -1021,26 +1108,28 @@ def _run_attempt_v4(
             ledger.steps += 1
             if bool(done):
                 episode_finished_ns = _require_nonnegative_clock(clock)
+                pending = pending_slot.value
                 if pending is not None:
                     pending.trace.disposition = "abandoned"
                     try:
                         _cancel_generation_v4(worker, timeout_s=args.connection_timeout_s)
                     except Exception as error:
                         raise _eval.classify_exception(error, phase="policy_infer") from error
-                    pending = None
+                    pending_slot.clear()
                 return ledger.result(
                     success=True,
                     now_ns=episode_finished_ns,
                 )
 
         episode_finished_ns = _require_nonnegative_clock(clock)
+        pending = pending_slot.value
         if pending is not None:
             pending.trace.disposition = "abandoned"
             try:
                 _cancel_generation_v4(worker, timeout_s=args.connection_timeout_s)
             except Exception as error:
                 raise _eval.classify_exception(error, phase="policy_infer") from error
-            pending = None
+            pending_slot.clear()
         return ledger.result(
             success=False,
             now_ns=episode_finished_ns,
@@ -1048,7 +1137,10 @@ def _run_attempt_v4(
             error="maximum rollout steps reached",
         )
     except BaseException as primary_error:
-        if pending is not None:
+        pending = pending_slot.value
+        if pending is not None and pending.trace.disposition is None:
+            pending.trace.disposition = "abandoned"
+        if pending_slot.owns_job:
             _cancel_preserving_v4(
                 worker,
                 timeout_s=args.connection_timeout_s,
