@@ -1,4 +1,5 @@
 import dataclasses
+import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -20,16 +21,20 @@ class ManualClock:
     def __init__(self, now_ns=0):
         self.now_ns = now_ns
         self.waits = []
+        self._lock = threading.Lock()
 
     def monotonic_ns(self):
-        return self.now_ns
+        with self._lock:
+            return self.now_ns
 
     def wait_until_ns(self, deadline_ns):
-        self.waits.append(deadline_ns)
-        self.now_ns = max(self.now_ns, deadline_ns)
+        with self._lock:
+            self.waits.append(deadline_ns)
+            self.now_ns = max(self.now_ns, deadline_ns)
 
     def advance_to(self, target_ns):
-        self.now_ns = max(self.now_ns, target_ns)
+        with self._lock:
+            self.now_ns = max(self.now_ns, target_ns)
 
 
 def _metadata_payload(*, revision="same"):

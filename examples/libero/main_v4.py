@@ -346,6 +346,8 @@ def _validate_args_v4(
             or value <= 0
         ):
             raise ValueError("{} must be positive and finite".format(name))
+    if args.socket_close_timeout_s > args.worker_shutdown_timeout_s:
+        raise ValueError("socket_close_timeout_s must not exceed worker_shutdown_timeout_s")
     if args.control_freq != 20 or args.video_fps != 40:
         raise ValueError("schema-v4 execution requires exactly 20 Hz control and 40 fps video")
     if type(args.video_show_inference_waits) is not bool:
