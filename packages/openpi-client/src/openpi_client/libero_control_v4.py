@@ -205,10 +205,47 @@ class RequestIntentV4:
             "bsp_prefetch",
         ):
             raise ValueError("Unsupported request trigger")
-        scheduler_context = _freeze_value(self.scheduler_context)
-        for key, value in scheduler_context.items():
-            _require_nonbool_int(value, label="scheduler_context.{}".format(key), minimum=0)
+        if not isinstance(self.scheduler_context, Mapping):
+            raise ValueError("scheduler_context must be a mapping")
+        if any(not isinstance(key, str) for key in self.scheduler_context):
+            raise ValueError("scheduler_context keys must be strings")
+        scheduler_context = _FrozenDict(
+            {
+                key: _require_nonbool_int(
+                    value,
+                    label="scheduler_context.{}".format(key),
+                    minimum=0,
+                )
+                for key, value in self.scheduler_context.items()
+            }
+        )
+        expected_dispatch = {
+            "initial_plan": "blocking_initial",
+            "baseline_chunk_exhausted": "blocking_replan",
+            "rtc_launch": "background",
+            "bsp_curve_exhausted": "blocking_replan",
+            "bsp_prefetch": "background",
+        }[self.trigger]
+        if self.dispatch != expected_dispatch:
+            raise ValueError("request dispatch does not match its trigger")
+        if self.trigger in ("initial_plan", "baseline_chunk_exhausted", "bsp_curve_exhausted"):
+            if scheduler_context:
+                raise ValueError("request trigger requires an empty scheduler context")
+        elif self.trigger == "rtc_launch":
+            if set(scheduler_context) != {"s", "d"}:
+                raise ValueError("RTC launch context must contain exactly s and d")
+            start = scheduler_context["s"]
+            delay = scheduler_context["d"]
+            if not 8 <= start <= 16 or not 0 <= delay <= start or start + delay > 16:
+                raise ValueError("RTC launch context violates the action horizon")
+        else:
+            if set(scheduler_context) != {"remaining_plan_ns", "budget_ns"}:
+                raise ValueError("BSP prefetch context must contain exactly remaining time and budget")
+            if scheduler_context["remaining_plan_ns"] > scheduler_context["budget_ns"]:
+                raise ValueError("BSP prefetch remaining time must not exceed its budget")
         object.__setattr__(self, "scheduler_context", scheduler_context)
+        if not isinstance(self.request_overlay, Mapping):
+            raise ValueError("request_overlay must be a mapping")
         object.__setattr__(self, "request_overlay", _freeze_value(self.request_overlay))
 
 
@@ -220,9 +257,28 @@ class ActivationDecisionV4:
     def __post_init__(self) -> None:
         if self.activation not in ("initial", "blocking_replace", "immediate_swap"):
             raise ValueError("Unsupported plan activation")
-        activation_context = _freeze_value(self.activation_context)
-        for key, value in activation_context.items():
-            _require_nonbool_int(value, label="activation_context.{}".format(key), minimum=0)
+        if not isinstance(self.activation_context, Mapping):
+            raise ValueError("activation_context must be a mapping")
+        if any(not isinstance(key, str) for key in self.activation_context):
+            raise ValueError("activation_context keys must be strings")
+        activation_context = _FrozenDict(
+            {
+                key: _require_nonbool_int(
+                    value,
+                    label="activation_context.{}".format(key),
+                    minimum=0,
+                )
+                for key, value in self.activation_context.items()
+            }
+        )
+        if set(activation_context) == {"action_cursor"}:
+            if activation_context["action_cursor"] > 15:
+                raise ValueError("native activation action_cursor must be in 0..15")
+        elif set(activation_context) == {"curve_elapsed_ns"}:
+            if activation_context["curve_elapsed_ns"] != 0:
+                raise ValueError("BSP activation curve_elapsed_ns must be zero")
+        else:
+            raise ValueError("activation context must be exactly native or BSP")
         object.__setattr__(self, "activation_context", activation_context)
 
 
@@ -262,6 +318,7 @@ class NoCatchupPacer:
         self._clock = clock
         self._period_ns = _require_nonbool_int(period_ns, label="period_ns", minimum=1)
         self._next_deadline_ns = None  # type: Optional[int]
+        self._current_due_ns = None  # type: Optional[int]
         self._last_observed_ns = None  # type: Optional[int]
 
     @property
@@ -272,13 +329,16 @@ class NoCatchupPacer:
         while True:
             now_ns = self._read_clock()
             if self._next_deadline_ns is None or now_ns >= self._next_deadline_ns:
+                self._current_due_ns = (
+                    now_ns if self._next_deadline_ns is None else self._next_deadline_ns
+                )
                 return now_ns
             self._clock.wait_until_ns(self._next_deadline_ns)
 
     def mark_action_started(self, started_ns: int) -> int:
         started = _require_nonbool_int(started_ns, label="started_ns", minimum=0)
         if self._next_deadline_ns is None:
-            due_ns = self._read_clock()
+            due_ns = started if self._current_due_ns is None else self._current_due_ns
         else:
             due_ns = self._next_deadline_ns
         if started < due_ns:
@@ -286,6 +346,7 @@ class NoCatchupPacer:
         if self._last_observed_ns is not None and started < self._last_observed_ns:
             raise ValueError("action start must not move the monotonic clock backwards")
         self._last_observed_ns = started
+        self._current_due_ns = None
         self._next_deadline_ns = started + self._period_ns
         return self._next_deadline_ns
 
@@ -328,7 +389,7 @@ def _canonical_value(value: Any) -> Any:
         canonical = {}
         for key in sorted(value):
             canonical[key] = _canonical_value(value[key])
-        return canonical
+        return {"__mapping__": canonical}
     if isinstance(value, (list, tuple)):
         return [_canonical_value(item) for item in value]
     raise TypeError("unsupported canonical fingerprint value: {}".format(type(value).__name__))
@@ -828,9 +889,13 @@ def calibration_seed(namespace: str, phase: str, index: int) -> int:
     _require_nonempty_text(namespace, label="namespace")
     _require_nonempty_text(phase, label="phase")
     seed_index = _require_nonbool_int(index, label="seed index", minimum=0)
-    payload = canonical_json_bytes(
-        {"namespace": namespace, "phase": phase, "index": seed_index}
-    )
+    payload = json.dumps(
+        {"namespace": namespace, "phase": phase, "index": seed_index},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
     return int.from_bytes(hashlib.sha256(payload).digest()[:4], "big", signed=False)
 
 
@@ -1071,15 +1136,6 @@ def _run_probe(
         ) from error
     if getattr(outcome, "job", None) is not job:
         raise CalibrationPolicyError("Calibration worker returned an outcome for a different job")
-    error = getattr(outcome, "error", None)
-    if error is not None:
-        if not isinstance(error, Exception):
-            raise error
-        if _is_infrastructure_error(error):
-            raise _RetryCalibration() from error
-        raise CalibrationPolicyError(
-            "Calibration policy failed: {}: {}".format(type(error).__name__, error)
-        ) from error
     if getattr(outcome, "stale", False) or getattr(outcome, "cancelled", False):
         raise _RetryCalibration() from CalibrationInfrastructureError(
             "Calibration request became stale or cancelled"
@@ -1089,6 +1145,15 @@ def _run_probe(
         getattr(outcome, "connection", None),
         expected_fingerprint=expected_metadata_fingerprint,
     )
+    error = getattr(outcome, "error", None)
+    if error is not None:
+        if not isinstance(error, Exception):
+            raise error
+        if _is_infrastructure_error(error):
+            raise _RetryCalibration() from error
+        raise CalibrationPolicyError(
+            "Calibration policy failed: {}: {}".format(type(error).__name__, error)
+        ) from error
     submitted_ns = getattr(job, "submitted_monotonic_ns", None)
     completed_ns = getattr(outcome, "completed_monotonic_ns", None)
     try:
@@ -1144,12 +1209,14 @@ def _validate_rtc_calibration_response(response: Mapping[str, Any]) -> None:
 
 def _validate_bsp_calibration_response(response: Mapping[str, Any]) -> None:
     try:
-        _bsp_mapping_from_response(response)
+        validate_bsp_response(response)
     except (TypeError, ValueError) as error:
         raise CalibrationPolicyError("Malformed BSP calibration response") from error
 
 
 class ModeSchedulerV4:
+    _pending_intent: Optional[RequestIntentV4]
+
     def reset(self) -> None:
         raise NotImplementedError
 
@@ -1175,6 +1242,32 @@ class ModeSchedulerV4:
     def take_action(self, now_ns: int) -> ActionDecisionV4:
         raise NotImplementedError
 
+    def _reuse_pending(
+        self,
+        *,
+        request_in_flight: bool,
+    ) -> Optional[RequestIntentV4]:
+        if self._pending_intent is None:
+            return None
+        if request_in_flight:
+            return None
+        return self._pending_intent
+
+    def _set_pending(self, intent: RequestIntentV4) -> RequestIntentV4:
+        if self._pending_intent is not None:
+            raise RuntimeError("a scheduler request transition is already pending")
+        self._pending_intent = intent
+        return intent
+
+    def _require_pending(self, intent: RequestIntentV4) -> None:
+        if intent is not self._pending_intent:
+            raise ValueError("response intent does not match the pending scheduler transition")
+
+    def _complete_pending(self) -> None:
+        if self._pending_intent is None:
+            raise RuntimeError("scheduler has no pending transition to complete")
+        self._pending_intent = None
+
 
 class _BaselineSyncScheduler(ModeSchedulerV4):
     def __init__(self) -> None:
@@ -1184,6 +1277,7 @@ class _BaselineSyncScheduler(ModeSchedulerV4):
         self._chunk = None  # type: Optional[rtc.RtcActionChunk]
         self._cursor = 0
         self._installed_count = 0
+        self._pending_intent = None
 
     def maybe_request(
         self,
@@ -1195,6 +1289,9 @@ class _BaselineSyncScheduler(ModeSchedulerV4):
         _require_nonbool_int(now_ns, label="now_ns", minimum=0)
         _require_bool(at_due, label="at_due")
         _require_bool(request_in_flight, label="request_in_flight")
+        pending = self._reuse_pending(request_in_flight=request_in_flight)
+        if pending is not None or self._pending_intent is not None:
+            return pending
         if request_in_flight:
             return None
         if self._chunk is None:
@@ -1205,13 +1302,17 @@ class _BaselineSyncScheduler(ModeSchedulerV4):
             trigger = "baseline_chunk_exhausted"
         else:
             return None
-        return RequestIntentV4(
-            dispatch=dispatch,
-            trigger=trigger,
-            scheduler_context={},
-            request_overlay={
-                inference.RTC_REQUEST_KEY: {"schema_version": inference.RTC_SCHEMA_VERSION}
-            },
+        return self._set_pending(
+            RequestIntentV4(
+                dispatch=dispatch,
+                trigger=trigger,
+                scheduler_context={},
+                request_overlay={
+                    inference.RTC_REQUEST_KEY: {
+                        "schema_version": inference.RTC_SCHEMA_VERSION
+                    }
+                },
+            )
         )
 
     def install_response(
@@ -1223,11 +1324,13 @@ class _BaselineSyncScheduler(ModeSchedulerV4):
         control_step: int,
     ) -> ActivationDecisionV4:
         _validate_install_inputs(intent, now_ns=now_ns, control_step=control_step)
+        self._require_pending(intent)
         chunk = rtc.RtcActionChunk.from_response(response)
         self._chunk = chunk
         self._cursor = 0
         activation = "initial" if self._installed_count == 0 else "blocking_replace"
         self._installed_count += 1
+        self._complete_pending()
         return ActivationDecisionV4(
             activation=activation,
             activation_context={"action_cursor": 0},
@@ -1249,10 +1352,12 @@ class _RtcScheduler(ModeSchedulerV4):
         self._d_init = d_init
         self._plan = rtc.RtcPlan(d_init=d_init)
         self._installed_count = 0
+        self._pending_intent = None
 
     def reset(self) -> None:
         self._plan.reset(d_init=self._d_init)
         self._installed_count = 0
+        self._pending_intent = None
 
     def maybe_request(
         self,
@@ -1264,24 +1369,31 @@ class _RtcScheduler(ModeSchedulerV4):
         _require_nonbool_int(now_ns, label="now_ns", minimum=0)
         _require_bool(at_due, label="at_due")
         _require_bool(request_in_flight, label="request_in_flight")
+        pending = self._reuse_pending(request_in_flight=request_in_flight)
+        if pending is not None or self._pending_intent is not None:
+            return pending
         if request_in_flight:
             return None
         state = self._plan.state
         if state is rtc.RtcPlanState.BOOTSTRAP_REQUIRED:
-            return RequestIntentV4(
-                dispatch="blocking_initial",
-                trigger="initial_plan",
-                scheduler_context={},
-                request_overlay=self._plan.begin_bootstrap(),
+            return self._set_pending(
+                RequestIntentV4(
+                    dispatch="blocking_initial",
+                    trigger="initial_plan",
+                    scheduler_context={},
+                    request_overlay=self._plan.begin_bootstrap(),
+                )
             )
         if state is rtc.RtcPlanState.READY_TO_LAUNCH:
             overlay = self._plan.begin_guided()
             context = overlay[inference.RTC_REQUEST_KEY]
-            return RequestIntentV4(
-                dispatch="background",
-                trigger="rtc_launch",
-                scheduler_context={"s": context["s"], "d": context["d"]},
-                request_overlay=overlay,
+            return self._set_pending(
+                RequestIntentV4(
+                    dispatch="background",
+                    trigger="rtc_launch",
+                    scheduler_context={"s": context["s"], "d": context["d"]},
+                    request_overlay=overlay,
+                )
             )
         if state is rtc.RtcPlanState.INFEASIBLE:
             self._plan.begin_guided()
@@ -1296,9 +1408,11 @@ class _RtcScheduler(ModeSchedulerV4):
         control_step: int,
     ) -> ActivationDecisionV4:
         _validate_install_inputs(intent, now_ns=now_ns, control_step=control_step)
+        self._require_pending(intent)
         self._plan.install_result(response)
         activation = "initial" if self._installed_count == 0 else "immediate_swap"
         self._installed_count += 1
+        self._complete_pending()
         return ActivationDecisionV4(
             activation=activation,
             activation_context={"action_cursor": self._plan.cursor},
@@ -1324,6 +1438,7 @@ class _BspScheduler(ModeSchedulerV4):
     def reset(self) -> None:
         self._plan = bsp_spline.BspActionPlan()
         self._installed_count = 0
+        self._pending_intent = None
 
     def maybe_request(
         self,
@@ -1335,14 +1450,19 @@ class _BspScheduler(ModeSchedulerV4):
         now = _require_nonbool_int(now_ns, label="now_ns", minimum=0)
         _require_bool(at_due, label="at_due")
         _require_bool(request_in_flight, label="request_in_flight")
+        pending = self._reuse_pending(request_in_flight=request_in_flight)
+        if pending is not None or self._pending_intent is not None:
+            return pending
         if request_in_flight:
             return None
         if self._plan.spline is None:
-            return RequestIntentV4(
-                dispatch="blocking_initial",
-                trigger="initial_plan",
-                scheduler_context={},
-                request_overlay={},
+            return self._set_pending(
+                RequestIntentV4(
+                    dispatch="blocking_initial",
+                    trigger="initial_plan",
+                    scheduler_context={},
+                    request_overlay={},
+                )
             )
         if self._asynchronous:
             if self._budget_ns is None:
@@ -1350,23 +1470,29 @@ class _BspScheduler(ModeSchedulerV4):
             decision = self._plan.prefetch_decision(now, lead_time_ns=self._budget_ns)
             if not decision.should_prefetch:
                 return None
-            return RequestIntentV4(
-                dispatch="background",
-                trigger="bsp_prefetch",
-                scheduler_context={
-                    "remaining_plan_ns": decision.remaining_time_ns,
-                    "budget_ns": self._budget_ns,
-                },
-                request_overlay={},
+            return self._set_pending(
+                RequestIntentV4(
+                    dispatch="background",
+                    trigger="bsp_prefetch",
+                    scheduler_context={
+                        "remaining_plan_ns": decision.remaining_time_ns,
+                        "budget_ns": self._budget_ns,
+                    },
+                    request_overlay={},
+                )
             )
+        if not at_due:
+            return None
         sample = self._plan.sample(now)
         if not sample.underflow:
             return None
-        return RequestIntentV4(
-            dispatch="blocking_replan",
-            trigger="bsp_curve_exhausted",
-            scheduler_context={},
-            request_overlay={},
+        return self._set_pending(
+            RequestIntentV4(
+                dispatch="blocking_replan",
+                trigger="bsp_curve_exhausted",
+                scheduler_context={},
+                request_overlay={},
+            )
         )
 
     def install_response(
@@ -1378,15 +1504,19 @@ class _BspScheduler(ModeSchedulerV4):
         control_step: int,
     ) -> ActivationDecisionV4:
         now, _ = _validate_install_inputs(intent, now_ns=now_ns, control_step=control_step)
-        self._plan.install(_bsp_mapping_from_response(response), activation_time_ns=now)
+        self._require_pending(intent)
+        validate_bsp_response(response)
+        candidate_plan = bsp_spline.BspActionPlan()
+        candidate_plan.install(response["bsp"], activation_time_ns=now)
         if self._asynchronous:
             if self._budget_ns is None:
                 raise AssertionError("asynchronous BSP scheduler is missing its budget")
-            usable_duration_ns = self._plan.remaining_time_ns(now)
+            usable_duration_ns = candidate_plan.remaining_time_ns(now)
             if self._budget_ns >= usable_duration_ns:
                 raise BspBudgetError(
                     "BSP prefetch budget must be smaller than the curve usable duration"
                 )
+        self._plan.install(response["bsp"], activation_time_ns=now)
         if self._installed_count == 0:
             activation = "initial"
         elif self._asynchronous:
@@ -1394,6 +1524,7 @@ class _BspScheduler(ModeSchedulerV4):
         else:
             activation = "blocking_replace"
         self._installed_count += 1
+        self._complete_pending()
         return ActivationDecisionV4(
             activation=activation,
             activation_context={"curve_elapsed_ns": 0},
@@ -1469,9 +1600,24 @@ def _validate_install_inputs(
     return now, step
 
 
-def _bsp_mapping_from_response(response: Mapping[str, Any]) -> Mapping[str, Any]:
-    if not isinstance(response, Mapping) or "bsp" not in response:
-        raise ValueError("BSP policy response must contain a bsp sidecar")
-    sidecar = response["bsp"]
-    bsp_spline.BspSpline.from_response(sidecar)
-    return sidecar
+def validate_bsp_response(response: Mapping[str, Any]) -> bsp_spline.BspSpline:
+    """Validate the legacy eight actions and exact continuous BSP sidecar together."""
+    if not isinstance(response, Mapping) or "actions" not in response or "bsp" not in response:
+        raise ValueError("BSP policy response must contain legacy actions and a bsp sidecar")
+    try:
+        actions = np.asarray(response["actions"])
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("BSP legacy actions must be a numeric array") from error
+    if actions.shape != (8, 7):
+        raise ValueError("BSP legacy actions must have exact shape (8, 7)")
+    if not np.issubdtype(actions.dtype, np.number) or np.issubdtype(
+        actions.dtype, np.complexfloating
+    ):
+        raise ValueError("BSP legacy actions must be real numeric values")
+    if not np.isfinite(actions).all():
+        raise ValueError("BSP legacy actions must be finite")
+    with np.errstate(over="ignore", invalid="ignore"):
+        float32_actions = np.asarray(actions, dtype=np.float32)
+    if not np.isfinite(float32_actions).all():
+        raise ValueError("BSP legacy actions must be representable as finite float32")
+    return bsp_spline.BspSpline.from_response(response["bsp"])
