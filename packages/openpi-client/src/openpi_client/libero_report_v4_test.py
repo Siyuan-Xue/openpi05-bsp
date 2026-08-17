@@ -402,6 +402,11 @@ def test_new_loader_rejects_legacy_schemas(
         libero_report_v4.load_run_v4(run_dir)
 
 
+def test_legacy_loader_rejects_schema_v4(formal_baseline_run: Path) -> None:
+    with pytest.raises(libero_report.ComparisonError, match="schema"):
+        libero_report.load_run(formal_baseline_run)
+
+
 def test_load_run_v4_rejects_duplicate_json_keys(
     formal_baseline_run: Path,
     tmp_path: Path,
