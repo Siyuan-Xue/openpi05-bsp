@@ -1,5 +1,6 @@
 import copy
 import dataclasses
+import hashlib
 
 import numpy as np
 import pytest
@@ -778,37 +779,66 @@ def test_canonical_encoding_has_literal_float_bytes_and_c_contiguous_ndarray_gol
         "array": np.asarray([[1, 2], [3, 4]], dtype="<i2"),
     }
     expected = (
-        b'{"__mapping__":{"array":{"__ndarray__":{"dtype":"<i2",'
+        b'{"array":{"__ndarray__":{"dtype":"<i2",'
         b'"sha256":"ea99f710d9d0b8ba192295c969a63ed7ce8fc5743da20d2057fa2b6d2c404bfb",'
         b'"shape":[2,2]}},"bytes":{"__bytes__":"00ff"},'
-        b'"float":{"__float_hex__":"0x1.8000000000000p+0"}}}'
+        b'"float":{"__float_hex__":"0x1.8000000000000p+0"}}'
     )
 
     assert control.canonical_json_bytes(value) == expected
     assert control.canonical_fingerprint(value) == (
-        "4afa4d2be877c5232bb1a06e501768fc36689e69ff5d66b37ed3d3b054415245"
+        "0f8914286b06f6b96f42bf65fc4165f96fec7cca4a6b250e19d0279c5c4145f9"
     )
 
 
-def test_canonical_type_tags_cannot_collide_with_literal_user_mappings():
-    array = np.asarray([[1, 2], [3, 4]], dtype="<i2")
-    ndarray_literal = {
-        "__ndarray__": {
-            "dtype": "<i2",
-            "shape": [2, 2],
-            "sha256": "ea99f710d9d0b8ba192295c969a63ed7ce8fc5743da20d2057fa2b6d2c404bfb",
-        }
-    }
+@pytest.mark.parametrize(
+    "reserved_mapping",
+    [
+        {"__float_hex__": "0x1.8000000000000p+0"},
+        {"__float_hex__": "not-a-float-tag"},
+        {"__bytes__": "00ff"},
+        {"__bytes__": 2},
+        {
+            "__ndarray__": {
+                "dtype": "<i2",
+                "shape": [2, 2],
+                "sha256": (
+                    "ea99f710d9d0b8ba192295c969a63ed7ce8fc5743da20d2057fa2b6d2c404bfb"
+                ),
+            }
+        },
+        {"__ndarray__": "not-an-array-tag"},
+    ],
+)
+def test_canonical_encoder_fail_closes_every_single_reserved_tag_envelope(
+    reserved_mapping,
+):
+    with pytest.raises(ValueError, match="reserved canonical type tag"):
+        control.canonical_json_bytes(reserved_mapping)
 
-    assert control.canonical_json_bytes(1.5) != control.canonical_json_bytes(
-        {"__float_hex__": 1.5.hex()}
-    )
-    assert control.canonical_json_bytes(b"\x00\xff") != control.canonical_json_bytes(
-        {"__bytes__": "00ff"}
-    )
-    assert control.canonical_json_bytes(array) != control.canonical_json_bytes(
-        ndarray_literal
-    )
+
+@pytest.mark.parametrize(
+    ("ordinary_mapping", "expected"),
+    [
+        (
+            {"__float_hex__": "literal", "kind": "metadata"},
+            b'{"__float_hex__":"literal","kind":"metadata"}',
+        ),
+        (
+            {"__bytes__": "00ff", "length": 2},
+            b'{"__bytes__":"00ff","length":2}',
+        ),
+        (
+            {"__ndarray__": "literal", "source": "metadata"},
+            b'{"__ndarray__":"literal","source":"metadata"}',
+        ),
+    ],
+)
+def test_canonical_encoder_keeps_non_tag_shaped_reserved_key_mappings_ordinary(
+    ordinary_mapping,
+    expected,
+):
+    assert control.canonical_json_bytes(ordinary_mapping) == expected
 
 
 def test_seed_namespace_phase_index_and_checkpoint_identity_are_fingerprint_inputs():
@@ -829,6 +859,24 @@ def test_seed_namespace_phase_index_and_checkpoint_identity_are_fingerprint_inpu
         checkpoint,
         norm_hash="3" * 64,
     ).fingerprint
+
+
+def test_calibration_seed_uses_the_shared_canonical_json_encoder(monkeypatch):
+    encoded = b"canonical-seed-vector"
+    calls = []
+
+    def canonical_json_bytes(value):
+        calls.append(value)
+        return encoded
+
+    monkeypatch.setattr(control, "canonical_json_bytes", canonical_json_bytes)
+
+    assert control.calibration_seed("namespace", "measurement", 7) == int.from_bytes(
+        hashlib.sha256(encoded).digest()[:4],
+        "big",
+        signed=False,
+    )
+    assert calls == [{"namespace": "namespace", "phase": "measurement", "index": 7}]
 
 
 @pytest.mark.parametrize(

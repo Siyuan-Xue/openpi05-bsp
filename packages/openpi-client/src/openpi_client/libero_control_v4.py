@@ -24,6 +24,9 @@ CALIBRATION_INFRASTRUCTURE_RETRIES = 2
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _CODE_SHA_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _CONTAINER_DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
+# An exact single-key envelope is reserved regardless of payload validity; maps
+# with any additional key remain ordinary JSON mappings and cannot collide.
+_CANONICAL_TYPE_TAGS = frozenset(("__float_hex__", "__bytes__", "__ndarray__"))
 
 
 _EXECUTION_PARAMETERS_BY_NAME = {
@@ -386,10 +389,12 @@ def _canonical_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         if any(not isinstance(key, str) for key in value):
             raise ValueError("canonical mapping keys must be strings")
+        if len(value) == 1 and next(iter(value)) in _CANONICAL_TYPE_TAGS:
+            raise ValueError("mapping uses a reserved canonical type tag envelope")
         canonical = {}
         for key in sorted(value):
             canonical[key] = _canonical_value(value[key])
-        return {"__mapping__": canonical}
+        return canonical
     if isinstance(value, (list, tuple)):
         return [_canonical_value(item) for item in value]
     raise TypeError("unsupported canonical fingerprint value: {}".format(type(value).__name__))
@@ -889,13 +894,9 @@ def calibration_seed(namespace: str, phase: str, index: int) -> int:
     _require_nonempty_text(namespace, label="namespace")
     _require_nonempty_text(phase, label="phase")
     seed_index = _require_nonbool_int(index, label="seed index", minimum=0)
-    payload = json.dumps(
-        {"namespace": namespace, "phase": phase, "index": seed_index},
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
+    payload = canonical_json_bytes(
+        {"namespace": namespace, "phase": phase, "index": seed_index}
+    )
     return int.from_bytes(hashlib.sha256(payload).digest()[:4], "big", signed=False)
 
 
