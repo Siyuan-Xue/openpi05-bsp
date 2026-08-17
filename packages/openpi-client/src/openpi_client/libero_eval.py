@@ -35,6 +35,15 @@ _SUITE_ALIASES = {
     **{suite: suite for suite in SUPPORTED_SUITES},
 }
 _INFRASTRUCTURE_KINDS = ("simulator", "container", "network")
+_STALL_REASONS = (
+    _video_timing.STALL_REASON_SYNCHRONOUS_INFERENCE,
+    _video_timing.STALL_REASON_ASYNC_ACTION_UNDERFLOW,
+)
+_OVERLAY_TYPE_BY_STALL_REASON = {
+    _video_timing.STALL_REASON_SYNCHRONOUS_INFERENCE: "synchronous_inference",
+    _video_timing.STALL_REASON_ASYNC_ACTION_UNDERFLOW: "waiting_for_policy_actions",
+}
+_OVERLAY_TYPES = tuple(_OVERLAY_TYPE_BY_STALL_REASON.values())
 _REPLAN_ACTIONS = 8
 _ACTION_DIM = 7
 BSP_PARAMETERS = {
@@ -65,6 +74,22 @@ BSP_PARAMETERS = {
 def _require_exact_integer(value: Any, *, name: str, minimum: int = 0) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise ValueError(f"{name} must be an integer greater than or equal to {minimum}")
+    return value
+
+
+def _require_exact_string_tuple(
+    value: Any,
+    *,
+    name: str,
+    allowed_values: tuple[str, ...],
+    expected_count: int | None = None,
+) -> tuple[str, ...]:
+    if type(value) is not tuple:
+        raise TypeError(f"{name} must be a tuple")
+    if expected_count is not None and len(value) != expected_count:
+        raise ValueError(f"{name} must contain exactly {expected_count} entries")
+    if any(type(entry) is not str or entry not in allowed_values for entry in value):
+        raise ValueError(f"{name} contains an unsupported value")
     return value
 
 
@@ -766,6 +791,9 @@ class VideoArtifactAudit:
     video_show_inference_waits: bool
     measured_stall_count: int
     measured_control_stall_ns: int
+    measured_stall_reasons: tuple[str, ...]
+    included_stall_reasons: tuple[str, ...]
+    inserted_overlay_types: tuple[str, ...]
     encoded_fps: float
     encoded_frame_count: int
     encoded_duration_ns: int
@@ -776,6 +804,46 @@ class VideoArtifactAudit:
     warning: str | None = None
 
     def __post_init__(self) -> None:
+        _require_exact_string_tuple(
+            self.measured_stall_reasons,
+            name="video measured_stall_reasons",
+            allowed_values=_STALL_REASONS,
+            expected_count=self.measured_stall_count,
+        )
+        _require_exact_string_tuple(
+            self.included_stall_reasons,
+            name="video included_stall_reasons",
+            allowed_values=_STALL_REASONS,
+            expected_count=self.included_stall_count,
+        )
+        _require_exact_string_tuple(
+            self.inserted_overlay_types,
+            name="video inserted_overlay_types",
+            allowed_values=_OVERLAY_TYPES,
+        )
+        expected_reason = (
+            _video_timing.STALL_REASON_SYNCHRONOUS_INFERENCE
+            if self.inference_schedule == _video_timing.SYNCHRONOUS_INFERENCE_SCHEDULE
+            else _video_timing.STALL_REASON_ASYNC_ACTION_UNDERFLOW
+        )
+        if any(reason != expected_reason for reason in self.measured_stall_reasons):
+            raise ValueError("Measured stall reason does not match inference schedule")
+        if self.video_show_inference_waits:
+            if self.included_stall_reasons != self.measured_stall_reasons:
+                raise ValueError("Included stall reasons must match measured stall reasons")
+        elif self.included_stall_reasons or self.inserted_overlay_types:
+            raise ValueError("Disabled inference waits cannot include stalls or overlays")
+        expected_overlay_type = _OVERLAY_TYPE_BY_STALL_REASON[expected_reason]
+        if any(overlay_type != expected_overlay_type for overlay_type in self.inserted_overlay_types):
+            raise ValueError("Inserted overlay type does not match inference schedule")
+        if len(self.inserted_overlay_types) > self.included_stall_count:
+            raise ValueError("Inserted overlays cannot outnumber included stalls")
+        overlay_expected = self.video_show_inference_waits and (
+            self.planned.stall_frame_count > 0
+            or (self.artifact_padding_frame_count == 1 and bool(self.included_stall_reasons))
+        )
+        if bool(self.inserted_overlay_types) != overlay_expected:
+            raise ValueError("Inserted overlay audit does not match the encoded video timeline")
         _require_exact_integer(
             self.artifact_padding_frame_count,
             name="video artifact_padding_frame_count",
@@ -813,6 +881,9 @@ class VideoArtifactAudit:
             "video_show_inference_waits": self.video_show_inference_waits,
             "measured_stall_count": self.measured_stall_count,
             "measured_control_stall_ns": self.measured_control_stall_ns,
+            "measured_stall_reasons": list(self.measured_stall_reasons),
+            "included_stall_reasons": list(self.included_stall_reasons),
+            "inserted_overlay_types": list(self.inserted_overlay_types),
             "encoded_fps": self.encoded_fps,
             "encoded_frame_count": self.encoded_frame_count,
             "encoded_duration_ns": self.encoded_duration_ns,
@@ -917,6 +988,27 @@ def build_video_artifact_audit(
             f"{abs(deviation_ns) / _video_timing.NANOSECONDS_PER_SECOND:.6f} s "
             f"(tolerance {tolerance_ns / _video_timing.NANOSECONDS_PER_SECOND:.6f} s)"
         )
+    measured_stall_reasons = tuple(stall.reason for stall in measured_stalls)
+    included_stall_reasons = tuple(stall.reason for stall in included_stalls)
+    inserted_overlay_types = tuple(
+        _OVERLAY_TYPE_BY_STALL_REASON[stall.reason]
+        for stall, frame_count in zip(
+            included_stalls,
+            _video_timing.quantize_stall_frames(
+                included_stalls,
+                video_fps=planned.video_fps,
+            ),
+        )
+        if frame_count
+    )
+    if (
+        artifact_padding_frame_count
+        and video_show_inference_waits
+        and included_stall_reasons
+    ):
+        inserted_overlay_types = (
+            _OVERLAY_TYPE_BY_STALL_REASON[included_stall_reasons[0]],
+        )
     return VideoArtifactAudit(
         episode_id=episode_id,
         path=path,
@@ -925,6 +1017,9 @@ def build_video_artifact_audit(
         video_show_inference_waits=video_show_inference_waits,
         measured_stall_count=len(measured_stalls),
         measured_control_stall_ns=sum(stall.duration_ns for stall in measured_stalls),
+        measured_stall_reasons=measured_stall_reasons,
+        included_stall_reasons=included_stall_reasons,
+        inserted_overlay_types=inserted_overlay_types,
         encoded_fps=float(encoded_fps),
         encoded_frame_count=encoded_frame_count,
         encoded_duration_ns=encoded_duration_ns,
