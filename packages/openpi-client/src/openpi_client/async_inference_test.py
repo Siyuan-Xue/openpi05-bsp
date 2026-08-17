@@ -11,14 +11,26 @@ from openpi_client import msgpack_numpy
 
 
 class _GatePolicy:
-    def __init__(self, *, result=None, error=None, return_after_cancel=False, ignore_cancel=False):
+    def __init__(
+        self,
+        *,
+        result=None,
+        error=None,
+        return_after_cancel=False,
+        ignore_cancel=False,
+        close_gate=None,
+        close_error=None,
+    ):
         self.result = {"actions": [1, 2, 3]} if result is None else result
         self.error = error
         self.return_after_cancel = return_after_cancel
         self.ignore_cancel = ignore_cancel
+        self.close_gate = close_gate
+        self.close_error = close_error
         self.started = threading.Event()
         self.release = threading.Event()
         self.cancel_observed = threading.Event()
+        self.close_started = threading.Event()
         self.closed = threading.Event()
         self.payloads = []
         self.infer_thread_ids = []
@@ -47,7 +59,12 @@ class _GatePolicy:
 
     def close(self):
         self.close_thread_ids.append(threading.get_ident())
+        self.close_started.set()
+        if self.close_gate is not None:
+            self.close_gate.wait()
         self.closed.set()
+        if self.close_error is not None:
+            raise self.close_error
 
 
 class _Factory:
@@ -63,8 +80,9 @@ class _Factory:
 
 
 class _BlockingFactory:
-    def __init__(self, policy):
+    def __init__(self, policy, *, ignore_cancel=False):
         self.policy = policy
+        self.ignore_cancel = ignore_cancel
         self.started = threading.Event()
         self.release = threading.Event()
         self.cancel_observed = threading.Event()
@@ -73,11 +91,21 @@ class _BlockingFactory:
     def __call__(self, cancel_event):
         self.started.set()
         while not self.release.wait(0.005):
-            if cancel_event.is_set():
+            if cancel_event.is_set() and not self.ignore_cancel:
                 self.cancel_observed.set()
                 raise RuntimeError("fake connect retry cancelled")
         self.created_policies.append(self.policy)
         return self.policy
+
+
+class _FailingFactory:
+    def __init__(self, error):
+        self.error = error
+        self.started = threading.Event()
+
+    def __call__(self, cancel_event):
+        self.started.set()
+        raise self.error
 
 
 def _submit_when_ready(worker, observation):
@@ -89,6 +117,14 @@ def _submit_when_ready(worker, observation):
             if time.monotonic() >= deadline:
                 raise
             time.sleep(0.005)
+
+
+def _wait_for_stored_completion(worker, job):
+    with worker._condition:
+        assert worker._condition.wait_for(
+            lambda: job.request_id in worker._completions,
+            timeout=1.0,
+        )
 
 
 def test_poll_and_wait_do_not_complete_before_policy_gate_opens():
@@ -239,6 +275,59 @@ def test_current_generation_error_is_delivered_unchanged():
         worker.close()
 
 
+def test_current_generation_factory_error_is_delivered_unchanged():
+    error = ConnectionError("factory connect failed")
+    factory = _FailingFactory(error)
+    worker = async_inference.AsyncInferenceWorker(factory)
+    try:
+        job = worker.submit({"request": "connect error"})
+        assert factory.started.wait(1.0)
+        outcome = worker.wait(job, timeout=1.0)
+        assert outcome.error is error
+        assert outcome.result is None
+        assert not outcome.stale
+        assert not outcome.cancelled
+    finally:
+        worker.close()
+
+
+def test_reset_invalidates_completed_unpolled_result():
+    policy = _GatePolicy(result={"old": "result"})
+    policy.release.set()
+    worker = async_inference.AsyncInferenceWorker(_Factory([policy]))
+    try:
+        job = worker.submit({"generation": 0})
+        _wait_for_stored_completion(worker, job)
+
+        assert worker.reset_generation() == 1
+        outcome = worker.poll(job)
+        assert outcome.result is None
+        assert outcome.error is None
+        assert outcome.stale
+        assert outcome.cancelled
+    finally:
+        worker.close()
+
+
+def test_reset_invalidates_completed_unpolled_error():
+    error = OSError("old generation transport failure")
+    policy = _GatePolicy(error=error)
+    policy.release.set()
+    worker = async_inference.AsyncInferenceWorker(_Factory([policy]))
+    try:
+        job = worker.submit({"generation": 0})
+        _wait_for_stored_completion(worker, job)
+
+        assert worker.reset_generation() == 1
+        outcome = worker.poll(job)
+        assert outcome.result is None
+        assert outcome.error is None
+        assert outcome.stale
+        assert outcome.cancelled
+    finally:
+        worker.close()
+
+
 def test_reset_of_queued_job_is_stale_without_transport_use():
     policy = _GatePolicy()
     factory = _BlockingFactory(policy)
@@ -264,7 +353,8 @@ def test_reset_of_queued_job_is_stale_without_transport_use():
 
 
 def test_active_reset_retires_socket_before_fresh_generation_is_accepted():
-    old_policy = _GatePolicy()
+    close_gate = threading.Event()
+    old_policy = _GatePolicy(close_gate=close_gate)
     new_policy = _GatePolicy(result={"generation": 1})
     new_policy.release.set()
     factory = _Factory([old_policy, new_policy])
@@ -276,10 +366,11 @@ def test_active_reset_retires_socket_before_fresh_generation_is_accepted():
         assert worker.reset_generation() == 1
         stale = worker.wait(old_job, timeout=1.0)
         assert stale.stale and stale.cancelled
+        assert old_policy.close_started.wait(1.0)
         with pytest.raises(async_inference.BusyError):
             worker.submit({"too": "early"})
 
-        assert old_policy.cancel_observed.wait(1.0)
+        close_gate.set()
         assert old_policy.closed.wait(1.0)
         new_job = _submit_when_ready(worker, {"generation": 1})
         fresh = worker.wait(new_job, timeout=1.0)
@@ -287,6 +378,84 @@ def test_active_reset_retires_socket_before_fresh_generation_is_accepted():
         assert fresh.result == {"generation": 1}
         assert factory.cancel_events[0] is not factory.cancel_events[1]
         assert len(factory.cancel_events) == 2
+    finally:
+        close_gate.set()
+        old_policy.release.set()
+        new_policy.release.set()
+        worker.close()
+
+
+def test_repeated_reset_keeps_submit_blocked_until_owner_retires_old_socket():
+    close_gate = threading.Event()
+    old_policy = _GatePolicy(close_gate=close_gate)
+    new_policy = _GatePolicy(result={"generation": 2})
+    new_policy.release.set()
+    worker = async_inference.AsyncInferenceWorker(_Factory([old_policy, new_policy]))
+    try:
+        old_job = worker.submit({"generation": 0})
+        assert old_policy.started.wait(1.0)
+        assert worker.reset_generation() == 1
+        assert old_policy.close_started.wait(1.0)
+
+        assert worker.reset_generation() == 2
+        with pytest.raises(async_inference.BusyError):
+            worker.submit({"too": "early"})
+
+        close_gate.set()
+        assert old_policy.closed.wait(1.0)
+        new_job = _submit_when_ready(worker, {"generation": 2})
+        outcome = worker.wait(new_job, timeout=1.0)
+        assert new_job.generation == 2
+        assert outcome.result == {"generation": 2}
+        stale = worker.poll(old_job)
+        assert stale.stale and stale.cancelled
+        assert stale.result is None and stale.error is None
+    finally:
+        close_gate.set()
+        old_policy.release.set()
+        new_policy.release.set()
+        worker.close()
+
+
+def test_late_factory_candidate_after_reset_is_closed_without_inference():
+    policy = _GatePolicy()
+    factory = _BlockingFactory(policy, ignore_cancel=True)
+    worker = async_inference.AsyncInferenceWorker(factory)
+    try:
+        job = worker.submit({"request": "queued"})
+        assert factory.started.wait(1.0)
+        worker.reset_generation()
+
+        factory.release.set()
+        assert policy.closed.wait(1.0)
+        outcome = worker.poll(job)
+        assert outcome.stale and outcome.cancelled
+        assert outcome.result is None and outcome.error is None
+        assert policy.payloads == []
+    finally:
+        factory.release.set()
+        policy.release.set()
+        worker.close()
+
+
+def test_policy_close_failure_is_logged_and_failed_policy_is_never_reused(caplog):
+    close_error = OSError("close handshake failed")
+    old_policy = _GatePolicy(close_error=close_error)
+    new_policy = _GatePolicy(result={"fresh": True})
+    new_policy.release.set()
+    worker = async_inference.AsyncInferenceWorker(_Factory([old_policy, new_policy]))
+    try:
+        old_job = worker.submit({"generation": 0})
+        assert old_policy.started.wait(1.0)
+        worker.reset_generation()
+        assert old_policy.closed.wait(1.0)
+
+        new_job = _submit_when_ready(worker, {"generation": 1})
+        assert worker.wait(new_job, timeout=1.0).result == {"fresh": True}
+        assert worker.poll(old_job).stale
+        assert "Failed to close asynchronous inference policy" in caplog.text
+        assert len(old_policy.payloads) == 1
+        assert len(new_policy.payloads) == 1
     finally:
         old_policy.release.set()
         new_policy.release.set()
@@ -303,7 +472,9 @@ def test_late_result_after_active_reset_cannot_replace_stale_outcome():
         first_outcome = worker.wait(job, timeout=1.0)
         assert old_policy.closed.wait(1.0)
 
-        assert worker.poll(job) is first_outcome
+        repeated_outcome = worker.poll(job)
+        assert repeated_outcome == first_outcome
+        assert repeated_outcome.job is job
         assert first_outcome.result is None
         assert first_outcome.stale
         assert first_outcome.cancelled
@@ -316,16 +487,21 @@ def test_close_interrupts_policy_factory_retry_and_exits_worker_thread():
     policy = _GatePolicy()
     factory = _BlockingFactory(policy)
     worker = async_inference.AsyncInferenceWorker(factory, shutdown_timeout_s=0.5)
-    worker.submit({"request": "connect"})
-    assert factory.started.wait(1.0)
+    try:
+        worker.submit({"request": "connect"})
+        assert factory.started.wait(1.0)
 
-    worker.close()
-    worker.close()
+        worker.close()
+        worker.close()
 
-    assert factory.cancel_observed.is_set()
-    assert not worker._thread.daemon
-    assert not worker._thread.is_alive()
-    assert factory.created_policies == []
+        assert factory.cancel_observed.is_set()
+        assert not worker._thread.daemon
+        assert not worker._thread.is_alive()
+        assert factory.created_policies == []
+    finally:
+        factory.release.set()
+        policy.release.set()
+        worker.close()
 
 
 def test_close_interrupts_active_receive_and_owner_closes_socket():
@@ -333,27 +509,55 @@ def test_close_interrupts_active_receive_and_owner_closes_socket():
     factory = _Factory([policy])
     calling_thread_id = threading.get_ident()
     worker = async_inference.AsyncInferenceWorker(factory, shutdown_timeout_s=0.5)
-    worker.submit({"request": "active"})
-    assert policy.started.wait(1.0)
+    try:
+        worker.submit({"request": "active"})
+        assert policy.started.wait(1.0)
 
-    worker.close()
+        worker.close()
 
-    assert policy.cancel_observed.is_set()
-    assert policy.closed.is_set()
-    assert not worker._thread.is_alive()
-    assert factory.thread_ids == policy.infer_thread_ids == policy.close_thread_ids
-    assert factory.thread_ids[0] != calling_thread_id
+        assert policy.cancel_observed.is_set()
+        assert policy.closed.is_set()
+        assert not worker._thread.is_alive()
+        assert factory.thread_ids == policy.infer_thread_ids == policy.close_thread_ids
+        assert factory.thread_ids[0] != calling_thread_id
+    finally:
+        policy.release.set()
+        worker.close()
 
 
 def test_close_raises_timeout_if_non_daemon_owner_does_not_stop_in_bound():
     policy = _GatePolicy(ignore_cancel=True)
     worker = async_inference.AsyncInferenceWorker(_Factory([policy]), shutdown_timeout_s=0.01)
-    worker.submit({"request": "stuck"})
-    assert policy.started.wait(1.0)
+    try:
+        worker.submit({"request": "stuck"})
+        assert policy.started.wait(1.0)
 
-    with pytest.raises(TimeoutError, match="worker thread"):
+        with pytest.raises(TimeoutError, match="worker thread"):
+            worker.close()
+
+        policy.release.set()
+        worker.close()
+        assert not worker._thread.is_alive()
+    finally:
+        policy.release.set()
         worker.close()
 
-    policy.release.set()
-    worker.close()
-    assert not worker._thread.is_alive()
+
+def test_repeated_close_joins_even_after_owner_publishes_closed(monkeypatch):
+    worker = async_inference.AsyncInferenceWorker(_Factory([]), shutdown_timeout_s=0.5)
+    try:
+        worker.close()
+        join_calls = []
+        real_join = worker._thread.join
+
+        def recording_join(timeout):
+            join_calls.append(timeout)
+            return real_join(timeout)
+
+        monkeypatch.setattr(worker._thread, "join", recording_join)
+        worker.close()
+
+        assert join_calls == [0.5]
+        assert not worker._thread.is_alive()
+    finally:
+        worker.close()

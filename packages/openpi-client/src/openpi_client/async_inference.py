@@ -139,6 +139,7 @@ class AsyncInferenceWorker:
                 raise RuntimeError("Async inference worker is closed")
 
             self._generation += 1
+            self._invalidate_older_jobs_locked()
             if self._queued_job is not None:
                 self._publish_cancelled_locked(self._queued_job)
                 self._queued_job = None
@@ -153,9 +154,7 @@ class AsyncInferenceWorker:
     def close(self) -> None:
         """Stop and join the owner thread within the configured time bound."""
         with self._condition:
-            if self._closed:
-                return
-            if not self._closing:
+            if not self._closed and not self._closing:
                 self._closing = True
                 self._generation += 1
                 if self._queued_job is not None:
@@ -323,6 +322,16 @@ class AsyncInferenceWorker:
             self._completions[job.request_id] = _Completion(stale=True, cancelled=True)
             self._condition.notify_all()
 
+    def _invalidate_older_jobs_locked(self) -> None:
+        invalidated = False
+        for request_id, job_reference in list(self._jobs.items()):
+            job = job_reference()
+            if job is not None and job.generation < self._generation:
+                self._completions[request_id] = _Completion(stale=True, cancelled=True)
+                invalidated = True
+        if invalidated:
+            self._condition.notify_all()
+
     def _acknowledge_cancellation(self, cancel_event: threading.Event) -> None:
         with self._condition:
             if (
@@ -338,6 +347,11 @@ class AsyncInferenceWorker:
     def _retire_policy(
         policy: Optional[websocket_client_policy.WebsocketClientPolicy],
     ) -> Optional[websocket_client_policy.WebsocketClientPolicy]:
+        """Attempt owner-side close, then discard the policy even if close reports failure.
+
+        A close exception means transport cleanup isn't proven, so it is logged.
+        The failed policy is never reused; later work creates a distinct policy.
+        """
         if policy is not None:
             try:
                 policy.close()

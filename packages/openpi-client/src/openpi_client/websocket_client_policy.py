@@ -75,7 +75,10 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
                     metadata_response = self._recv_server_metadata(conn, deadline)
                     metadata = msgpack_numpy.unpackb(metadata_response)
                 except Exception:
-                    conn.close()
+                    try:
+                        conn.close()
+                    except BaseException:
+                        logging.exception("Failed to close websocket after metadata error")
                     raise
                 return conn, metadata
             except ConnectionRefusedError as error:

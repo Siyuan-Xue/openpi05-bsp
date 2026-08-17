@@ -12,8 +12,9 @@ class _FakePacker:
 
 
 class _FakeWebsocket:
-    def __init__(self, response=b"response"):
+    def __init__(self, response=b"response", close_error=None):
         self.response = response
+        self.close_error = close_error
         self.sent = []
         self.recv_calls = []
         self.close_calls = 0
@@ -29,6 +30,8 @@ class _FakeWebsocket:
 
     def close(self):
         self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
 
 
 def _client(timeout):
@@ -208,6 +211,45 @@ def test_metadata_receive_poll_is_interrupted_by_cancel_event(monkeypatch):
         )
 
     assert connection.recv_calls == [((), {"timeout": 0.05})]
+    assert connection.close_calls == 1
+
+
+def test_metadata_receive_error_is_not_replaced_by_cleanup_close_error(monkeypatch):
+    receive_error = OSError("metadata receive failed")
+    close_error = RuntimeError("cleanup close failed")
+    connection = _FakeWebsocket(response=receive_error, close_error=close_error)
+    monkeypatch.setattr(
+        websocket_client_policy.websockets.sync.client,
+        "connect",
+        lambda *args, **kwargs: connection,
+    )
+
+    with pytest.raises(OSError) as error_info:
+        websocket_client_policy.WebsocketClientPolicy("127.0.0.1", 8000)
+
+    assert error_info.value is receive_error
+    assert connection.close_calls == 1
+
+
+def test_metadata_decode_error_is_not_replaced_by_cleanup_close_error(monkeypatch):
+    decode_error = ValueError("metadata decode failed")
+    close_error = RuntimeError("cleanup close failed")
+    connection = _FakeWebsocket(response=b"invalid metadata", close_error=close_error)
+    monkeypatch.setattr(
+        websocket_client_policy.websockets.sync.client,
+        "connect",
+        lambda *args, **kwargs: connection,
+    )
+    monkeypatch.setattr(
+        websocket_client_policy.msgpack_numpy,
+        "unpackb",
+        lambda response: (_ for _ in ()).throw(decode_error),
+    )
+
+    with pytest.raises(ValueError) as error_info:
+        websocket_client_policy.WebsocketClientPolicy("127.0.0.1", 8000)
+
+    assert error_info.value is decode_error
     assert connection.close_calls == 1
 
 
