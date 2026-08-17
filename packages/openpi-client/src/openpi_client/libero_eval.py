@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping, Sequence
 import dataclasses
 import hashlib
+import json
 import math
 from pathlib import Path
 import re
