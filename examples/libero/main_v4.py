@@ -1,6 +1,6 @@
 """Schema-v4 LIBERO evaluation with calibrated single-owner inference."""
 
-# ruff: noqa: UP006, UP045 -- the simulator client runs Python 3.8.
+# ruff: noqa: SLF001, UP006, UP045 -- Python 3.8 entrypoint reuses narrow v3 helpers.
 
 from __future__ import annotations
 

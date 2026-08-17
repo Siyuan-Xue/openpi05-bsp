@@ -1,3 +1,5 @@
+# ruff: noqa: SLF001 -- focused integration tests exercise private controller seams.
+
 import dataclasses
 import threading
 from types import SimpleNamespace
