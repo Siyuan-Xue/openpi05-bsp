@@ -302,11 +302,14 @@ def _validate_args_v4(
         "libero_10": "libero_10",
         "10": "libero_10",
     }
-    if args.task_suite_name == "all":
+    if not isinstance(args.task_suite_name, str):
+        raise ValueError("task_suite_name must be a string")
+    suite_selection = args.task_suite_name.strip().lower()
+    if suite_selection == "all":
         suites = tuple(_eval.SUPPORTED_SUITES)
     else:
         try:
-            suites = (suite_aliases[args.task_suite_name],)
+            suites = (suite_aliases[suite_selection],)
         except (KeyError, TypeError) as error:
             raise ValueError("unsupported LIBERO suite selection") from error
     if args.task_ids is None:
@@ -348,7 +351,14 @@ def _validate_args_v4(
             raise ValueError("{} must be positive and finite".format(name))
     if args.socket_close_timeout_s > args.worker_shutdown_timeout_s:
         raise ValueError("socket_close_timeout_s must not exceed worker_shutdown_timeout_s")
-    if args.control_freq != 20 or args.video_fps != 40:
+    if (
+        isinstance(args.control_freq, bool)
+        or not isinstance(args.control_freq, int)
+        or args.control_freq != 20
+        or isinstance(args.video_fps, bool)
+        or not isinstance(args.video_fps, int)
+        or args.video_fps != 40
+    ):
         raise ValueError("schema-v4 execution requires exactly 20 Hz control and 40 fps video")
     if type(args.video_show_inference_waits) is not bool:
         raise ValueError("video_show_inference_waits must be boolean")
@@ -498,6 +508,11 @@ def _submit_request_v4(
     source_frame: Any,
     ledger: _AttemptLedgerV4,
 ) -> _PendingRequestV4:
+    for reserved_key in (_inference.INFERENCE_SEED_KEY, _inference.RTC_REQUEST_KEY):
+        if reserved_key in prepared_observation:
+            raise _eval.PolicyFailure(
+                "prepared observation contains reserved key {}".format(reserved_key)
+            )
     request_id = len(ledger.requests)
     flow_seed = _eval.stable_replan_seed(ledger.eval_seed, ledger.identity, request_id)
     request = dict(prepared_observation)
