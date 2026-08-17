@@ -16,6 +16,7 @@ class _GatePolicy:
         *,
         result=None,
         error=None,
+        metadata=None,
         return_after_cancel=False,
         ignore_cancel=False,
         close_gate=None,
@@ -23,6 +24,7 @@ class _GatePolicy:
     ):
         self.result = {"actions": [1, 2, 3]} if result is None else result
         self.error = error
+        self.metadata = {"server": "test"} if metadata is None else metadata
         self.return_after_cancel = return_after_cancel
         self.ignore_cancel = ignore_cancel
         self.close_gate = close_gate
@@ -33,10 +35,15 @@ class _GatePolicy:
         self.close_started = threading.Event()
         self.closed = threading.Event()
         self.payloads = []
+        self.metadata_thread_ids = []
         self.infer_thread_ids = []
         self.close_thread_ids = []
         self.active_calls = 0
         self.max_active_calls = 0
+
+    def get_server_metadata(self):
+        self.metadata_thread_ids.append(threading.get_ident())
+        return self.metadata
 
     def infer_packed(self, payload, *, cancel_event=None, recv_poll_interval_s=None):
         self.infer_thread_ids.append(threading.get_ident())
@@ -108,15 +115,31 @@ class _FailingFactory:
         raise self.error
 
 
-def _submit_when_ready(worker, observation):
-    deadline = time.monotonic() + 1.0
-    while True:
-        try:
-            return worker.submit(observation)
-        except async_inference.BusyError:
-            if time.monotonic() >= deadline:
-                raise
-            time.sleep(0.005)
+class _ManualMonotonicNs:
+    def __init__(self, initial_ns=0):
+        self._condition = threading.Condition()
+        self._now_ns = initial_ns
+        self._call_count = 0
+
+    def __call__(self):
+        with self._condition:
+            self._call_count += 1
+            self._condition.notify_all()
+            return self._now_ns
+
+    def set(self, now_ns):
+        with self._condition:
+            self._now_ns = now_ns
+            self._condition.notify_all()
+
+    def wait_for_call_count(self, count, timeout=1.0):
+        with self._condition:
+            return self._condition.wait_for(lambda: self._call_count >= count, timeout=timeout)
+
+    @property
+    def call_count(self):
+        with self._condition:
+            return self._call_count
 
 
 def _wait_for_stored_completion(worker, job):
@@ -125,6 +148,205 @@ def _wait_for_stored_completion(worker, job):
             lambda: job.request_id in worker._completions,
             timeout=1.0,
         )
+
+
+def test_connect_reuses_live_snapshot_and_reconnects_after_retirement():
+    first_policy = _GatePolicy(metadata={"server": "one"})
+    second_policy = _GatePolicy(metadata={"server": "one"})
+    factory = _Factory([first_policy, second_policy])
+    worker = async_inference.AsyncInferenceWorker(factory)
+    try:
+        first = worker.connect(timeout=1.0)
+        repeated = worker.connect(timeout=1.0)
+
+        assert repeated is first
+        assert msgpack_numpy.unpackb(first.metadata_payload) == {"server": "one"}
+        assert len(factory.cancel_events) == 1
+
+        generation = worker.reset_generation()
+        worker.wait_until_ready(generation, timeout=1.0)
+        second = worker.connect(timeout=1.0)
+
+        assert second.connection_id == first.connection_id + 1
+        assert second is not first
+        assert msgpack_numpy.unpackb(second.metadata_payload) == {"server": "one"}
+        assert len(factory.cancel_events) == 2
+    finally:
+        first_policy.release.set()
+        second_policy.release.set()
+        worker.close()
+
+
+def test_connect_publishes_defensive_metadata_snapshot_read_by_owner():
+    metadata = {
+        "nested": {"version": 1},
+        "array": np.array([1, 2], dtype=np.int32),
+    }
+    policy = _GatePolicy(metadata=metadata)
+    factory = _Factory([policy])
+    calling_thread_id = threading.get_ident()
+    worker = async_inference.AsyncInferenceWorker(factory)
+    try:
+        connection = worker.connect(timeout=1.0)
+        metadata["nested"]["version"] = 99
+        metadata["array"][:] = 0
+
+        assert isinstance(connection.metadata_payload, bytes)
+        unpacked = msgpack_numpy.unpackb(connection.metadata_payload)
+        assert unpacked["nested"] == {"version": 1}
+        np.testing.assert_array_equal(unpacked["array"], np.array([1, 2], dtype=np.int32))
+        assert factory.thread_ids == policy.metadata_thread_ids
+        assert factory.thread_ids[0] != calling_thread_id
+    finally:
+        policy.release.set()
+        worker.close()
+
+
+def test_queued_job_and_connect_converge_on_same_owner_connection():
+    policy = _GatePolicy(metadata={"server": "queued"}, result={"answer": 7})
+    policy.release.set()
+    factory = _BlockingFactory(policy)
+    worker = async_inference.AsyncInferenceWorker(factory)
+    connect_result = []
+    connect_finished = threading.Event()
+
+    def connect():
+        try:
+            connect_result.append(worker.connect(timeout=1.0))
+        finally:
+            connect_finished.set()
+
+    try:
+        job = worker.submit({"request": "queued"})
+        assert factory.started.wait(1.0)
+        connect_thread = threading.Thread(target=connect)
+        connect_thread.start()
+
+        factory.release.set()
+        assert connect_finished.wait(1.0)
+        connect_thread.join()
+        outcome = worker.wait(job, timeout=1.0)
+
+        assert len(connect_result) == 1
+        assert outcome.connection is connect_result[0]
+        assert outcome.result == {"answer": 7}
+        assert len(factory.created_policies) == 1
+    finally:
+        factory.release.set()
+        policy.release.set()
+        worker.close()
+
+
+def test_queued_job_error_and_connect_share_snapshot_even_after_retirement():
+    error = OSError("inference failed")
+    policy = _GatePolicy(metadata={"server": "queued-error"}, error=error)
+    policy.release.set()
+    factory = _BlockingFactory(policy)
+    worker = async_inference.AsyncInferenceWorker(factory)
+    connect_result = []
+    connect_finished = threading.Event()
+
+    def connect():
+        try:
+            connect_result.append(worker.connect(timeout=1.0))
+        finally:
+            connect_finished.set()
+
+    try:
+        job = worker.submit({"request": "queued-error"})
+        assert factory.started.wait(1.0)
+        connect_thread = threading.Thread(target=connect)
+        connect_thread.start()
+
+        factory.release.set()
+        assert connect_finished.wait(1.0)
+        connect_thread.join()
+        outcome = worker.wait(job, timeout=1.0)
+
+        assert outcome.error is error
+        assert len(connect_result) == 1
+        assert outcome.connection is connect_result[0]
+        assert policy.closed.wait(1.0)
+    finally:
+        factory.release.set()
+        policy.release.set()
+        worker.close()
+
+
+def test_submit_and_completion_timestamps_use_injected_clock_at_exact_seams():
+    clock = _ManualMonotonicNs(11)
+    policy = _GatePolicy(metadata={"server": "timed"}, result={"answer": 7})
+    worker = async_inference.AsyncInferenceWorker(_Factory([policy]), monotonic_ns=clock)
+    try:
+        job = worker.submit({"request": "timed"})
+        assert job.submitted_monotonic_ns == 11
+        assert policy.started.wait(1.0)
+
+        clock.set(47)
+        with worker._condition:
+            policy.release.set()
+            assert clock.wait_for_call_count(2)
+            assert job.request_id not in worker._completions
+        outcome = worker.wait(job, timeout=1.0)
+
+        assert outcome.completed_monotonic_ns == 47
+        assert outcome.connection is not None
+        assert msgpack_numpy.unpackb(outcome.connection.metadata_payload) == {"server": "timed"}
+        assert clock.call_count == 2
+    finally:
+        policy.release.set()
+        worker.close()
+
+
+def test_current_generation_inference_error_carries_timestamp_and_connection():
+    clock = _ManualMonotonicNs(3)
+    error = OSError("transport failed")
+    policy = _GatePolicy(metadata={"server": "error"}, error=error)
+    worker = async_inference.AsyncInferenceWorker(_Factory([policy]), monotonic_ns=clock)
+    try:
+        job = worker.submit({"request": "error"})
+        assert policy.started.wait(1.0)
+        clock.set(29)
+        policy.release.set()
+
+        outcome = worker.wait(job, timeout=1.0)
+        assert outcome.error is error
+        assert outcome.completed_monotonic_ns == 29
+        assert outcome.connection is not None
+        assert msgpack_numpy.unpackb(outcome.connection.metadata_payload) == {"server": "error"}
+    finally:
+        policy.release.set()
+        worker.close()
+
+
+def test_wait_until_ready_acknowledges_retirement_without_starting_connection():
+    policy = _GatePolicy()
+    factory = _Factory([policy])
+    worker = async_inference.AsyncInferenceWorker(factory)
+    try:
+        generation = worker.reset_generation()
+        worker.wait_until_ready(generation, timeout=1.0)
+
+        assert factory.cancel_events == []
+        job = worker.submit({"generation": generation})
+        policy.release.set()
+        assert worker.wait(job, timeout=1.0).result == policy.result
+    finally:
+        policy.release.set()
+        worker.close()
+
+
+def test_wait_until_ready_rejects_generation_invalidated_by_later_reset():
+    worker = async_inference.AsyncInferenceWorker(_Factory([]))
+    try:
+        old_generation = worker.reset_generation()
+        current_generation = worker.reset_generation()
+
+        with pytest.raises(ValueError, match="generation"):
+            worker.wait_until_ready(old_generation, timeout=1.0)
+        worker.wait_until_ready(current_generation, timeout=1.0)
+    finally:
+        worker.close()
 
 
 def test_poll_and_wait_do_not_complete_before_policy_gate_opens():
@@ -269,6 +491,8 @@ def test_current_generation_error_is_delivered_unchanged():
         outcome = worker.wait(job, timeout=1.0)
         assert outcome.error is error
         assert outcome.result is None
+        assert isinstance(outcome.completed_monotonic_ns, int)
+        assert outcome.connection is not None
         assert not outcome.stale
         assert not outcome.cancelled
     finally:
@@ -285,6 +509,8 @@ def test_current_generation_factory_error_is_delivered_unchanged():
         outcome = worker.wait(job, timeout=1.0)
         assert outcome.error is error
         assert outcome.result is None
+        assert outcome.completed_monotonic_ns is None
+        assert outcome.connection is None
         assert not outcome.stale
         assert not outcome.cancelled
     finally:
@@ -402,20 +628,37 @@ def test_active_reset_retires_socket_before_fresh_generation_is_accepted():
     try:
         old_job = worker.submit({"generation": 0})
         assert old_policy.started.wait(1.0)
+        old_connection = worker.connect(timeout=1.0)
 
-        assert worker.reset_generation() == 1
+        generation = worker.reset_generation()
+        assert generation == 1
         stale = worker.wait(old_job, timeout=1.0)
         assert stale.stale and stale.cancelled
         assert old_policy.close_started.wait(1.0)
         with pytest.raises(async_inference.BusyError):
             worker.submit({"too": "early"})
+        with pytest.raises(TimeoutError, match="generation"):
+            worker.wait_until_ready(generation, timeout=0)
+
+        ready = threading.Event()
+
+        def wait_until_ready():
+            worker.wait_until_ready(generation, timeout=1.0)
+            ready.set()
+
+        ready_thread = threading.Thread(target=wait_until_ready)
+        ready_thread.start()
+        assert not ready.is_set()
 
         close_gate.set()
         assert old_policy.closed.wait(1.0)
-        new_job = _submit_when_ready(worker, {"generation": 1})
+        assert ready.wait(1.0)
+        ready_thread.join()
+        new_job = worker.submit({"generation": 1})
         fresh = worker.wait(new_job, timeout=1.0)
         assert new_job.generation == 1
         assert fresh.result == {"generation": 1}
+        assert fresh.connection.connection_id == old_connection.connection_id + 1
         assert factory.cancel_events[0] is not factory.cancel_events[1]
         assert len(factory.cancel_events) == 2
     finally:
@@ -443,7 +686,8 @@ def test_repeated_reset_keeps_submit_blocked_until_owner_retires_old_socket():
 
         close_gate.set()
         assert old_policy.closed.wait(1.0)
-        new_job = _submit_when_ready(worker, {"generation": 2})
+        worker.wait_until_ready(2, timeout=1.0)
+        new_job = worker.submit({"generation": 2})
         outcome = worker.wait(new_job, timeout=1.0)
         assert new_job.generation == 2
         assert outcome.result == {"generation": 2}
@@ -478,28 +722,54 @@ def test_late_factory_candidate_after_reset_is_closed_without_inference():
         worker.close()
 
 
-def test_policy_close_failure_is_logged_and_failed_policy_is_never_reused(caplog):
+def test_policy_close_failure_is_fatal_and_observable_on_readiness_and_close():
     close_error = OSError("close handshake failed")
     old_policy = _GatePolicy(close_error=close_error)
-    new_policy = _GatePolicy(result={"fresh": True})
-    new_policy.release.set()
-    worker = async_inference.AsyncInferenceWorker(_Factory([old_policy, new_policy]))
+    worker = async_inference.AsyncInferenceWorker(_Factory([old_policy]))
     try:
         old_job = worker.submit({"generation": 0})
         assert old_policy.started.wait(1.0)
-        worker.reset_generation()
+        generation = worker.reset_generation()
         assert old_policy.closed.wait(1.0)
 
-        new_job = _submit_when_ready(worker, {"generation": 1})
-        assert worker.wait(new_job, timeout=1.0).result == {"fresh": True}
         assert worker.poll(old_job).stale
-        assert "Failed to close asynchronous inference policy" in caplog.text
+        with pytest.raises(OSError, match="close handshake failed"):
+            worker.wait_until_ready(generation, timeout=1.0)
+        with pytest.raises(OSError, match="close handshake failed"):
+            worker.connect(timeout=1.0)
+        with pytest.raises(OSError, match="close handshake failed"):
+            worker.close()
+        with pytest.raises(OSError, match="close handshake failed"):
+            worker.close()
         assert len(old_policy.payloads) == 1
-        assert len(new_policy.payloads) == 1
     finally:
         old_policy.release.set()
-        new_policy.release.set()
-        worker.close()
+        try:
+            worker.close()
+        except OSError:
+            pass
+
+
+def test_close_surfaces_owner_policy_close_failure_idempotently():
+    close_error = OSError("close failed during shutdown")
+    policy = _GatePolicy(close_error=close_error)
+    calling_thread_id = threading.get_ident()
+    worker = async_inference.AsyncInferenceWorker(_Factory([policy]))
+    try:
+        worker.connect(timeout=1.0)
+
+        with pytest.raises(OSError, match="close failed during shutdown"):
+            worker.close()
+        with pytest.raises(OSError, match="close failed during shutdown"):
+            worker.close()
+
+        assert len(policy.close_thread_ids) == 1
+        assert policy.close_thread_ids[0] != calling_thread_id
+    finally:
+        try:
+            worker.close()
+        except OSError:
+            pass
 
 
 def test_late_result_after_active_reset_cannot_replace_stale_outcome():
@@ -558,7 +828,12 @@ def test_close_interrupts_active_receive_and_owner_closes_socket():
         assert policy.cancel_observed.is_set()
         assert policy.closed.is_set()
         assert not worker._thread.is_alive()
-        assert factory.thread_ids == policy.infer_thread_ids == policy.close_thread_ids
+        assert (
+            factory.thread_ids
+            == policy.metadata_thread_ids
+            == policy.infer_thread_ids
+            == policy.close_thread_ids
+        )
         assert factory.thread_ids[0] != calling_thread_id
     finally:
         policy.release.set()
