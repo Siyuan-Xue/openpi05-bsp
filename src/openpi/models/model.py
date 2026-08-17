@@ -257,6 +257,16 @@ class BaseModel(nnx.Module, abc.ABC):
     @abc.abstractmethod
     def sample_actions(self, rng: at.KeyArrayLike, observation: Observation, **kwargs) -> Actions: ...
 
+    @property
+    def supports_rtc(self) -> bool:
+        """Whether this model implements the fixed baseline RTC sampling contract."""
+        return False
+
+    def sample_actions_rtc(self, rng: at.KeyArrayLike, observation: Observation, **kwargs) -> Actions:
+        """Optional RTC hook. Implementations must opt in through ``supports_rtc``."""
+        del rng, observation, kwargs
+        raise NotImplementedError("This model does not support RTC sampling")
+
 
 def restore_params(
     params_path: pathlib.Path | str,

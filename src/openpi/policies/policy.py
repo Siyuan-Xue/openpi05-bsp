@@ -15,6 +15,7 @@ from typing_extensions import override
 
 from openpi import transforms as _transforms
 from openpi.models import model as _model
+from openpi.models import pi0 as _pi0
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
 
@@ -31,6 +32,32 @@ def _select_jax_inference_rng(
     return next_rng, sample_rng
 
 
+def _inference_capabilities(
+    *,
+    action_representation: str,
+    model_action_horizon: int,
+    model_action_dim: int,
+    has_rtc_hook: bool,
+) -> dict[str, Any]:
+    if (
+        action_representation == "native"
+        and (model_action_horizon, model_action_dim) == (16, 32)
+        and has_rtc_hook
+    ):
+        supported_protocols = ["baseline_h16_n5_v1", "baseline_rtc_h16_v1"]
+    elif action_representation == "bsp":
+        supported_protocols = ["bsp_spline_h8_v1"]
+    else:
+        supported_protocols = []
+    return {
+        "schema_version": 1,
+        "action_representation": action_representation,
+        "model_action_horizon": model_action_horizon,
+        "model_action_dim": model_action_dim,
+        "supported_protocols": supported_protocols,
+    }
+
+
 class Policy(BasePolicy):
     def __init__(
         self,
@@ -41,6 +68,7 @@ class Policy(BasePolicy):
         output_transforms: Sequence[_transforms.DataTransformFn] = (),
         sample_kwargs: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
+        action_representation: str,
     ):
         """Initialize the Policy.
 
@@ -51,13 +79,33 @@ class Policy(BasePolicy):
             output_transforms: Output data transformations to apply after inference.
             sample_kwargs: Additional keyword arguments to pass to model.sample_actions.
             metadata: Additional metadata to store with the policy.
+            action_representation: Explicitly identifies native actions versus BSP parameters.
         """
+        if action_representation not in ("native", "bsp"):
+            raise ValueError("action_representation must be 'native' or 'bsp'")
+        metadata = dict(metadata or {})
+        if _inference.INFERENCE_CAPABILITIES_KEY in metadata:
+            raise ValueError(f"{_inference.INFERENCE_CAPABILITIES_KEY} is reserved policy metadata")
+
         self._model = model
         self._input_transform = _transforms.compose(transforms)
         self._output_transform = _transforms.compose(output_transforms)
         self._sample_kwargs = sample_kwargs or {}
-        self._metadata = metadata or {}
         self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+        self._action_representation = action_representation
+        self._model_action_horizon = int(model.action_horizon)
+        self._model_action_dim = int(model.action_dim)
+        has_rtc_hook = bool(getattr(model, "supports_rtc", False)) and callable(
+            getattr(model, "sample_actions_rtc", None)
+        )
+        self._sample_actions_rtc = nnx_utils.module_jit(model.sample_actions_rtc) if has_rtc_hook else None
+        metadata[_inference.INFERENCE_CAPABILITIES_KEY] = _inference_capabilities(
+            action_representation=action_representation,
+            model_action_horizon=self._model_action_horizon,
+            model_action_dim=self._model_action_dim,
+            has_rtc_hook=has_rtc_hook,
+        )
+        self._metadata = metadata
         self._rng = rng or jax.random.key(0)
 
     @override
@@ -65,6 +113,9 @@ class Policy(BasePolicy):
         # The seed belongs to the request envelope, not the model observation.
         # pop_inference_seed copies the top-level mapping so the caller is not mutated.
         inputs, inference_seed = _inference.pop_inference_seed(obs)
+        inputs, rtc_context = _inference.pop_rtc_context(inputs)
+        if rtc_context is not None:
+            self._validate_rtc_capability()
         # Make a tree copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, inputs)
         inputs = self._input_transform(inputs)
@@ -80,20 +131,69 @@ class Policy(BasePolicy):
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
 
+        sample_actions = self._sample_actions
+        if rtc_context is not None:
+            unsupported_kwargs = set(sample_kwargs) - {"num_steps", "noise"}
+            if unsupported_kwargs:
+                names = ", ".join(sorted(unsupported_kwargs))
+                raise ValueError(f"RTC does not support configured sampler kwargs: {names}")
+            if rtc_context.is_bootstrap:
+                sample_kwargs["num_steps"] = _pi0.RTC_NUM_STEPS
+            else:
+                assert rtc_context.previous_model_actions is not None
+                assert rtc_context.s is not None
+                assert rtc_context.d is not None
+                target, weights = _pi0.make_rtc_target_and_weights(
+                    rtc_context.previous_model_actions,
+                    s=rtc_context.s,
+                    d=rtc_context.d,
+                )
+                sample_kwargs.pop("num_steps", None)
+                sample_kwargs["target"] = target[None, ...]
+                sample_kwargs["weights"] = weights
+                assert self._sample_actions_rtc is not None
+                sample_actions = self._sample_actions_rtc
+
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
         outputs = {
             "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng, observation, **sample_kwargs),
+            "actions": sample_actions(sample_rng, observation, **sample_kwargs),
         }
         model_time = time.monotonic() - start_time
         outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
+        rtc_model_actions = None
+        if rtc_context is not None:
+            with np.errstate(over="ignore", invalid="ignore"):
+                rtc_model_actions = np.asarray(outputs["actions"], dtype=np.float32).copy()
+            if rtc_model_actions.shape != (16, 32):
+                raise ValueError(f"RTC model output must have shape (16, 32), got {rtc_model_actions.shape}")
+            if not np.isfinite(rtc_model_actions).all():
+                raise ValueError("RTC model output must be representable as finite float32 values")
+
         outputs = self._output_transform(outputs)
+        if rtc_model_actions is not None:
+            outputs["rtc"] = {
+                "schema_version": _inference.RTC_SCHEMA_VERSION,
+                "model_actions": rtc_model_actions,
+            }
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
         return outputs
+
+    def _validate_rtc_capability(self) -> None:
+        if getattr(self, "_action_representation", None) != "native":
+            raise ValueError("RTC requests require native action representation")
+        model_shape = (
+            getattr(self, "_model_action_horizon", None),
+            getattr(self, "_model_action_dim", None),
+        )
+        if model_shape != (16, 32):
+            raise ValueError("RTC requests require model action shape (16, 32)")
+        if getattr(self, "_sample_actions_rtc", None) is None:
+            raise ValueError("RTC requests require a model RTC sampling hook")
 
     @property
     def metadata(self) -> dict[str, Any]:

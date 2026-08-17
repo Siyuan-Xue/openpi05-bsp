@@ -58,3 +58,19 @@ def test_pack_unpack(data):
     packed = msgpack_numpy.packb(data)
     unpacked = msgpack_numpy.unpackb(packed)
     _check_structure(data, unpacked)
+
+
+def test_rtc_sidecar_preserves_exact_nested_shape_and_dtype():
+    response = {
+        "actions": np.zeros((16, 7), dtype=np.float32),
+        "rtc": {
+            "schema_version": 1,
+            "model_actions": np.arange(16 * 32, dtype=np.float32).reshape(16, 32),
+        },
+    }
+
+    unpacked = msgpack_numpy.unpackb(msgpack_numpy.packb(response))
+
+    _check_structure(response, unpacked)
+    assert unpacked["rtc"]["model_actions"].shape == (16, 32)
+    assert unpacked["rtc"]["model_actions"].dtype == np.float32

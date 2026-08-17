@@ -51,4 +51,5 @@ def create_trained_policy(
         ],
         sample_kwargs=sample_kwargs,
         metadata=train_config.policy_metadata,
+        action_representation="bsp" if data_config.use_bsp else "native",
     )
