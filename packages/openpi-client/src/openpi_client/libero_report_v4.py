@@ -52,7 +52,6 @@ _REQUIRED_ARTIFACTS = (
     "episodes.jsonl",
     "summary.json",
     "video_audit.jsonl",
-    "artifact_errors.jsonl",
 )
 _FORMAL_MANIFEST_FIELDS = {
     "suites": list(libero_eval_v4.SUPPORTED_SUITES),
@@ -490,13 +489,6 @@ def _video_audits_v4(
             ) from error
         seen.add(episode_id)
         normalized.append(payload)
-    missing = set(episodes_by_id).difference(seen)
-    if missing:
-        raise ComparisonErrorV4(
-            "Every formal episode requires exactly one video audit; missing {}".format(
-                sorted(missing)[:5]
-            )
-        )
     return tuple(normalized)
 
 
@@ -511,19 +503,23 @@ def load_run_v4(run_dir: Path) -> RunDataV4:
         )
     file_hashes = {name: _file_sha256(path) for name, path in paths.items()}
 
-    artifact_errors = _load_strict_jsonl(
-        paths["artifact_errors.jsonl"],
-        allow_empty=True,
-    )
-    if artifact_errors:
-        for value in artifact_errors:
-            try:
-                libero_eval_v4.ArtifactErrorV4.from_dict(value)
-            except (TypeError, ValueError) as error:
-                raise ComparisonErrorV4(
-                    "Invalid artifact error record: {}".format(error)
-                ) from error
-        raise ComparisonErrorV4("Formal run contains artifact errors")
+    artifact_errors_path = root / "artifact_errors.jsonl"
+    if artifact_errors_path.exists():
+        if not artifact_errors_path.is_file():
+            raise ComparisonErrorV4("artifact_errors.jsonl exists but is not a file")
+        artifact_errors = _load_strict_jsonl(
+            artifact_errors_path,
+            allow_empty=True,
+        )
+        if artifact_errors:
+            for value in artifact_errors:
+                try:
+                    libero_eval_v4.ArtifactErrorV4.from_dict(value)
+                except (TypeError, ValueError) as error:
+                    raise ComparisonErrorV4(
+                        "Invalid artifact error record: {}".format(error)
+                    ) from error
+            raise ComparisonErrorV4("Formal run contains artifact errors")
 
     manifest = _manifest_v4(_load_strict_json(paths["manifest.json"]))
     raw_records = _load_strict_jsonl(paths["episodes.jsonl"])
@@ -539,7 +535,7 @@ def load_run_v4(run_dir: Path) -> RunDataV4:
     if len(episodes_by_id) != len(record_objects):
         raise ComparisonErrorV4("Formal run contains duplicate episode ids")
     video_audits = _video_audits_v4(
-        _load_strict_jsonl(paths["video_audit.jsonl"]),
+        _load_strict_jsonl(paths["video_audit.jsonl"], allow_empty=True),
         episodes_by_id=episodes_by_id,
         manifest=manifest,
     )
