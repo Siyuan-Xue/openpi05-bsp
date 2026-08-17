@@ -1285,7 +1285,7 @@ def _calibration_request_v4(
         raise ValueError("calibration suite must contain exactly ten tasks")
     task = task_suite.get_task(task_id)
     initial_states = task_suite.get_task_init_states(task_id)
-    if len(initial_states) == 0:
+    if len(initial_states) == 0:  # noqa: PLC1802 -- state arrays have ambiguous truth values.
         raise ValueError("calibration task has no initial state")
     initial_state = initial_states[0]
     environment = _TaskEnvironmentV4(
