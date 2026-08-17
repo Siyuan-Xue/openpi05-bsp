@@ -493,7 +493,7 @@ def _build_video_frames(
             raise ValueError("stall source control_step must be unique and within the replay timeline")
         stall_source_by_step[control_step] = source_frame
     stall_frames_by_step = {}
-    for stall, stall_frame_count in zip(
+    for stall, stall_frame_count in zip(  # noqa: B905 -- LIBERO client runs on Python 3.8.
         stalls,
         _video_timing.quantize_stall_frames(stalls, video_fps=video_fps),
     ):
