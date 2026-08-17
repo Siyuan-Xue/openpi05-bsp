@@ -20,6 +20,7 @@ from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
 
 BasePolicy: TypeAlias = _base_policy.BasePolicy
+_MISSING = object()
 
 
 def _select_jax_inference_rng(
@@ -180,11 +181,10 @@ class Policy(BasePolicy):
     def _prepare_rtc_sample_call(self, rtc_context, *, noise):
         """Validate RTC-only kwargs and targets before advancing stateful RNG."""
         sample_kwargs = dict(self._sample_kwargs)
-        if noise is not None:
-            noise = jnp.asarray(noise)
-            if noise.ndim == 2:
-                noise = noise[None, ...]
-            sample_kwargs["noise"] = noise
+        configured_noise = sample_kwargs.pop("noise", _MISSING)
+        rtc_noise = noise if noise is not None else configured_noise
+        if rtc_noise is not _MISSING:
+            sample_kwargs["noise"] = _canonicalize_rtc_noise(rtc_noise)
 
         unsupported_kwargs = set(sample_kwargs) - {"num_steps", "noise"}
         if unsupported_kwargs:
@@ -211,6 +211,23 @@ class Policy(BasePolicy):
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata
+
+
+def _canonicalize_rtc_noise(noise) -> jax.Array:
+    """Validate RTC noise without changing the legacy request path."""
+    try:
+        array = np.asarray(noise)
+    except (TypeError, ValueError) as error:
+        raise ValueError("RTC noise must be a finite numeric array") from error
+    if array.shape not in ((16, 32), (1, 16, 32)):
+        raise ValueError("RTC noise must have shape (16, 32) or (1, 16, 32)")
+    if np.issubdtype(array.dtype, np.bool_) or not np.issubdtype(array.dtype, np.number):
+        raise ValueError("RTC noise must be a finite numeric array")
+    if not np.isfinite(array).all():
+        raise ValueError("RTC noise must be finite")
+    if array.ndim == 2:
+        array = array[None, ...]
+    return jnp.asarray(array)
 
 
 class PolicyRecorder(_base_policy.BasePolicy):

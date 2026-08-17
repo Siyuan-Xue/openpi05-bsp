@@ -214,6 +214,79 @@ def test_guided_request_rejects_unrelated_sampler_kwargs(monkeypatch):
     _assert_key_equal(policy_instance._rng, initial_rng)
 
 
+@pytest.mark.parametrize("mode", ["bootstrap", "guided"])
+@pytest.mark.parametrize("source", ["explicit", "configured"])
+@pytest.mark.parametrize(
+    "invalid_noise",
+    [
+        np.zeros((16, 32), dtype=np.bool_),
+        np.full((16, 32), "noise", dtype=object),
+        np.full((16, 32), np.nan, dtype=np.float32),
+        np.full((1, 16, 32), np.inf, dtype=np.float32),
+        np.zeros((15, 32), dtype=np.float32),
+        np.zeros((1, 16, 31), dtype=np.float32),
+        np.zeros((2, 16, 32), dtype=np.float32),
+    ],
+)
+def test_rtc_noise_is_strictly_validated_before_rng_advance(
+    monkeypatch,
+    mode,
+    source,
+    invalid_noise,
+):
+    policy_instance, _ = _fake_policy()
+    initial_rng = policy_instance._rng
+    request = (
+        {"raw": np.asarray([3.0]), inference.RTC_REQUEST_KEY: {"schema_version": 1}}
+        if mode == "bootstrap"
+        else _guided_observation()
+    )
+    call_kwargs = {}
+    if source == "explicit":
+        call_kwargs["noise"] = invalid_noise
+    else:
+        policy_instance._sample_kwargs = {"num_steps": 5, "noise": invalid_noise}
+    monkeypatch.setattr(policy._model.Observation, "from_dict", staticmethod(lambda inputs: object()))
+
+    with pytest.raises(ValueError, match="RTC noise"):
+        policy_instance.infer(request, **call_kwargs)
+
+    _assert_key_equal(policy_instance._rng, initial_rng)
+
+
+@pytest.mark.parametrize("shape", [(16, 32), (1, 16, 32)])
+@pytest.mark.parametrize("source", ["explicit", "configured"])
+def test_rtc_noise_accepts_both_exact_shapes_and_canonicalizes_one_batch(monkeypatch, shape, source):
+    policy_instance, seen = _fake_policy()
+    supplied = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+    call_kwargs = {}
+    if source == "explicit":
+        call_kwargs["noise"] = supplied
+    else:
+        policy_instance._sample_kwargs = {"num_steps": 99, "noise": supplied}
+    monkeypatch.setattr(policy._model.Observation, "from_dict", staticmethod(lambda inputs: object()))
+
+    policy_instance.infer(
+        {"raw": np.asarray([3.0]), inference.RTC_REQUEST_KEY: {"schema_version": 1}},
+        **call_kwargs,
+    )
+
+    canonical = seen["legacy"][0][1]["noise"]
+    assert canonical.shape == (1, 16, 32)
+    np.testing.assert_array_equal(canonical, supplied.reshape(1, 16, 32))
+
+
+def test_absent_rtc_preserves_legacy_configured_noise_without_new_validation(monkeypatch):
+    policy_instance, seen = _fake_policy()
+    configured_noise = object()
+    policy_instance._sample_kwargs = {"noise": configured_noise, "legacy_option": True}
+    monkeypatch.setattr(policy._model.Observation, "from_dict", staticmethod(lambda inputs: object()))
+
+    policy_instance.infer({"raw": np.asarray([3.0])})
+
+    assert seen["legacy"][0][1] == {"noise": configured_noise, "legacy_option": True}
+
+
 class _FakeModel:
     def __init__(self, *, supports_rtc=True, horizon=16, action_dim=32):
         self.supports_rtc = supports_rtc
