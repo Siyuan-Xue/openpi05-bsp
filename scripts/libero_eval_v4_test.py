@@ -68,10 +68,11 @@ class _ScriptedCall:
 
 
 class FakeWorker:
-    def __init__(self, clock, calls, *, connect_payload=None):
+    def __init__(self, clock, calls, *, connect_payload=None, reset_advance_ns=0):
         self.clock = clock
         self.calls = list(calls)
         self.connect_payload = connect_payload or _metadata_payload()
+        self.reset_advance_ns = reset_advance_ns
         self.requests = []
         self.jobs = []
         self._pending = None
@@ -135,6 +136,8 @@ class FakeWorker:
         self.reset_calls += 1
         self.generation += 1
         self._pending = None
+        if self.reset_calls > 1:
+            self.clock.advance_to(self.clock.monotonic_ns() + self.reset_advance_ns)
         return self.generation
 
     def wait_until_ready(self, generation, timeout=None):
@@ -461,6 +464,7 @@ def test_done_abandons_background_request_without_latency_or_activation():
             _ScriptedCall(0, {"ok": True}),
             _ScriptedCall(500 * NS_PER_MS, {"ok": True}),
         ],
+        reset_advance_ns=700 * NS_PER_MS,
     )
     environment = FakeEnvironment(done_after_real_steps=2)
 
@@ -476,6 +480,7 @@ def test_done_abandons_background_request_without_latency_or_activation():
     assert result.inference_requests[-1].disposition == "abandoned"
     assert len(result.inference_latencies) == 1
     assert len(result.plan_activations) == 1
+    assert result.episode_duration_ns == 50 * NS_PER_MS
     assert worker.reset_calls == 2
     assert worker.ready_calls[-1] == worker.generation
 

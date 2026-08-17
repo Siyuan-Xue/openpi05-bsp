@@ -1003,6 +1003,7 @@ def _run_attempt_v4(
             ledger.replay_frames.append(image)
             ledger.steps += 1
             if bool(done):
+                episode_finished_ns = _require_nonnegative_clock(clock)
                 if pending is not None:
                     pending.trace.disposition = "abandoned"
                     try:
@@ -1012,9 +1013,10 @@ def _run_attempt_v4(
                     pending = None
                 return ledger.result(
                     success=True,
-                    now_ns=_require_nonnegative_clock(clock),
+                    now_ns=episode_finished_ns,
                 )
 
+        episode_finished_ns = _require_nonnegative_clock(clock)
         if pending is not None:
             pending.trace.disposition = "abandoned"
             try:
@@ -1024,7 +1026,7 @@ def _run_attempt_v4(
             pending = None
         return ledger.result(
             success=False,
-            now_ns=_require_nonnegative_clock(clock),
+            now_ns=episode_finished_ns,
             failure_kind="timeout",
             error="maximum rollout steps reached",
         )
