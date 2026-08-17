@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import dataclasses
 import hashlib
 import html
@@ -15,6 +16,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from openpi_client import libero_artifacts
 from openpi_client import libero_eval
+from openpi_client import libero_video_timing
 
 
 MILESTONES = (0, 1000, 2000, 5000, 10000)
@@ -24,7 +26,6 @@ TASKS_PER_SUITE = 10
 TRIALS_PER_TASK = 50
 EPISODES_PER_RUN = len(libero_eval.SUPPORTED_SUITES) * TASKS_PER_SUITE * TRIALS_PER_TASK
 TOTAL_EPISODES = EPISODES_PER_RUN * 2 * len(MILESTONES)
-_REPLAN_STEPS = libero_eval.resolve_policy_protocol("bsp", None).expected_action_horizon
 OUTPUT_FILENAMES = (
     "task_comparison.csv",
     "suite_comparison.csv",
@@ -63,6 +64,10 @@ _IDENTITY_FIELDS = (
 _SHARED_MANIFEST_FIELDS = (
     "code_sha",
     "dataset_revision",
+    "dataset_fps",
+    "source_demo_control_hz",
+    "control_freq_hz",
+    "inference_schedule",
     "container_digest",
     "train_seed",
     "eval_seed",
@@ -73,6 +78,9 @@ _SHARED_MANIFEST_FIELDS = (
     "max_steps_by_suite",
     "connection_timeout_s",
     "inference_timeout_s",
+    "infrastructure_retries",
+    "replan_steps",
+    "execution_horizon",
 )
 _PHASE_ONE_CONFIGS = {
     ("baseline", "full"): "pi05_libero_baseline_h16",
@@ -160,6 +168,14 @@ def _file_sha256(path: Path) -> str:
     return hasher.hexdigest()
 
 
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
 def _require_fields(payload: Mapping[str, Any], fields: Sequence[str], *, label: str) -> None:
     missing = sorted(field for field in fields if field not in payload)
     if missing:
@@ -175,14 +191,42 @@ def _training_family(manifest: Mapping[str, Any]) -> str:
         if candidate_variant == variant and candidate_config == config_name
     ]
     if len(matches) != 1:
-        raise ComparisonError("{} manifest has unsupported phase-one config_name {}".format(variant, config_name))
+        raise ComparisonError(
+            "{} manifest has unsupported phase-one config_name {}".format(variant, config_name)
+        )
     return matches[0]
 
 
+def _require_integer(value: Any, *, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ComparisonError("{} must be an integer".format(label))
+    return value
+
+
 def _validate_manifest(manifest: Mapping[str, Any]) -> Tuple[str, int]:
+    _require_fields(manifest, ("schema_version",), label="evaluation manifest")
+    schema_version = _require_integer(
+        manifest["schema_version"], label="Evaluation manifest schema_version"
+    )
+    if schema_version == 2:
+        raise ComparisonError(
+            "Phase-one comparison requires schema_version 3; schema 2 is archive-only "
+            "and must be rerun with the schema-3 evaluator"
+        )
+    if schema_version != 3:
+        raise ComparisonError(
+            "Evaluation manifest has unsupported schema_version {}; expected 3".format(
+                schema_version
+            )
+        )
     required = (
         "schema_version",
-        "native_control_hz",
+        "dataset_fps",
+        "source_demo_control_hz",
+        "control_freq_hz",
+        "video_fps",
+        "video_show_inference_waits",
+        "inference_schedule",
         "replan_steps",
         "code_sha",
         "dataset_revision",
@@ -210,41 +254,95 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> Tuple[str, int]:
         "infrastructure_retries",
     )
     _require_fields(manifest, required, label="evaluation manifest")
-    if manifest["schema_version"] != 2:
-        raise ComparisonError("Phase-one comparison requires evaluation manifest schema_version 2")
-    if manifest["native_control_hz"] != 10 or manifest["replan_steps"] != _REPLAN_STEPS:
-        raise ComparisonError("Evaluation manifest has an incompatible native-control protocol")
+    for field, expected in (
+        ("dataset_fps", 10),
+        ("source_demo_control_hz", 20),
+        ("control_freq_hz", 20),
+        ("replan_steps", 8),
+    ):
+        value = _require_integer(manifest[field], label="Evaluation manifest {}".format(field))
+        if value != expected:
+            raise ComparisonError("Evaluation manifest {} must be exactly {}".format(field, expected))
+    video_fps = manifest["video_fps"]
+    if (
+        isinstance(video_fps, bool)
+        or not isinstance(video_fps, int)
+        or video_fps <= 0
+        or video_fps % manifest["control_freq_hz"]
+    ):
+        raise ComparisonError("Evaluation manifest video_fps must be a positive control-rate multiple")
+    if not isinstance(manifest["video_show_inference_waits"], bool):
+        raise ComparisonError("Evaluation manifest video_show_inference_waits must be boolean")
+    if manifest["inference_schedule"] != libero_video_timing.SYNCHRONOUS_INFERENCE_SCHEDULE:
+        raise ComparisonError("Formal phase-one comparison currently requires synchronous inference_schedule")
     variant = manifest["policy_variant"]
-    step = manifest["checkpoint_step"]
+    step = _require_integer(
+        manifest["checkpoint_step"], label="Evaluation manifest checkpoint_step"
+    )
     if variant not in ("baseline", "bsp"):
         raise ComparisonError("Evaluation manifest policy_variant must be baseline or bsp")
-    if isinstance(step, bool) or not isinstance(step, int):
-        raise ComparisonError("Evaluation manifest checkpoint_step must be an integer")
     if step not in MILESTONES:
         raise ComparisonError("Unexpected phase-one checkpoint_step {}".format(step))
     _training_family(manifest)
     expected = {
         "baseline": ("baseline_h16", 16),
-        "bsp": ("bsp_decoded_h8", _REPLAN_STEPS),
+        "bsp": ("bsp_decoded_h8", 8),
     }[variant]
-    actual = (manifest["policy_protocol"], manifest["expected_action_horizon"])
+    expected_action_horizon = _require_integer(
+        manifest["expected_action_horizon"],
+        label="Evaluation manifest expected_action_horizon",
+    )
+    actual = (manifest["policy_protocol"], expected_action_horizon)
     if actual != expected:
         raise ComparisonError(
             "{}@{} has config/protocol/horizon {}, expected {}".format(variant, step, actual, expected)
         )
-    if manifest["execution_horizon"] != _REPLAN_STEPS:
+    execution_horizon = _require_integer(
+        manifest["execution_horizon"], label="Evaluation manifest execution_horizon"
+    )
+    if execution_horizon != 8:
         raise ComparisonError("Phase-one evaluation must execute exactly eight actions per replan")
-    if tuple(manifest["suites"]) != tuple(libero_eval.SUPPORTED_SUITES):
+    suites = manifest["suites"]
+    if not isinstance(suites, list):
+        raise ComparisonError("Evaluation manifest suites must be a JSON list")
+    if any(not isinstance(suite, str) or not suite or suite not in libero_eval.SUPPORTED_SUITES for suite in suites):
+        raise ComparisonError("Evaluation manifest suites must contain supported non-empty strings")
+    if tuple(suites) != tuple(libero_eval.SUPPORTED_SUITES):
         raise ComparisonError("Phase-one evaluation requires all four suites in canonical order")
-    if tuple(manifest["task_ids"]) != tuple(range(TASKS_PER_SUITE)):
+    if not isinstance(manifest["task_ids"], list):
+        raise ComparisonError("Evaluation manifest task_ids must be a JSON list")
+    task_ids = tuple(
+        _require_integer(value, label="Evaluation manifest task_ids item")
+        for value in manifest["task_ids"]
+    )
+    if task_ids != tuple(range(TASKS_PER_SUITE)):
         raise ComparisonError("Phase-one evaluation requires task ids 0..9")
-    if manifest["trials_per_task"] != TRIALS_PER_TASK:
+    trials_per_task = _require_integer(
+        manifest["trials_per_task"], label="Evaluation manifest trials_per_task"
+    )
+    if trials_per_task != TRIALS_PER_TASK:
         raise ComparisonError("Phase-one evaluation requires exactly 50 trials per task")
-    if manifest["num_steps_wait"] != 10 or manifest["max_steps_by_suite"] != _MAX_STEPS_BY_SUITE:
+    num_steps_wait = _require_integer(
+        manifest["num_steps_wait"], label="Evaluation manifest num_steps_wait"
+    )
+    max_steps = manifest["max_steps_by_suite"]
+    if not isinstance(max_steps, dict) or set(max_steps) != set(_MAX_STEPS_BY_SUITE):
+        raise ComparisonError("Evaluation manifest max_steps_by_suite must contain all four suites")
+    exact_max_steps = {
+        suite: _require_integer(value, label="Evaluation manifest max_steps_by_suite value")
+        for suite, value in max_steps.items()
+    }
+    if num_steps_wait != 10 or exact_max_steps != _MAX_STEPS_BY_SUITE:
         raise ComparisonError("Evaluation wait/max-step protocol does not match phase one")
-    if manifest["infrastructure_retries"] != 2:
+    infrastructure_retries = _require_integer(
+        manifest["infrastructure_retries"],
+        label="Evaluation manifest infrastructure_retries",
+    )
+    if infrastructure_retries != 2:
         raise ComparisonError("Evaluation must retain exactly two infrastructure retries")
-    if manifest["train_seed"] != 42 or manifest["eval_seed"] != 42:
+    train_seed = _require_integer(manifest["train_seed"], label="Evaluation manifest train_seed")
+    eval_seed = _require_integer(manifest["eval_seed"], label="Evaluation manifest eval_seed")
+    if train_seed != 42 or eval_seed != 42:
         raise ComparisonError("Phase-one training and evaluation seeds must both be 42")
     for field in ("code_sha", "dataset_revision", "checkpoint", "container_digest"):
         if not isinstance(manifest[field], str) or not manifest[field]:
@@ -260,17 +358,23 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> Tuple[str, int]:
     normalized_checkpoint = manifest["checkpoint"].rstrip("/")
     if not normalized_checkpoint or normalized_checkpoint.rsplit("/", 1)[-1] != str(step):
         raise ComparisonError("Evaluation checkpoint terminal component must equal checkpoint_step")
-    if not libero_artifacts.is_sha256(manifest["norm_hash"]):
+    if not _is_sha256(manifest["norm_hash"]):
         raise ComparisonError("Evaluation manifest norm_hash must be a lowercase SHA256")
-    if manifest["bsp_parameters"] != libero_eval.BSP_PARAMETERS:
+    bsp_parameters = manifest["bsp_parameters"]
+    if not isinstance(bsp_parameters, dict) or set(bsp_parameters) != set(libero_eval.BSP_PARAMETERS):
+        raise ComparisonError("Evaluation manifest BSP parameters do not match the fixed protocol")
+    if any(
+        type(bsp_parameters[field]) is not type(expected) or bsp_parameters[field] != expected
+        for field, expected in libero_eval.BSP_PARAMETERS.items()
+    ):
         raise ComparisonError("Evaluation manifest BSP parameters do not match the fixed protocol")
     if variant == "baseline":
         if manifest["bsp_cache_hash"] is not None or manifest["bsp_cache_manifest_fingerprint"] is not None:
             raise ComparisonError("Baseline manifests must record null BSP cache identities")
     else:
-        if not libero_artifacts.is_sha256(manifest["bsp_cache_hash"]):
+        if not _is_sha256(manifest["bsp_cache_hash"]):
             raise ComparisonError("BSP cache hash must be the actual NPZ lowercase SHA256")
-        if not libero_artifacts.is_sha256(manifest["bsp_cache_manifest_fingerprint"]):
+        if not _is_sha256(manifest["bsp_cache_manifest_fingerprint"]):
             raise ComparisonError("BSP cache manifest fingerprint must be a lowercase SHA256")
     return str(variant), int(step)
 
@@ -281,7 +385,9 @@ def classify_phase_one_manifests(
     """Identify baseline/BSP at all five fixed milestones using manifest contents only."""
     required_run_count = 2 * len(MILESTONES)
     if len(manifests) != required_run_count:
-        raise ComparisonError("Phase-one comparison requires exactly {} run manifests".format(required_run_count))
+        raise ComparisonError(
+            "Phase-one comparison requires exactly {} run manifests".format(required_run_count)
+        )
     classified: Dict[Tuple[str, int], Mapping[str, Any]] = {}
     for manifest in manifests:
         key = _validate_manifest(manifest)
@@ -297,7 +403,9 @@ def classify_phase_one_manifests(
     training_families = {_training_family(manifest) for manifest in manifests}
     if len(training_families) != 1:
         raise ComparisonError(
-            "All phase-one runs must use one training family; found {}".format(sorted(training_families))
+            "All phase-one runs must use one training family; found {}".format(
+                sorted(training_families)
+            )
         )
 
     normalized_checkpoints = [manifest["checkpoint"].rstrip("/") for manifest in manifests]
@@ -321,11 +429,17 @@ def classify_phase_one_manifests(
     return classified
 
 
-def _finite_number(value: Any, *, label: str, nonnegative: bool = False, strictly_positive: bool = False) -> float:
+def _finite_number(
+    value: Any, *, label: str, nonnegative: bool = False, strictly_positive: bool = False
+) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ComparisonError("{} must be numeric".format(label))
     number = float(value)
-    if not math.isfinite(number) or (nonnegative and number < 0.0) or (strictly_positive and number <= 0.0):
+    if (
+        not math.isfinite(number)
+        or (nonnegative and number < 0.0)
+        or (strictly_positive and number <= 0.0)
+    ):
         qualifier = " and positive" if strictly_positive else " and non-negative" if nonnegative else ""
         raise ComparisonError("{} must be finite{}".format(label, qualifier))
     return number
@@ -352,6 +466,8 @@ def _validate_episode(record: Mapping[str, Any], manifest: Mapping[str, Any]) ->
         "replans",
         "inference_ms",
         "mean_inference_ms",
+        "inference_requests",
+        "control_stalls",
         "infrastructure_history",
     )
     _require_fields(record, required, label="episode record")
@@ -364,7 +480,7 @@ def _validate_episode(record: Mapping[str, Any], manifest: Mapping[str, Any]) ->
     for field in ("episode_id", "paired_key", "task_name", "init_state_fingerprint"):
         if not isinstance(record[field], str) or not record[field]:
             raise ComparisonError("Episode {} must be non-empty".format(field))
-    if not libero_artifacts.is_sha256(record["init_state_fingerprint"]):
+    if not _is_sha256(record["init_state_fingerprint"]):
         raise ComparisonError("Episode init_state_fingerprint must be a lowercase SHA256")
     try:
         canonical_identity = libero_eval.EpisodeIdentity(
@@ -380,7 +496,8 @@ def _validate_episode(record: Mapping[str, Any], manifest: Mapping[str, Any]) ->
         raise ComparisonError("Episode paired_key is not canonical for its identity")
     if record["episode_id"] != canonical_identity.episode_id:
         raise ComparisonError("Episode episode_id is not canonical for its identity")
-    if record["eval_seed"] != manifest["eval_seed"]:
+    eval_seed = _require_integer(record["eval_seed"], label="Episode eval_seed")
+    if eval_seed != manifest["eval_seed"]:
         raise ComparisonError("Episode eval_seed does not match its manifest")
     if record["include_in_success_rate"] is not True:
         raise ComparisonError("Every phase-one episode must be eligible; infrastructure run is incomplete")
@@ -409,7 +526,7 @@ def _validate_episode(record: Mapping[str, Any], manifest: Mapping[str, Any]) ->
     max_steps = _MAX_STEPS_BY_SUITE[record["suite"]]
     if record["steps"] > max_steps:
         raise ComparisonError("Episode steps exceed the suite maximum")
-    if record["replans"] > math.ceil(max_steps / _REPLAN_STEPS):
+    if record["replans"] > math.ceil(max_steps / 8):
         raise ComparisonError("Episode replans exceed the suite maximum at an eight-step horizon")
     timings = record["inference_ms"]
     if not isinstance(timings, list):
@@ -418,12 +535,15 @@ def _validate_episode(record: Mapping[str, Any], manifest: Mapping[str, Any]) ->
     if len(finite_timings) != record["replans"]:
         raise ComparisonError("Episode inference_ms length must equal replans")
     if finite_timings:
-        recorded_mean = _finite_number(record["mean_inference_ms"], label="mean_inference_ms", nonnegative=True)
+        recorded_mean = _finite_number(
+            record["mean_inference_ms"], label="mean_inference_ms", nonnegative=True
+        )
         expected_mean = sum(finite_timings) / len(finite_timings)
         if not math.isclose(recorded_mean, expected_mean, rel_tol=1e-12, abs_tol=1e-12):
             raise ComparisonError("Episode mean_inference_ms is inconsistent with inference_ms")
     elif record["mean_inference_ms"] is not None:
         raise ComparisonError("Episode mean_inference_ms must be null when inference_ms is empty")
+    _validate_episode_timing_events(record, manifest, finite_timings)
     history = record["infrastructure_history"]
     if not isinstance(history, list):
         raise ComparisonError("Episode infrastructure_history must be a list")
@@ -433,12 +553,96 @@ def _validate_episode(record: Mapping[str, Any], manifest: Mapping[str, Any]) ->
         if not isinstance(entry, dict):
             raise ComparisonError("Episode infrastructure history entries must be objects")
         _require_fields(entry, ("attempt", "kind", "error"), label="infrastructure history entry")
-        if entry["attempt"] != expected_attempt:
+        attempt = _require_integer(
+            entry["attempt"], label="Episode infrastructure history attempt"
+        )
+        if attempt != expected_attempt:
             raise ComparisonError("Episode infrastructure history attempts must be consecutive")
         if entry["kind"] not in ("simulator", "container", "network"):
             raise ComparisonError("Episode infrastructure history has an invalid kind")
         if not isinstance(entry["error"], str) or not entry["error"].strip():
             raise ComparisonError("Episode infrastructure history error must be non-empty")
+
+
+def _event_nonnegative_int(event: Mapping[str, Any], field: str, *, label: str) -> int:
+    value = event[field]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ComparisonError("{} {} must be a non-negative integer".format(label, field))
+    return value
+
+
+def _validate_episode_timing_events(
+    record: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    finite_timings: Sequence[float],
+) -> None:
+    requests = record["inference_requests"]
+    stalls = record["control_stalls"]
+    if not isinstance(requests, list) or not isinstance(stalls, list):
+        raise ComparisonError("Episode inference_requests and control_stalls must be lists")
+
+    parsed_requests = []
+    previous_end = 0
+    request_fields = {"clock", "replan_index", "started_offset_ns", "duration_ns"}
+    for expected_index, event in enumerate(requests):
+        if not isinstance(event, dict) or set(event) != request_fields:
+            raise ComparisonError("Inference request must contain exactly the schema-3 fields")
+        if event["clock"] != libero_video_timing.EPISODE_MONOTONIC_CLOCK:
+            raise ComparisonError("Inference request clock must be episode_monotonic_ns")
+        replan_index = _event_nonnegative_int(event, "replan_index", label="request")
+        started = _event_nonnegative_int(event, "started_offset_ns", label="request")
+        duration = _event_nonnegative_int(event, "duration_ns", label="request")
+        if replan_index != expected_index:
+            raise ComparisonError("Inference request replan indexes must be sequential from zero")
+        if started < previous_end:
+            raise ComparisonError("Inference requests must be chronological and non-overlapping")
+        parsed_requests.append((replan_index, started, duration))
+        previous_end = started + duration
+
+    parsed_stalls = []
+    previous_end = 0
+    previous_step = -1
+    stall_fields = {
+        "clock",
+        "control_step",
+        "replan_index",
+        "started_offset_ns",
+        "duration_ns",
+        "reason",
+    }
+    for event in stalls:
+        if not isinstance(event, dict) or set(event) != stall_fields:
+            raise ComparisonError("Control stall must contain exactly the schema-3 fields")
+        if event["clock"] != libero_video_timing.EPISODE_MONOTONIC_CLOCK:
+            raise ComparisonError("Control stall clock must be episode_monotonic_ns")
+        step = _event_nonnegative_int(event, "control_step", label="stall")
+        replan_index = _event_nonnegative_int(event, "replan_index", label="stall")
+        started = _event_nonnegative_int(event, "started_offset_ns", label="stall")
+        duration = _event_nonnegative_int(event, "duration_ns", label="stall")
+        if step <= previous_step or step > record["steps"]:
+            raise ComparisonError("Control stall steps must be strictly increasing within 0..steps")
+        if started < previous_end:
+            raise ComparisonError("Control stalls must be chronological and non-overlapping")
+        if event["reason"] != libero_video_timing.STALL_REASON_SYNCHRONOUS_INFERENCE:
+            raise ComparisonError("Synchronous control stalls must use reason synchronous_inference")
+        parsed_stalls.append((replan_index, started, duration))
+        previous_step = step
+        previous_end = started + duration
+
+    replans = record["replans"]
+    expected_counts = {replans}
+    if record["status"] == "policy_failure":
+        expected_counts.add(replans + 1)
+    if len(parsed_requests) not in expected_counts or len(parsed_stalls) != len(parsed_requests):
+        raise ComparisonError("Synchronous request/stall counts do not match episode replans")
+    if parsed_requests != parsed_stalls:
+        raise ComparisonError("Synchronous requests and control stalls must have matching intervals")
+    if manifest["inference_schedule"] != libero_video_timing.SYNCHRONOUS_INFERENCE_SCHEDULE:
+        raise ComparisonError("Episode timing validation currently accepts only synchronous schedules")
+    for index, timing_ms in enumerate(finite_timings):
+        expected_ms = parsed_requests[index][2] / 1_000_000
+        if not math.isclose(timing_ms, expected_ms, rel_tol=0.0, abs_tol=1e-12):
+            raise ComparisonError("Episode inference_ms must derive from successful request durations")
 
 
 def _derive_summary(records: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
@@ -476,7 +680,8 @@ def _derive_summary(records: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
                 "failures": len(suite_records) - successes,
                 "incomplete_infrastructure_count": 0,
                 "success_rate": successes / len(suite_records),
-                "task_macro_success_rate": sum(row["success_rate"] for row in suite_tasks) / len(suite_tasks),
+                "task_macro_success_rate": sum(row["success_rate"] for row in suite_tasks)
+                / len(suite_tasks),
             }
         )
     suite_rates = [row["success_rate"] for row in suites]
@@ -772,16 +977,14 @@ def validate_diagnostics(
     p95 = _finite_number(
         bsp_diagnostics["p95_reconstruction_error"], label="p95 reconstruction error", nonnegative=True
     )
-    threshold = _finite_number(bsp_diagnostics["max_error_threshold"], label="max error threshold", nonnegative=True)
+    threshold = _finite_number(
+        bsp_diagnostics["max_error_threshold"], label="max error threshold", nonnegative=True
+    )
     if threshold != 0.002 or not maximum < 0.002 or mean > maximum or p95 > maximum:
         raise ComparisonError("BSP reconstruction requires the strict maximum error < 0.002")
     contents_sha = bsp_diagnostics["cache_contents_sha256"]
     rebuilt_sha = bsp_diagnostics["rebuilt_contents_sha256"]
-    if (
-        not libero_artifacts.is_sha256(contents_sha)
-        or not libero_artifacts.is_sha256(rebuilt_sha)
-        or contents_sha != rebuilt_sha
-    ):
+    if not _is_sha256(contents_sha) or not _is_sha256(rebuilt_sha) or contents_sha != rebuilt_sha:
         raise ComparisonError("BSP cache and rebuilt canonical content SHA256 values must match")
     if any(bsp_diagnostics["code_sha"] != manifest["code_sha"] for manifest in classified.values()):
         raise ComparisonError("BSP diagnostics code SHA does not match all evaluation manifests")
@@ -820,8 +1023,8 @@ def validate_diagnostics(
     baseline_action_sha = norm_diagnostics["baseline_action_stats_sha256"]
     bsp_action_sha = norm_diagnostics["bsp_action_stats_sha256"]
     if (
-        not libero_artifacts.is_sha256(baseline_action_sha)
-        or not libero_artifacts.is_sha256(bsp_action_sha)
+        not _is_sha256(baseline_action_sha)
+        or not _is_sha256(bsp_action_sha)
         or baseline_action_sha == bsp_action_sha
     ):
         raise ComparisonError("Baseline/BSP action-stat SHA256 values must be valid and distinct")
@@ -853,7 +1056,10 @@ def _render_markdown(milestones: Sequence[Mapping[str, Any]]) -> str:
     lines = [
         "# π0.5 + LIBERO BSP 第一阶段固定里程碑比较",
         "",
-        ("该报告只比较 0k、1k、2k、5k、10k 五个预先固定的 checkpoint；主指标为四套件分层宏平均成功率。"),
+        (
+            "该报告只比较 0k、1k、2k、5k、10k 五个预先固定的 checkpoint；"
+            "主指标为四套件分层宏平均成功率。"
+        ),
         "",
         "| optimizer step | baseline | BSP | BSP-baseline | paired bootstrap 95% CI |",
         "|---:|---:|---:|---:|:---|",
@@ -862,7 +1068,9 @@ def _render_markdown(milestones: Sequence[Mapping[str, Any]]) -> str:
         lines.append(
             "| {checkpoint_step} | {baseline_four_suite_macro_success_rate:.6f} | "
             "{bsp_four_suite_macro_success_rate:.6f} | {bsp_minus_baseline:.6f} | "
-            "[{low:.6f}, {high:.6f}] |".format(low=row["bootstrap_95_ci"][0], high=row["bootstrap_95_ci"][1], **row)
+            "[{low:.6f}, {high:.6f}] |".format(
+                low=row["bootstrap_95_ci"][0], high=row["bootstrap_95_ci"][1], **row
+            )
         )
     lines.extend(
         [
@@ -911,7 +1119,9 @@ def _render_svg(milestones: Sequence[Mapping[str, Any]]) -> str:
         value = tick / 5
         y_pos = y(value)
         elements.append(
-            '<line x1="{}" y1="{:.2f}" x2="{}" y2="{:.2f}" stroke="#dddddd"/>'.format(left, y_pos, width - right, y_pos)
+            '<line x1="{}" y1="{:.2f}" x2="{}" y2="{:.2f}" stroke="#dddddd"/>'.format(
+                left, y_pos, width - right, y_pos
+            )
         )
         elements.append(
             '<text x="{}" y="{:.2f}" text-anchor="end" font-family="sans-serif" font-size="12">{:.1f}</text>'.format(
@@ -923,11 +1133,15 @@ def _render_svg(milestones: Sequence[Mapping[str, Any]]) -> str:
             '<line x1="{}" y1="{}" x2="{}" y2="{}" stroke="#222"/>'.format(
                 left, top + plot_height, width - right, top + plot_height
             ),
-            '<line x1="{}" y1="{}" x2="{}" y2="{}" stroke="#222"/>'.format(left, top, left, top + plot_height),
+            '<line x1="{}" y1="{}" x2="{}" y2="{}" stroke="#222"/>'.format(
+                left, top, left, top + plot_height
+            ),
             '<polyline points="{}" fill="none" stroke="#3b82f6" stroke-width="3"/>'.format(
                 html.escape(baseline_points)
             ),
-            '<polyline points="{}" fill="none" stroke="#ef4444" stroke-width="3"/>'.format(html.escape(bsp_points)),
+            '<polyline points="{}" fill="none" stroke="#ef4444" stroke-width="3"/>'.format(
+                html.escape(bsp_points)
+            ),
         ]
     )
     for index, row in enumerate(milestones):
@@ -941,7 +1155,9 @@ def _render_svg(milestones: Sequence[Mapping[str, Any]]) -> str:
             (row["baseline_four_suite_macro_success_rate"], "#3b82f6"),
             (row["bsp_four_suite_macro_success_rate"], "#ef4444"),
         ):
-            elements.append('<circle cx="{:.2f}" cy="{:.2f}" r="4" fill="{}"/>'.format(x_pos, y(value), color))
+            elements.append(
+                '<circle cx="{:.2f}" cy="{:.2f}" r="4" fill="{}"/>'.format(x_pos, y(value), color)
+            )
     elements.extend(
         [
             '<text x="{}" y="{}" font-family="sans-serif" font-size="12" fill="#3b82f6">baseline</text>'.format(
@@ -951,8 +1167,11 @@ def _render_svg(milestones: Sequence[Mapping[str, Any]]) -> str:
                 width - 100, 20
             ),
             (
-                '<text x="{}" y="{}" text-anchor="middle" font-family="sans-serif" font-size="12">optimizer step</text>'
-            ).format(left + plot_width / 2, height - 10),
+                '<text x="{}" y="{}" text-anchor="middle" font-family="sans-serif" '
+                'font-size="12">optimizer step</text>'
+            ).format(
+                left + plot_width / 2, height - 10
+            ),
             "</svg>",
         ]
     )
@@ -991,7 +1210,9 @@ def compare_phase_one(
     norm_comparison_file = Path(norm_comparison_path).expanduser().resolve()
     bsp_diagnostics = load_strict_json(bsp_diagnostics_file)
     norm_diagnostics = load_strict_json(norm_comparison_file)
-    reconstruction = validate_diagnostics([run.manifest for run in runs], bsp_diagnostics, norm_diagnostics)
+    reconstruction = validate_diagnostics(
+        [run.manifest for run in runs], bsp_diagnostics, norm_diagnostics
+    )
 
     all_task_rows: List[Mapping[str, Any]] = []
     all_suite_rows: List[Mapping[str, Any]] = []

@@ -359,7 +359,15 @@ ImportError、黑屏、错误 shape 或崩溃是失败。
 解释器、LIBERO gitlink 和 EGL 配置的可复算摘要，不是镜像 ID：
 
 ```bash
-export CODE_SHA="$(git -C "$BSP_REPO_DIR" rev-parse HEAD)"
+if ! EVALUATOR_CODE_SHA="$(git -C "$BSP_REPO_DIR" rev-parse HEAD)"; then
+  echo "STOP: cannot resolve evaluator Git identity" >&2
+  exit 2
+fi
+if ! evaluator_status="$(git -C "$BSP_REPO_DIR" status --porcelain --untracked-files=all)"; then
+  echo "STOP: cannot inspect evaluator Git status" >&2
+  exit 2
+fi
+test -z "$evaluator_status"
 export HOST_RUNTIME_DIGEST="sha256:$(
   {
     "$OPENPI_PY" --version
@@ -405,10 +413,12 @@ env \
   --args.policy-variant baseline \
   --args.expected-action-horizon 10 \
   --args.num-trials-per-task 5 \
+  --args.control-freq 20 \
+  --args.video-fps 40 \
+  --args.video-show-inference-waits \
   --args.output-dir "$OFFICIAL_CAL" \
   --args.config-name pi05_libero \
   --args.checkpoint-step 30000 \
-  --args.code-sha "$CODE_SHA" \
   --args.dataset-revision v2.0 \
   --args.norm-hash "$OFFICIAL_NORM_HASH" \
   --args.checkpoint "$OPENPI_DATA_HOME/openpi-assets/checkpoints/pi05_libero" \
@@ -617,8 +627,18 @@ step 0 必须在第一次正梯度更新前完成；它是各自 config/norm/pro
 
 每个 checkpoint 运行四套件 × 10 tasks × 50 initial states = 2,000 episodes；十个 run
 总计 20,000。baseline 服务输出 h16，执行前 8 步；BSP 服务在反归一化后解码 h8。两者
-都在 10 Hz 下每 8 步重规划，并从 `(suite, task, init_state, replan_index)` 派生相同 flow
+都在 20 Hz 下每 8 步重规划，并从 `(suite, task, init_state, replan_index)` 派生相同 flow
 noise seed。
+
+正式评测写 schema v3，并区分四个时钟：dataset FPS=10、来源示范环境=20 Hz、评测环境
+`control_freq_hz=20`、MP4 默认 40 FPS。dataset/source 频率只作身份记录，不参与录像
+帧数计算。同步请求 latency 与 control stall 使用同一实测区间；未来异步请求可以有 latency
+而没有 stall，只有 stall 才冻结画面。开启 `--args.video-show-inference-waits` 只改变被选中
+MP4 与 `video_audit.jsonl`，不得改变动作、环境步数、done 或成功率。缺少 stall source frame、
+缺少 overlay、zero-step padding 不一致或编码回读不一致都会产生 artifact error。
+
+schema-v2 结果只作不可变归档，不能混入正式 comparator。十次正式评测必须来自同一个 clean
+checkout；evaluator 自动记录 HEAD，不再接受手工代码 SHA 参数。
 
 对每个 `variant/step`：
 
@@ -653,10 +673,12 @@ env \
   --args.policy-variant bsp \
   --args.expected-action-horizon 8 \
   --args.num-trials-per-task 50 \
+  --args.control-freq 20 \
+  --args.video-fps 40 \
+  --args.video-show-inference-waits \
   --args.output-dir "$OUTPUT" \
   --args.config-name "$BSP_CONFIG" \
   --args.checkpoint-step "$STEP" \
-  --args.code-sha "$CODE_SHA" \
   --args.dataset-revision v2.0 \
   --args.bsp-cache-hash "$BSP_CACHE_HASH" \
   --args.bsp-cache-manifest-fingerprint "$BSP_FINGERPRINT" \

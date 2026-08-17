@@ -8,6 +8,7 @@ import pytest
 
 from openpi_client import libero_eval
 from openpi_client import libero_report
+from openpi_client import libero_video_timing
 
 
 _STEPS = (0, 1000, 2000, 5000, 10000)
@@ -37,8 +38,13 @@ _VERIFICATION_FLAGS = (
 def _manifest(variant, step, *, family="full"):
     baseline = variant == "baseline"
     return {
-        "schema_version": 2,
-        "native_control_hz": 10,
+        "schema_version": 3,
+        "dataset_fps": 10,
+        "source_demo_control_hz": 20,
+        "control_freq_hz": 20,
+        "video_fps": 40,
+        "video_show_inference_waits": False,
+        "inference_schedule": "synchronous",
         "replan_steps": 8,
         "code_sha": _CODE_SHA,
         "dataset_revision": "v2.0",
@@ -72,6 +78,22 @@ def _manifest(variant, step, *, family="full"):
     }
 
 
+def _manifest_v2(variant, step, *, family="full"):
+    manifest = _manifest(variant, step, family=family)
+    for field in (
+        "dataset_fps",
+        "source_demo_control_hz",
+        "control_freq_hz",
+        "video_fps",
+        "video_show_inference_waits",
+        "inference_schedule",
+    ):
+        manifest.pop(field)
+    manifest["schema_version"] = 2
+    manifest["native_control_hz"] = 10
+    return manifest
+
+
 def _write_json(path, payload):
     path.write_text(json.dumps(payload, allow_nan=False, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -92,6 +114,12 @@ def _episode(suite, task_id, init_index, success):
         failure_kind=None if success else "policy",
         error=None if success else "policy output invalid",
         inference_ms=(1.0,),
+        inference_requests=(
+            libero_video_timing.InferenceRequest(0, 0, 1_000_000),
+        ),
+        control_stalls=(
+            libero_video_timing.ControlStall(0, 0, 0, 1_000_000),
+        ),
     )
     return libero_eval.EpisodeRecord.from_attempt(
         identity,
@@ -278,6 +306,141 @@ class TestLiberoPhaseOneReport:
         with pytest.raises(libero_report.ComparisonError):
             libero_report.classify_phase_one_manifests(mismatched)
 
+    def test_schema_two_is_archive_only_and_mixed_versions_are_rejected(self):
+        valid = [_manifest(variant, step) for variant in ("baseline", "bsp") for step in _STEPS]
+        v2 = [_manifest_v2(variant, step) for variant in ("baseline", "bsp") for step in _STEPS]
+        for manifests in (
+            v2,
+            [v2[0], *valid[1:]],
+        ):
+            with pytest.raises(libero_report.ComparisonError, match="archive-only"):
+                libero_report.classify_phase_one_manifests(manifests)
+
+    @pytest.mark.parametrize("schema_version", (1, 4))
+    def test_unsupported_manifest_schema_versions_are_explicit(self, schema_version):
+        manifest = _manifest("baseline", 0)
+        manifest["schema_version"] = schema_version
+
+        with pytest.raises(libero_report.ComparisonError, match="unsupported schema_version"):
+            libero_report._validate_manifest(manifest)
+
+    def test_artifact_only_video_settings_may_differ_but_metric_clocks_must_match(self):
+        valid = [_manifest(variant, step) for variant in ("baseline", "bsp") for step in _STEPS]
+        artifact_differences = copy.deepcopy(valid)
+        artifact_differences[0]["video_fps"] = 60
+        artifact_differences[1]["video_show_inference_waits"] = True
+        libero_report.classify_phase_one_manifests(artifact_differences)
+
+        for field, value in (
+            ("dataset_fps", 11),
+            ("source_demo_control_hz", 10),
+            ("control_freq_hz", 10),
+            ("inference_schedule", "asynchronous"),
+        ):
+            changed = copy.deepcopy(valid)
+            changed[0][field] = value
+            with pytest.raises(libero_report.ComparisonError):
+                libero_report.classify_phase_one_manifests(changed)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        (
+            ("video_fps", 0),
+            ("video_fps", 30),
+            ("video_fps", True),
+            ("video_show_inference_waits", 1),
+        ),
+    )
+    def test_invalid_per_run_video_artifact_settings_are_rejected(self, field, value):
+        manifests = [_manifest(variant, step) for variant in ("baseline", "bsp") for step in _STEPS]
+        manifests[0][field] = value
+        with pytest.raises(libero_report.ComparisonError):
+            libero_report.classify_phase_one_manifests(manifests)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        (
+            ("schema_version", 3.0),
+            ("schema_version", True),
+            ("checkpoint_step", 0.0),
+            ("checkpoint_step", False),
+            ("expected_action_horizon", 16.0),
+            ("expected_action_horizon", True),
+            ("execution_horizon", 8.0),
+            ("trials_per_task", 50.0),
+            ("num_steps_wait", 10.0),
+            ("infrastructure_retries", 2.0),
+            ("train_seed", 42.0),
+            ("eval_seed", True),
+            ("replan_steps", 8.0),
+        ),
+    )
+    def test_manifest_rejects_forged_non_integer_protocol_fields(self, field, value):
+        manifest = _manifest("baseline", 0)
+        manifest[field] = value
+        manifest = json.loads(json.dumps(manifest, allow_nan=False))
+        with pytest.raises(libero_report.ComparisonError):
+            libero_report._validate_manifest(manifest)
+
+    @pytest.mark.parametrize("value", [0.0, True])
+    def test_manifest_rejects_forged_task_ids_and_suite_max_steps(self, value):
+        manifest = _manifest("baseline", 0)
+        manifest["task_ids"] = list(manifest["task_ids"])
+        manifest["task_ids"][0] = value
+        manifest = json.loads(json.dumps(manifest, allow_nan=False))
+        with pytest.raises(libero_report.ComparisonError):
+            libero_report._validate_manifest(manifest)
+
+        manifest = _manifest("baseline", 0)
+        manifest["max_steps_by_suite"] = dict(manifest["max_steps_by_suite"])
+        manifest["max_steps_by_suite"]["libero_spatial"] = 220.0 if value == 0.0 else True
+        manifest = json.loads(json.dumps(manifest, allow_nan=False))
+        with pytest.raises(libero_report.ComparisonError):
+            libero_report._validate_manifest(manifest)
+
+    @pytest.mark.parametrize(
+        "suites",
+        (
+            {suite: None for suite in libero_eval.SUPPORTED_SUITES},
+            tuple(libero_eval.SUPPORTED_SUITES),
+            "".join(libero_eval.SUPPORTED_SUITES),
+        ),
+    )
+    def test_manifest_requires_suites_to_be_a_json_list(self, suites):
+        manifest = _manifest("baseline", 0)
+        manifest["suites"] = suites
+        with pytest.raises(libero_report.ComparisonError):
+            libero_report._validate_manifest(manifest)
+
+    @pytest.mark.parametrize("value", [0, True, None, ""])
+    def test_manifest_requires_nonempty_supported_string_suite_items(self, value):
+        manifest = _manifest("baseline", 0)
+        manifest["suites"] = list(manifest["suites"])
+        manifest["suites"][0] = value
+        manifest = json.loads(json.dumps(manifest, allow_nan=False))
+        with pytest.raises(libero_report.ComparisonError):
+            libero_report._validate_manifest(manifest)
+
+    def test_manifest_accepts_canonical_suite_json_list(self):
+        manifest = _manifest("baseline", 0)
+        manifest = json.loads(json.dumps(manifest, allow_nan=False))
+        assert manifest["suites"] == list(libero_eval.SUPPORTED_SUITES)
+        assert libero_report._validate_manifest(manifest) == ("baseline", 0)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        (
+            ("task_ids", tuple(range(10))),
+            ("max_steps_by_suite", list(_manifest("baseline", 0)["max_steps_by_suite"].items())),
+            ("bsp_parameters", list(libero_eval.BSP_PARAMETERS.items())),
+        ),
+    )
+    def test_manifest_rejects_non_json_sequence_and_mapping_containers(self, field, value):
+        manifest = _manifest("baseline", 0)
+        manifest[field] = value
+        with pytest.raises(libero_report.ComparisonError):
+            libero_report._validate_manifest(manifest)
+
     def test_replan_protocol_is_not_mutable_through_public_bsp_parameters(self):
         original_parameters = dict(libero_eval.BSP_PARAMETERS)
         try:
@@ -443,6 +606,8 @@ class TestLiberoPhaseOneReport:
                 steps=1,
                 replans=1,
                 inference_ms=(1.0,),
+                inference_requests=(libero_video_timing.InferenceRequest(0, 0, 1_000_000),),
+                control_stalls=(libero_video_timing.ControlStall(0, 0, 0, 1_000_000),),
             )
 
         valid = libero_eval.run_episode_with_retries(
@@ -473,6 +638,91 @@ class TestLiberoPhaseOneReport:
             record = dict(valid, infrastructure_history=history)
             with pytest.raises(libero_report.ComparisonError):
                 libero_report._validate_episode(record, manifest)
+
+    @pytest.mark.parametrize("eval_seed", (42.0, True))
+    def test_episode_validation_rejects_non_integer_eval_seed(self, eval_seed):
+        manifest = _manifest("baseline", 10000)
+        record = _episode("libero_spatial", 0, 0, True).to_dict()
+        record["eval_seed"] = eval_seed
+
+        with pytest.raises(libero_report.ComparisonError, match="eval_seed must be an integer"):
+            libero_report._validate_episode(record, manifest)
+
+    @pytest.mark.parametrize("attempt", (1.0, True))
+    def test_episode_validation_rejects_non_integer_history_attempt(self, attempt):
+        manifest = _manifest("baseline", 10000)
+        identity = _episode("libero_spatial", 0, 0, True).identity
+
+        def run_attempt(attempt_number):
+            if attempt_number == 1:
+                raise libero_eval.InfrastructureFailure("network", "socket timeout")
+            return libero_eval.AttemptResult(
+                success=True,
+                steps=1,
+                replans=1,
+                inference_ms=(1.0,),
+                inference_requests=(libero_video_timing.InferenceRequest(0, 0, 1_000_000),),
+                control_stalls=(libero_video_timing.ControlStall(0, 0, 0, 1_000_000),),
+            )
+
+        record = libero_eval.run_episode_with_retries(
+            identity,
+            run_attempt,
+            eval_seed=42,
+            infrastructure_retries=2,
+        ).to_dict()
+        record["infrastructure_history"][0]["attempt"] = attempt
+
+        with pytest.raises(libero_report.ComparisonError, match="history attempt must be an integer"):
+            libero_report._validate_episode(record, manifest)
+
+    def test_schema_three_episode_timing_rejects_forged_events(self):
+        manifest = _manifest("baseline", 10000)
+        valid = _episode("libero_spatial", 0, 0, True).to_dict()
+        cases = []
+        cases.append(dict(valid, inference_requests=None))
+        wrong_clock = copy.deepcopy(valid)
+        wrong_clock["inference_requests"][0]["clock"] = "absolute_monotonic_ns"
+        cases.append(wrong_clock)
+        bool_duration = copy.deepcopy(valid)
+        bool_duration["control_stalls"][0]["duration_ns"] = True
+        cases.append(bool_duration)
+        bad_reason = copy.deepcopy(valid)
+        bad_reason["control_stalls"][0]["reason"] = "async_action_underflow"
+        cases.append(bad_reason)
+        mismatch = copy.deepcopy(valid)
+        mismatch["control_stalls"][0]["duration_ns"] += 1
+        cases.append(mismatch)
+        forged_latency = copy.deepcopy(valid)
+        forged_latency["inference_ms"] = [2.0]
+        forged_latency["mean_inference_ms"] = 2.0
+        cases.append(forged_latency)
+        extra_field = copy.deepcopy(valid)
+        extra_field["inference_requests"][0]["wall_clock"] = 123
+        cases.append(extra_field)
+        for record in cases:
+            with pytest.raises(libero_report.ComparisonError):
+                libero_report._validate_episode(record, manifest)
+
+    def test_sync_timeout_has_exact_pairs_and_policy_failure_may_record_failed_trailing_request(self):
+        manifest = _manifest("baseline", 10000)
+        timeout = _episode("libero_spatial", 0, 0, False).to_dict()
+        timeout.update(status="timeout_failure", failure_kind="timeout", error="max steps")
+        libero_report._validate_episode(timeout, manifest)
+
+        policy_failure = _episode("libero_spatial", 0, 0, False).to_dict()
+        policy_failure["inference_requests"].append(
+            libero_video_timing.InferenceRequest(1, 2_000_000, 500_000).to_dict()
+        )
+        policy_failure["control_stalls"].append(
+            libero_video_timing.ControlStall(1, 1, 2_000_000, 500_000).to_dict()
+        )
+        libero_report._validate_episode(policy_failure, manifest)
+
+        success_with_extra = copy.deepcopy(policy_failure)
+        success_with_extra.update(status="success", success=True, failure_kind=None, error=None)
+        with pytest.raises(libero_report.ComparisonError):
+            libero_report._validate_episode(success_with_extra, manifest)
 
     def test_diagnostics_must_match_all_variant_artifact_identities(self):
         manifests = [_manifest(variant, step) for variant in ("baseline", "bsp") for step in _STEPS]

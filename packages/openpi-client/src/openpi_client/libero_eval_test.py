@@ -240,7 +240,14 @@ class TestLiberoEvaluation:
         assert payload["checkpoint_step"] == 10000
         assert payload["bsp_cache_hash"] == "a" * 64
         assert payload["bsp_cache_manifest_fingerprint"] == "c" * 64
-        assert payload["schema_version"] == 2
+        assert payload["schema_version"] == 3
+        assert "native_control_hz" not in payload
+        assert payload["dataset_fps"] == 10
+        assert payload["source_demo_control_hz"] == 20
+        assert payload["control_freq_hz"] == 20
+        assert payload["video_fps"] == 40
+        assert payload["video_show_inference_waits"] is False
+        assert payload["inference_schedule"] == "synchronous"
         assert payload["bsp_parameters"]["target_rows"] == 16
         assert payload["policy_protocol"] == "bsp_decoded_h8"
         assert payload["expected_action_horizon"] == 8
@@ -276,7 +283,7 @@ class TestLiberoEvaluation:
             (bsp_manifest, "bsp_cache_hash"),
             (bsp_manifest, "bsp_cache_manifest_fingerprint"),
         ):
-            with pytest.raises(TypeError):
+            with pytest.raises(ValueError):
                 dataclasses.replace(candidate, **{field: 123})
         for field, value in (
             ("code_sha", "abc"),
@@ -289,6 +296,23 @@ class TestLiberoEvaluation:
         ):
             with pytest.raises(ValueError):
                 dataclasses.replace(manifest, **{field: value})
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        (
+            ("dataset_fps", True),
+            ("dataset_fps", 20),
+            ("source_demo_control_hz", 10),
+            ("control_freq_hz", 10),
+            ("video_fps", 0),
+            ("video_fps", 30),
+            ("video_show_inference_waits", 1),
+            ("inference_schedule", "background"),
+        ),
+    )
+    def test_manifest_rejects_invalid_schema_three_clock_fields(self, field, value):
+        with pytest.raises(ValueError):
+            dataclasses.replace(_manifest(), **{field: value})
 
     def test_shared_artifact_helpers_preserve_wire_bytes_and_clean_failed_replacements(self, tmp_path):
         assert libero_artifacts.json_text({"z": 2, "a": 1}) == '{\n  "a": 1,\n  "z": 2\n}\n'
