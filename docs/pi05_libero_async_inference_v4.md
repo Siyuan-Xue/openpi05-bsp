@@ -14,9 +14,10 @@
 - 论文：[BSP paper（arXiv:2607.09648v1）](https://arxiv.org/html/2607.09648v1)。
 - 作者仓库固定在 commit
   [`61ed5f42fced971d50a89b46417493790876ccd1`](https://github.com/B-spline-policy/bspline-policy/tree/61ed5f42fced971d50a89b46417493790876ccd1)，
-  本仓库移植的直接依据是该 revision 的
-  [`bspline_action.py`](https://github.com/B-spline-policy/bspline-policy/blob/61ed5f42fced971d50a89b46417493790876ccd1/bspline_policy/bspline_policy/common/bspline_action.py)
-  中的 FITPACK 分段与 knot repair 行为。
+  continuous execution、single-inflight 与 prefetch 的直接参考是该 revision 的
+  [`policy_local_bspline.py`](https://github.com/B-spline-policy/bspline-policy/blob/61ed5f42fced971d50a89b46417493790876ccd1/bspline_policy/bspline_policy/scripts/policy_local_bspline.py)；
+  FITPACK 分段与 knot repair 的直接参考是
+  [`bspline_action.py`](https://github.com/B-spline-policy/bspline-policy/blob/61ed5f42fced971d50a89b46417493790876ccd1/bspline_policy/bspline_policy/common/bspline_action.py)。
 
 本仓库保留 cubic degree 3、`(16, 8)` 参数、前 7 维控制量与第 8 维 knot、前 12 行控制点、
 下降 knot 的 `previous + 1e-6` 投影和闭区间内采样。LIBERO 是 delta end-effector action；依论文
@@ -24,17 +25,19 @@ Appendix 的 simulation 设置，**不做 segment alignment**，协议固定为
 `alignment="disabled_delta_eff"`。因此不能把论文中面向 absolute-pose 的 closest-point/alignment
 步骤移植到这里。
 
-BSP async 借用作者实现中“只允许一个请求在途”和 epoch/generation 令旧结果失效的并发思想；
-线程生命周期则按本仓库的故障边界实现：owner 线程是 non-daemon，关闭时必须有界 `join`，连接、
-推理和关闭错误都向控制器可见。这部分是 OpenPI/LIBERO transport 适配，不应归因于论文算法。
+BSP async 只借用作者实现中的 single-inflight 与 prefetch 时机。generation/epoch 失效、旧连接退休、
+owner 线程 non-daemon、有界 `join` 以及连接/推理/关闭错误通道都是本仓库的 OpenPI/LIBERO transport
+实现，不应归因于 BSP 论文或作者代码。
 
 ### Real-Time Chunking（RTC）
 
 - 论文：[Real-Time Execution of Action Chunking Flow Policies](https://arxiv.org/html/2506.07339v2)。
-- Physical Intelligence 研究页：[Real-Time Chunking](https://www.physicalintelligence.company/research/real_time_chunking)。
+- Physical Intelligence 研究页：[Real-Time Chunking](https://www.pi.website/research/real_time_chunking)。
 - 作者 Kinetix 代码固定在 commit
   [`9296f31d62d5bfeb5779dcb2f9bcf71ca37f448b`](https://github.com/Physical-Intelligence/real-time-chunking-kinetix/tree/9296f31d62d5bfeb5779dcb2f9bcf71ca37f448b)，
-  model/eval 两侧共同作为协议参考。
+  其中 [`src/model.py`](https://github.com/Physical-Intelligence/real-time-chunking-kinetix/blob/9296f31d62d5bfeb5779dcb2f9bcf71ca37f448b/src/model.py)
+  与 [`src/eval_flow.py`](https://github.com/Physical-Intelligence/real-time-chunking-kinetix/blob/9296f31d62d5bfeb5779dcb2f9bcf71ca37f448b/src/eval_flow.py)
+  共同作为 model/eval 协议参考。
 
 本实现把完整 guided VJP 接入 OpenPI 的 `Pi0.sample_actions_rtc`，不是在客户端对两个 action chunk
 做线程化插值的近似。论文时间变量从 data 到 noise；OpenPI sampler 从 noise 到 data，所以映射后
@@ -44,15 +47,19 @@ BSP async 借用作者实现中“只允许一个请求在途”和 epoch/genera
 也取 5。
 
 LIBERO/OpenPI 的冻结适配是：horizon `H=16`、最早发起位置 `s_min=8`、五步采样 `n=5`、
-`beta=5`、最近 10 次实际延迟的最大值作为 forecast；服务端保留完整 `(16, 32)` normalized model
-actions 供下一次引导，但一致性 mask 只覆盖原生动作的前 `7/32` 维。客户端同时严格校验
-`actions:(16,7)` 与 `rtc.model_actions:(16,32)`。
+`beta=5`。delay history 初始化为校准得到的 `d_init`，以后追加每次 guided request 的实际 delay
+ticks，只保留最新 10 项，并取其中最大值作为 forecast；它不是“最近 10 次实际延迟”从空队列开始。
+服务端保留完整 `(16, 32)` normalized model actions 供下一次引导，但一致性 mask 只覆盖原生动作的
+前 `7/32` 维。客户端同时严格校验 `actions:(16,7)` 与 `rtc.model_actions:(16,32)`。
 
 ### WebSocket 单 owner
 
-`openpi-client` 使用 websockets 13.1 的同步 API。其官方文档明确，同一连接上两个线程并发调用
-`recv()` 会触发 `ConcurrencyError`：
+single-owner 合约对照 websockets 13.1 的同步 API 文档验证；该文档明确，同一连接上两个线程并发
+调用 `recv()` 会触发 `ConcurrencyError`：
 [websockets 13.1 sync client reference](https://websockets.readthedocs.io/en/13.1/reference/sync/client.html)。
+这不是把服务器 runtime 钉死在 13.1：`openpi-client` 声明的是 `websockets>=11.0`，当前根 lock
+解析到 15.x，而本路径只使用 13.1/15.x 共有的 sync client surface。实际服务器版本必须由下文
+preflight 报告，不能从文档假定。
 因此连接创建、metadata 接收、request `send/recv` 与 socket close 全部由一个 owner 线程串行拥有；
 控制线程只使用 `submit/poll/wait/reset_generation/close`。worker 最多一个 queued/active request，
 每次 episode/retry 的 generation reset 会废弃旧 job 并等待旧连接退休，不允许第二个接收者绕开它。
@@ -139,10 +146,13 @@ run-fatal，即使已有 primary error 也必须同时保留 cleanup failure。
 - `summary.json`：由 episode 与 artifact errors 派生的完整性汇总；
 - `video_audit.jsonl` 与 `videos/`：只记录被选择视频的计划帧、可选 stall 帧、最多一帧的零步 artifact
   padding 与编码后复核；
-- `artifact_errors.jsonl`：可选错误账本；非空时正式报告拒绝该 run。
+- `artifact_errors.jsonl`：仓库内 v4 writer 初始化时总会创建（可以为空）；loader 为兼容外部/既有 v4
+  目录允许该文件缺失，但只要存在且非空，正式报告就拒绝该 run。
 
 v4 loader 严格拒绝 duplicate JSON keys、NaN/Inf、字段集合或汇总不一致、infrastructure incomplete、
-视频审计/hash 不一致和任何 artifact error。它不调用 v2/v3 producer/reader；旧
+视频审计语义不一致和任何 artifact error。formal loader 计算并保留四个必需文件
+`manifest.json`、`episodes.jsonl`、`summary.json`、`video_audit.jsonl` 的 SHA256；它不对 MP4/video
+文件计算或验证 hash，video 只通过持久化的 audit 字段做语义校验。它不调用 v2/v3 producer/reader；旧
 `main.py`、旧 manifest 与旧 reporter 保持只读语义，不能自动升级。
 
 单 checkpoint 报告需要精确四个 run；正式五 checkpoint 报告需要
@@ -171,16 +181,48 @@ v4 loader 严格拒绝 duplicate JSON keys、NaN/Inf、字段集合或汇总不�
 以下命令不由本机或本次改动执行。接手者应先在服务器进入已推送 commit 的**干净 checkout**，再复用
 既有 runbook 中已安装的两个环境；不要在 macOS 本机安装依赖。
 
+canonical runbook 最后用 `pip install --no-deps -e packages/openpi-client`，它只安装 editable package，
+**不保证** client 环境已经有 `pytest`、`msgpack` 或 `websockets`。本任务未获授权在本机安装任何
+依赖；服务器接手者也应先执行下面的版本/import gate，缺包或版本不符就停止，再按服务器变更流程
+显式补齐环境，不能跳过 gate 后把 import failure 误判为代码回归。
+
 ### OpenPI 根环境：Python 3.11（NOT RUN）
+
+版本/import preflight（NOT RUN）：
+
+```bash
+cd "$BSP_REPO_DIR"
+"$OPENPI_PY" - <<'PY'
+import sys
+from importlib import metadata
+
+assert sys.version_info[:2] == (3, 11), sys.version
+import msgpack
+import pytest
+import websockets
+for distribution in ("pytest", "msgpack", "websockets"):
+    print(distribution, metadata.version(distribution))
+from openpi.models import pi0
+from openpi.policies import policy
+from openpi.training import bsp
+print("openpi_root_import_gate=PASS")
+PY
+```
+
+测试合同（NOT RUN）：
 
 ```bash
 cd "$BSP_REPO_DIR"
 "$OPENPI_PY" -m pytest -q \
   src/openpi/models/pi0_test.py \
   src/openpi/policies/policy_seed_test.py \
+  src/openpi/policies/libero_policy_test.py \
   scripts/serve_policy_test.py \
   src/openpi/training/bsp_test.py \
-  src/openpi/training/bsp_dataset_test.py
+  src/openpi/training/bsp_dataset_test.py \
+  src/openpi/training/loader_resume_test.py \
+  src/openpi/training/train_planning_test.py \
+  scripts/prepare_libero_bsp_test.py
 ```
 
 按待测 family 启动一个 policy server；baseline 两种 mode 使用 baseline checkpoint，BSP 两种 mode
@@ -198,6 +240,33 @@ cd "$BSP_REPO_DIR"
 
 ### LIBERO client 环境：Python 3.8（NOT RUN）
 
+版本/import preflight（NOT RUN）；这里打印实际 websockets 版本，而不是假定为 13.1：
+
+```bash
+cd "$BSP_REPO_DIR"
+env PYTHONPATH="$LIBERO_PYTHONPATH" "$LIBERO_PY" - <<'PY'
+import sys
+from importlib import metadata
+
+assert sys.version_info[:2] == (3, 8), sys.version
+import msgpack
+import pytest
+import websockets
+for distribution in ("pytest", "msgpack", "websockets"):
+    print(distribution, metadata.version(distribution))
+from openpi_client import async_inference
+from openpi_client import libero_control_v4
+from openpi_client import libero_eval_v4
+from openpi_client import libero_report_v4
+from openpi_client import libero_video_timing_v4
+from openpi_client import websocket_client_policy
+from examples.libero import main_v4
+print("libero_client_import_gate=PASS")
+PY
+```
+
+新旧协议共同测试合同（NOT RUN）；v3 tests 在此作为“不被 v4 改写”的回归门禁：
+
 ```bash
 cd "$BSP_REPO_DIR"
 env PYTHONPATH="$LIBERO_PYTHONPATH" \
@@ -206,14 +275,21 @@ env PYTHONPATH="$LIBERO_PYTHONPATH" \
   __EGL_VENDOR_LIBRARY_FILENAMES="$EGL_VENDOR_JSON" \
   "$LIBERO_PY" -m pytest -q \
     packages/openpi-client/src/openpi_client/inference_test.py \
+    packages/openpi-client/src/openpi_client/msgpack_numpy_test.py \
+    packages/openpi-client/src/openpi_client/websocket_client_policy_test.py \
     packages/openpi-client/src/openpi_client/async_inference_test.py \
     packages/openpi-client/src/openpi_client/rtc_test.py \
     packages/openpi-client/src/openpi_client/bsp_spline_test.py \
+    packages/openpi-client/src/openpi_client/libero_video_timing_test.py \
+    packages/openpi-client/src/openpi_client/libero_eval_test.py \
+    packages/openpi-client/src/openpi_client/libero_eval_video_test.py \
+    packages/openpi-client/src/openpi_client/libero_report_test.py \
     packages/openpi-client/src/openpi_client/libero_control_v4_test.py \
     packages/openpi-client/src/openpi_client/libero_video_timing_v4_test.py \
     packages/openpi-client/src/openpi_client/libero_eval_v4_test.py \
     packages/openpi-client/src/openpi_client/libero_eval_v4_video_test.py \
     packages/openpi-client/src/openpi_client/libero_report_v4_test.py \
+    scripts/libero_eval_test.py \
     scripts/libero_eval_v4_test.py
 ```
 
@@ -246,4 +322,25 @@ env PYTHONPATH="$LIBERO_PYTHONPATH" \
 `--args.bsp-cache-hash "$BSP_CACHE_HASH"` 与
 `--args.bsp-cache-manifest-fingerprint "$BSP_FINGERPRINT"`；baseline mode 必须省略二者。先用一个
 checkpoint 的四个 mode 完成服务器 smoke/正式验证，再决定是否生成五 checkpoint 的 20-run 报告。
-这里不声明任何命令已经成功。
+
+`libero_report_v4.py` 没有 CLI；交接时必须调用现有 Python API
+`write_five_checkpoint_report_v4(run_dirs, *, output_dir=Path(...))`。同一 API 接受精确 4 个 run
+（单 checkpoint 四 mode）或精确 20 个 run（五个固定 checkpoint x 四 mode）。下面的 bash array
+必须由接手者填入 4 或 20 个唯一目录，report output 必须不存在或为空（NOT RUN）：
+
+```bash
+RUN_DIRS=(
+  "/path/to/run-1"
+  "/path/to/run-2"
+  "/path/to/run-3"
+  "/path/to/run-4"
+)
+export REPORT_OUTPUT="/path/to/new-or-empty-v4-report"
+
+cd "$BSP_REPO_DIR"
+env PYTHONPATH="$LIBERO_PYTHONPATH" \
+  "$LIBERO_PY" -c 'from pathlib import Path; import sys; from openpi_client.libero_report_v4 import write_five_checkpoint_report_v4; write_five_checkpoint_report_v4([Path(value) for value in sys.argv[2:]], output_dir=Path(sys.argv[1]))' \
+  "$REPORT_OUTPUT" "${RUN_DIRS[@]}"
+```
+
+这里不声明任何 preflight、测试、评测或报告命令已经成功。
