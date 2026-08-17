@@ -528,11 +528,9 @@ def _build_video_frames(
     if trailing_stall is not None:
         _, stall_frame_count, overlay_lines = trailing_stall
         frame = stall_source_by_step.get(frame_count)
-        if frame is None and control_frames:
-            frame = control_frames[-1]
         if stall_frame_count:
             if frame is None:
-                raise ValueError("Cannot render a control stall without its request-time source frame")
+                raise ValueError("Cannot render a trailing control stall without its request-time source frame")
             rendered_stall = _video_timing.render_overlay(
                 frame,
                 overlay_lines,

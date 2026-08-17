@@ -838,6 +838,19 @@ def test_trailing_stall_uses_transient_request_frame_instead_of_last_control_fra
     ]
 
 
+def test_trailing_stall_without_transient_request_frame_fails_closed():
+    stall = timing.ControlStall(1, 1, 0, 50_000_000)
+
+    with pytest.raises(ValueError, match="request-time source frame"):
+        libero_main._build_video_frames(
+            ("previous-control-frame",),
+            (stall,),
+            control_hz=20,
+            video_fps=40,
+            inference_schedule="synchronous",
+        )
+
+
 def test_zero_step_policy_failure_encodes_quantized_wait_or_single_raw_padding_frame(
     monkeypatch, tmp_path
 ):
