@@ -79,7 +79,6 @@ def _args():
         norm_hash="b" * 64,
         checkpoint="checkpoint/10000",
         container_digest="sha256:" + "d" * 64,
-        code_sha="a" * 40,
     )
 
 
@@ -199,7 +198,8 @@ def test_official_calibration_resolves_strict_horizon_10_protocol():
     assert protocol.expected_action_horizon == 10
 
 
-def test_single_task_smoke_filter_is_canonical_and_recorded_in_manifest():
+def test_single_task_smoke_filter_is_canonical_and_recorded_in_manifest(monkeypatch):
+    monkeypatch.setattr(libero_main, "_resolve_code_sha", lambda: "a" * 40)
     args = dataclasses.replace(
         _args(),
         task_suite_name="libero_spatial",
@@ -233,7 +233,7 @@ def test_automatic_code_sha_requires_clean_evaluator_checkout(monkeypatch):
 
     monkeypatch.setattr(libero_main.subprocess, "run", clean_run)
 
-    assert libero_main._resolve_code_sha("auto") == "a" * 40
+    assert libero_main._resolve_code_sha() == "a" * 40
     assert calls[0][1:3] == ["-C", str(libero_main.Path(libero_main.__file__).resolve().parents[2])]
     assert "--untracked-files=all" in calls[1]
 
@@ -243,17 +243,11 @@ def test_automatic_code_sha_requires_clean_evaluator_checkout(monkeypatch):
 
     monkeypatch.setattr(libero_main.subprocess, "run", dirty_run)
     with pytest.raises(RuntimeError, match="clean"):
-        libero_main._resolve_code_sha("auto")
+        libero_main._resolve_code_sha()
 
 
-def test_manual_code_sha_compatibility_override_does_not_run_git(monkeypatch):
-    monkeypatch.setattr(
-        libero_main.subprocess,
-        "run",
-        lambda *args, **kwargs: pytest.fail("manual compatibility override unexpectedly ran git"),
-    )
-
-    assert libero_main._resolve_code_sha("b" * 40) == "b" * 40
+def test_manual_code_sha_override_is_not_exposed():
+    assert "code_sha" not in {field.name for field in dataclasses.fields(libero_main.Args)}
 
 
 @pytest.mark.parametrize("task_ids", [(), (0, 0), (-1,), (10,)])

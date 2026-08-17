@@ -58,12 +58,11 @@ class Args:
     # Output directory must identify one policy/checkpoint evaluation run.
     output_dir: str = "data/libero/eval"
 
-    # Audit manifest identities. `code_sha=auto` reads the current checkout.
+    # Audit manifest identities. The evaluator always resolves a clean Git HEAD.
     policy_variant: str = "baseline"
     expected_action_horizon: Optional[int] = None  # noqa: UP045 -- simulator client runs Python 3.8.
     config_name: str = ""
     checkpoint_step: int = 0
-    code_sha: str = "auto"
     dataset_revision: str = "v2.0"
     bsp_cache_hash: Optional[str] = None  # noqa: UP045 -- simulator client runs Python 3.8.
     bsp_cache_manifest_fingerprint: Optional[str] = None  # noqa: UP045 -- Python 3.8.
@@ -160,9 +159,7 @@ class _TaskEnvironment:
         self.invalidate()
 
 
-def _resolve_code_sha(value: str) -> str:
-    if value != "auto":
-        return value
+def _resolve_code_sha() -> str:
     repo_root = Path(__file__).resolve().parents[2]
     try:
         result = subprocess.run(
@@ -210,7 +207,7 @@ def _make_manifest(
     bsp_cache_hash = args.bsp_cache_hash or None
     bsp_cache_manifest_fingerprint = args.bsp_cache_manifest_fingerprint or None
     return _eval.EvaluationManifest(
-        code_sha=_resolve_code_sha(args.code_sha),
+        code_sha=_resolve_code_sha(),
         dataset_revision=args.dataset_revision,
         config_name=args.config_name,
         checkpoint_step=args.checkpoint_step,
