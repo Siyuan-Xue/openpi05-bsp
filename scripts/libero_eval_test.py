@@ -1,9 +1,12 @@
 import dataclasses
+import sys
+import types
 
 import pytest
 
 from openpi_client import inference
 from openpi_client import libero_eval
+from openpi_client import libero_video_timing as timing
 
 from examples.libero import main as libero_main
 
@@ -82,6 +85,55 @@ def test_evaluator_defaults_to_the_real_official_dataset_revision():
     assert libero_main.Args().dataset_revision == "v2.0"
 
 
+def test_evaluator_defaults_to_20_hz_control_and_40_fps_video():
+    args = libero_main.Args()
+
+    assert args.control_freq == 20
+    assert args.video_fps == 40
+    assert args.video_show_inference_waits is False
+
+
+@pytest.mark.parametrize(
+    ("control_freq", "video_fps"),
+    [(10, 40), (20, 0), (20, 30), (True, 40)],
+)
+def test_evaluator_rejects_non_protocol_video_frequencies(control_freq, video_fps):
+    with pytest.raises(ValueError):
+        libero_main._validate_args(
+            dataclasses.replace(_args(), control_freq=control_freq, video_fps=video_fps)
+        )
+
+
+def test_offscreen_environment_receives_explicit_20_hz_control_frequency(monkeypatch):
+    captured = {}
+
+    class FakeEnvironment:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def seed(self, seed):
+            captured["seed"] = seed
+
+    libero_package = types.ModuleType("libero")
+    libero_module = types.ModuleType("libero.libero")
+    envs_module = types.ModuleType("libero.libero.envs")
+    libero_module.get_libero_path = lambda _name: "/benchmark"
+    envs_module.OffScreenRenderEnv = FakeEnvironment
+    libero_package.libero = libero_module
+    libero_module.envs = envs_module
+    monkeypatch.setitem(sys.modules, "libero", libero_package)
+    monkeypatch.setitem(sys.modules, "libero.libero", libero_module)
+    monkeypatch.setitem(sys.modules, "libero.libero.envs", envs_module)
+
+    task = types.SimpleNamespace(problem_folder="suite", bddl_file="task.bddl")
+    libero_main._get_libero_env(task, 256, 42, control_freq=20)
+
+    assert captured["control_freq"] == 20
+    assert captured["camera_heights"] == 256
+    assert captured["camera_widths"] == 256
+    assert captured["seed"] == 42
+
+
 def test_client_holder_passes_finite_inference_deadline(monkeypatch):
     captured = {}
 
@@ -153,6 +205,54 @@ def test_run_attempt_sends_reserved_seed_and_uses_exact_initial_state(monkeypatc
     assert environment.actions == [_actions()[0]]
 
 
+def test_run_attempt_records_synchronous_request_and_stall_without_extra_steps(monkeypatch):
+    environment = _Environment()
+    holder = _ClientHolder([_actions()])
+    identity = _identity()
+    clock = iter((1_000, 1_100, 3_100))
+    monkeypatch.setattr(libero_main.time, "monotonic_ns", lambda: next(clock))
+    monkeypatch.setattr(libero_main, "_prepare_observation", lambda obs, prompt, size: ({}, "frame"))
+
+    result = libero_main._run_attempt(
+        environment=environment,
+        client_holder=holder,
+        initial_state=object(),
+        identity=identity,
+        task_description="pick up the block",
+        args=_args(),
+        max_steps=1,
+    )
+
+    assert result.inference_requests == (
+        timing.InferenceRequest(replan_index=0, started_offset_ns=100, duration_ns=2_000),
+    )
+    assert result.control_stalls == (
+        timing.ControlStall(
+            control_step=0,
+            replan_index=0,
+            started_offset_ns=100,
+            duration_ns=2_000,
+        ),
+    )
+    assert result.inference_ms == (0.002,)
+    assert result.replay_frames == ("frame",)
+    assert len(environment.actions) == result.steps == 1
+
+
+def test_synchronous_stall_overlay_uses_exact_current_mode_text():
+    stall = timing.ControlStall(
+        control_step=0,
+        replan_index=0,
+        started_offset_ns=100,
+        duration_ns=125_000_000,
+    )
+
+    assert libero_main._synchronous_stall_overlay_lines(stall) == (
+        "Synchronous inference",
+        "Control stalled: 0.12 s",
+    )
+
+
 def test_network_retry_invalidates_client_and_reuses_init_state_and_seed(monkeypatch):
     environment = _Environment()
     holder = _ClientHolder([TimeoutError("stalled"), _actions()])
@@ -221,3 +321,163 @@ def test_episode_is_persisted_before_video_error_is_audited(tmp_path):
     assert persisted.replay_frames == ()
     assert artifact_error is not None
     assert [call[0] for call in calls] == ["episode", "video", "artifact_error"]
+
+
+def test_unselected_video_is_not_expanded_or_encoded(monkeypatch):
+    calls = []
+
+    class Writer:
+        def append_episode(self, record):
+            calls.append("episode")
+
+    class Selector:
+        def claim(self, record):
+            return None
+
+    monkeypatch.setattr(
+        libero_main,
+        "_build_video_frames",
+        lambda *args, **kwargs: pytest.fail("unselected video timeline was expanded"),
+    )
+    record = libero_eval.EpisodeRecord.from_attempt(
+        _identity(),
+        42,
+        1,
+        success=True,
+        result=libero_eval.AttemptResult(
+            success=True,
+            steps=1,
+            replans=0,
+            replay_frames=("frame",),
+        ),
+    )
+
+    persisted, artifact_error = libero_main._persist_episode_artifacts(
+        record,
+        Writer(),
+        Selector(),
+        video_encoder=lambda *args, **kwargs: pytest.fail("unselected video was encoded"),
+    )
+
+    assert persisted.replay_frames == ()
+    assert artifact_error is None
+    assert calls == ["episode"]
+
+
+def test_selected_video_expands_to_40_fps_reads_back_and_appends_audit(monkeypatch, tmp_path):
+    calls = []
+    encoded = {}
+
+    class Writer:
+        def append_episode(self, record):
+            calls.append("episode")
+
+        def append_video_audit(self, audit):
+            calls.append("video_audit")
+            encoded["audit"] = audit
+
+        def append_artifact_error(self, error):
+            calls.append("artifact_error")
+
+    class Selector:
+        def claim(self, record):
+            return tmp_path / "video.mp4"
+
+    class Reader:
+        def get_meta_data(self):
+            return {"fps": 40.0, "duration": 0.125}
+
+        def count_frames(self):
+            return 5
+
+        def close(self):
+            calls.append("reader_close")
+
+    def encoder(path, frames, *, fps):
+        calls.append("video")
+        encoded.update(path=path, frames=tuple(frames), fps=fps)
+
+    monkeypatch.setattr(libero_main.imageio, "get_reader", lambda path: Reader())
+    attempt = libero_eval.AttemptResult(
+        success=True,
+        steps=2,
+        replans=1,
+        inference_requests=(
+            timing.InferenceRequest(0, started_offset_ns=0, duration_ns=25_000_000),
+        ),
+        control_stalls=(
+            timing.ControlStall(0, 0, started_offset_ns=0, duration_ns=25_000_000),
+        ),
+        replay_frames=("frame-0", "frame-1"),
+    )
+    record = libero_eval.EpisodeRecord.from_attempt(
+        _identity(), 42, 1, success=True, result=attempt
+    )
+
+    _, artifact_error = libero_main._persist_episode_artifacts(
+        record,
+        Writer(),
+        Selector(),
+        video_fps=40,
+        video_show_inference_waits=False,
+        video_encoder=encoder,
+    )
+
+    assert artifact_error is None
+    assert encoded["fps"] == 40
+    assert len(encoded["frames"]) == 5
+    assert encoded["audit"].timing_gate
+    assert calls == ["episode", "video", "reader_close", "video_audit"]
+
+
+def test_duration_only_mismatch_logs_warning_without_artifact_error(monkeypatch, caplog, tmp_path):
+    audits = []
+
+    class Writer:
+        def append_episode(self, record):
+            pass
+
+        def append_video_audit(self, audit):
+            audits.append(audit)
+
+        def append_artifact_error(self, error):
+            pytest.fail("duration-only mismatch became an artifact error")
+
+    class Selector:
+        def claim(self, record):
+            return tmp_path / "video.mp4"
+
+    class Reader:
+        def get_meta_data(self):
+            return {"fps": 40.0, "duration": 0.2}
+
+        def count_frames(self):
+            return 5
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(libero_main.imageio, "get_reader", lambda path: Reader())
+    attempt = libero_eval.AttemptResult(
+        success=True,
+        steps=2,
+        replans=1,
+        inference_requests=(timing.InferenceRequest(0, 0, 25_000_000),),
+        control_stalls=(timing.ControlStall(0, 0, 0, 25_000_000),),
+        replay_frames=("frame-0", "frame-1"),
+    )
+    record = libero_eval.EpisodeRecord.from_attempt(
+        _identity(), 42, 1, success=True, result=attempt
+    )
+
+    _, artifact_error = libero_main._persist_episode_artifacts(
+        record,
+        Writer(),
+        Selector(),
+        video_fps=40,
+        video_encoder=lambda *args, **kwargs: None,
+    )
+
+    assert artifact_error is None
+    assert not audits[0].timing_gate
+    assert "encoded duration deviates" in caplog.text

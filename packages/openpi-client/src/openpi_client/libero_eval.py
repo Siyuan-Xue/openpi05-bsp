@@ -17,6 +17,8 @@ import re
 import tempfile
 from typing import Any
 
+from openpi_client import libero_video_timing as _video_timing
+
 
 SUPPORTED_SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
 _SUITE_ALIASES = {
@@ -243,6 +245,8 @@ class AttemptResult:
     failure_kind: str | None = None
     error: str | None = None
     inference_ms: tuple[float, ...] = ()
+    inference_requests: tuple[_video_timing.InferenceRequest, ...] = ()
+    control_stalls: tuple[_video_timing.ControlStall, ...] = ()
     replay_frames: tuple[Any, ...] = dataclasses.field(default=(), repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -252,6 +256,10 @@ class AttemptResult:
             raise ValueError("A successful rollout cannot have a failure kind")
         if not self.success and self.failure_kind not in {"policy", "timeout"}:
             raise ValueError("A counted failure must be classified as policy or timeout")
+        if any(not isinstance(event, _video_timing.InferenceRequest) for event in self.inference_requests):
+            raise TypeError("inference_requests must contain InferenceRequest records")
+        if any(not isinstance(event, _video_timing.ControlStall) for event in self.control_stalls):
+            raise TypeError("control_stalls must contain ControlStall records")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -268,6 +276,8 @@ class EpisodeRecord:
     steps: int = 0
     replans: int = 0
     inference_ms: tuple[float, ...] = ()
+    inference_requests: tuple[_video_timing.InferenceRequest, ...] = ()
+    control_stalls: tuple[_video_timing.ControlStall, ...] = ()
     infrastructure_history: tuple[Mapping[str, Any], ...] = ()
     replay_frames: tuple[Any, ...] = dataclasses.field(default=(), repr=False, compare=False)
 
@@ -302,6 +312,8 @@ class EpisodeRecord:
             steps=result.steps if result else 0,
             replans=result.replans if result else 0,
             inference_ms=result.inference_ms if result else (),
+            inference_requests=result.inference_requests if result else (),
+            control_stalls=result.control_stalls if result else (),
             infrastructure_history=tuple(infrastructure_history),
             replay_frames=result.replay_frames if result else (),
         )
@@ -351,6 +363,8 @@ class EpisodeRecord:
             "replans": self.replans,
             "inference_ms": timings,
             "mean_inference_ms": sum(timings) / len(timings) if timings else None,
+            "inference_requests": [event.to_dict() for event in self.inference_requests],
+            "control_stalls": [event.to_dict() for event in self.control_stalls],
             "infrastructure_history": [dict(entry) for entry in self.infrastructure_history],
         }
 
@@ -639,6 +653,105 @@ class ArtifactError:
         return dataclasses.asdict(self)
 
 
+@dataclasses.dataclass(frozen=True)
+class VideoArtifactAudit:
+    """Planned and encoded timing for one selected video artifact."""
+
+    episode_id: str
+    path: str
+    planned: _video_timing.VideoTimingAudit
+    encoded_fps: float
+    encoded_frame_count: int
+    encoded_duration_ns: int
+    encoded_duration_deviation_ns: int
+    timing_tolerance_ns: int
+    timing_gate: bool
+    warning: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "episode_id": self.episode_id,
+            "path": self.path,
+            **self.planned.to_dict(),
+            "encoded_fps": self.encoded_fps,
+            "encoded_frame_count": self.encoded_frame_count,
+            "encoded_duration_ns": self.encoded_duration_ns,
+            "encoded_duration_deviation_ns": self.encoded_duration_deviation_ns,
+            "timing_tolerance_ns": self.timing_tolerance_ns,
+            "timing_gate": self.timing_gate,
+            "warning": self.warning,
+        }
+
+
+def build_video_artifact_audit(
+    *,
+    episode_id: str,
+    path: str,
+    planned: _video_timing.VideoTimingAudit,
+    encoded_fps: float,
+    encoded_frame_count: int,
+    encoded_duration_s: float,
+) -> VideoArtifactAudit:
+    """Validate MP4 readback and classify duration-only drift as a warning."""
+    if not episode_id or not path:
+        raise ValueError("Video audit identity and path must be non-empty")
+    if not isinstance(planned, _video_timing.VideoTimingAudit):
+        raise TypeError("planned must be a VideoTimingAudit")
+    if (
+        isinstance(encoded_fps, bool)
+        or not isinstance(encoded_fps, (int, float))
+        or not math.isfinite(encoded_fps)
+        or encoded_fps <= 0
+    ):
+        raise ValueError("Encoded FPS must be positive and finite")
+    if not math.isclose(float(encoded_fps), float(planned.video_fps), rel_tol=0.0, abs_tol=1e-6):
+        raise ValueError(
+            f"Encoded FPS {encoded_fps} does not match requested video FPS {planned.video_fps}"
+        )
+    if (
+        isinstance(encoded_frame_count, bool)
+        or not isinstance(encoded_frame_count, int)
+        or encoded_frame_count < 0
+    ):
+        raise ValueError("Encoded frame count must be a non-negative integer")
+    if encoded_frame_count != planned.video_frame_count:
+        raise ValueError(
+            f"Encoded frame count {encoded_frame_count} does not match planned frame count "
+            f"{planned.video_frame_count}"
+        )
+    if (
+        isinstance(encoded_duration_s, bool)
+        or not isinstance(encoded_duration_s, (int, float))
+        or not math.isfinite(encoded_duration_s)
+        or encoded_duration_s < 0
+    ):
+        raise ValueError("Encoded duration must be non-negative and finite")
+
+    encoded_duration_ns = round(float(encoded_duration_s) * _video_timing.NANOSECONDS_PER_SECOND)
+    deviation_ns = encoded_duration_ns - planned.expected_duration_ns
+    tolerance_ns = _video_timing.NANOSECONDS_PER_SECOND // planned.video_fps
+    timing_gate = abs(deviation_ns) <= tolerance_ns
+    warning = None
+    if not timing_gate:
+        warning = (
+            "encoded duration deviates from expected duration by "
+            f"{abs(deviation_ns) / _video_timing.NANOSECONDS_PER_SECOND:.6f} s "
+            f"(tolerance {tolerance_ns / _video_timing.NANOSECONDS_PER_SECOND:.6f} s)"
+        )
+    return VideoArtifactAudit(
+        episode_id=episode_id,
+        path=path,
+        planned=planned,
+        encoded_fps=float(encoded_fps),
+        encoded_frame_count=encoded_frame_count,
+        encoded_duration_ns=encoded_duration_ns,
+        encoded_duration_deviation_ns=deviation_ns,
+        timing_tolerance_ns=tolerance_ns,
+        timing_gate=timing_gate,
+        warning=warning,
+    )
+
+
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
@@ -672,6 +785,7 @@ class ArtifactWriter:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.episodes_path = self.output_dir / "episodes.jsonl"
         self.artifact_errors_path = self.output_dir / "artifact_errors.jsonl"
+        self.video_audit_path = self.output_dir / "video_audit.jsonl"
 
     def write_manifest(self, manifest: EvaluationManifest) -> None:
         _atomic_json(self.output_dir / "manifest.json", manifest.to_dict())
@@ -685,6 +799,12 @@ class ArtifactWriter:
     def append_artifact_error(self, error: ArtifactError) -> None:
         with self.artifact_errors_path.open("a", encoding="utf-8") as output:
             json.dump(error.to_dict(), output, sort_keys=True, allow_nan=False)
+            output.write("\n")
+            output.flush()
+
+    def append_video_audit(self, audit: VideoArtifactAudit) -> None:
+        with self.video_audit_path.open("a", encoding="utf-8") as output:
+            json.dump(audit.to_dict(), output, sort_keys=True, allow_nan=False)
             output.write("\n")
             output.flush()
 

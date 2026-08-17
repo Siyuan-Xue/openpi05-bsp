@@ -17,6 +17,7 @@ import numpy as np
 from openpi_client import image_tools
 from openpi_client import inference as _inference
 from openpi_client import libero_eval as _eval
+from openpi_client import libero_video_timing as _video_timing
 from openpi_client import websocket_client_policy as _websocket_client_policy
 import tqdm
 import tyro
@@ -24,7 +25,6 @@ import tyro
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256
-LIBERO_NATIVE_HZ = 10
 REPLAN_STEPS = 8
 EXPECTED_TASKS_PER_SUITE = 10
 MAX_STEPS_BY_SUITE = {
@@ -51,6 +51,9 @@ class Args:
     num_steps_wait: int = 10
     num_trials_per_task: int = 50
     eval_seed: int = 42
+    control_freq: int = 20
+    video_fps: int = 40
+    video_show_inference_waits: bool = False
 
     # Output directory must identify one policy/checkpoint evaluation run.
     output_dir: str = "data/libero/eval"
@@ -103,16 +106,22 @@ class _ClientHolder:
 
 
 class _TaskEnvironment:
-    def __init__(self, task, resolution: int, seed: int):
+    def __init__(self, task, resolution: int, seed: int, control_freq: int):
         self._task = task
         self._resolution = resolution
         self._seed = seed
+        self._control_freq = control_freq
         self._env = None
 
     def _get(self):
         if self._env is None:
             try:
-                self._env = _get_libero_env(self._task, self._resolution, self._seed)
+                self._env = _get_libero_env(
+                    self._task,
+                    self._resolution,
+                    self._seed,
+                    control_freq=self._control_freq,
+                )
             except Exception as error:
                 raise _eval.classify_exception(error, phase="environment_create") from error
         return self._env
@@ -173,6 +182,10 @@ def _validate_args(args: Args) -> tuple[tuple[str, ...], tuple[int, ...], _eval.
         raise ValueError("Training and evaluation seeds must be non-negative")
     if args.resize_size < 1 or args.connection_timeout_s <= 0 or args.inference_timeout_s <= 0:
         raise ValueError("Image size and connection/inference timeouts must be positive")
+    _video_timing.validate_video_frequencies(
+        control_hz=args.control_freq,
+        video_fps=args.video_fps,
+    )
     return suites, task_ids, protocol
 
 
@@ -255,9 +268,8 @@ def _infer_action_plan(
     eval_seed: int,
     replan_index: int,
     expected_action_horizon: int,
-) -> tuple[tuple[tuple[float, ...], ...], float]:
+) -> tuple[tuple[float, ...], ...]:
     request[_inference.INFERENCE_SEED_KEY] = _eval.stable_replan_seed(eval_seed, identity, replan_index)
-    start_time = time.monotonic()
     try:
         result = client_holder.get().infer(request)
     except _eval.InfrastructureFailure:
@@ -266,13 +278,12 @@ def _infer_action_plan(
     except Exception as error:
         client_holder.invalidate()
         raise _eval.classify_exception(error, phase="policy_infer") from error
-    elapsed_ms = (time.monotonic() - start_time) * 1_000
     if not isinstance(result, Mapping) or "actions" not in result:
         client_holder.invalidate()
         raise _eval.PolicyFailure("Policy response is missing the actions field")
-    return (
-        _eval.select_replan_actions(result["actions"], expected_horizon=expected_action_horizon),
-        elapsed_ms,
+    return _eval.select_replan_actions(
+        result["actions"],
+        expected_horizon=expected_action_horizon,
     )
 
 
@@ -288,9 +299,12 @@ def _run_attempt(
 ) -> _eval.AttemptResult:
     protocol = _eval.resolve_policy_protocol(args.policy_variant, args.expected_action_horizon)
     obs = environment.reset_to(initial_state)
+    episode_started_ns = time.monotonic_ns()
     action_plan = collections.deque()
     replay_images = []
     inference_ms = []
+    inference_requests = []
+    control_stalls = []
     replan_index = 0
     control_steps = 0
 
@@ -304,11 +318,11 @@ def _run_attempt(
         except Exception as error:
             environment.invalidate()
             raise _eval.classify_exception(error, phase="environment_step") from error
-        replay_images.append(image)
 
         if not action_plan:
+            request_started_ns = time.monotonic_ns()
             try:
-                chunk, elapsed_ms = _infer_action_plan(
+                chunk = _infer_action_plan(
                     client_holder,
                     request,
                     identity,
@@ -317,6 +331,24 @@ def _run_attempt(
                     protocol.expected_action_horizon,
                 )
             except _eval.PolicyFailure as error:
+                request_completed_ns = time.monotonic_ns()
+                request_duration_ns = request_completed_ns - request_started_ns
+                request_started_offset_ns = request_started_ns - episode_started_ns
+                inference_requests.append(
+                    _video_timing.InferenceRequest(
+                        replan_index=replan_index,
+                        started_offset_ns=request_started_offset_ns,
+                        duration_ns=request_duration_ns,
+                    )
+                )
+                control_stalls.append(
+                    _video_timing.ControlStall(
+                        control_step=control_steps,
+                        replan_index=replan_index,
+                        started_offset_ns=request_started_offset_ns,
+                        duration_ns=request_duration_ns,
+                    )
+                )
                 return _eval.AttemptResult(
                     success=False,
                     steps=control_steps,
@@ -324,14 +356,35 @@ def _run_attempt(
                     failure_kind="policy",
                     error=str(error),
                     inference_ms=tuple(inference_ms),
+                    inference_requests=tuple(inference_requests),
+                    control_stalls=tuple(control_stalls),
                     replay_frames=tuple(replay_images),
                 )
+            request_completed_ns = time.monotonic_ns()
+            request_duration_ns = request_completed_ns - request_started_ns
+            request_started_offset_ns = request_started_ns - episode_started_ns
+            inference_requests.append(
+                _video_timing.InferenceRequest(
+                    replan_index=replan_index,
+                    started_offset_ns=request_started_offset_ns,
+                    duration_ns=request_duration_ns,
+                )
+            )
+            control_stalls.append(
+                _video_timing.ControlStall(
+                    control_step=control_steps,
+                    replan_index=replan_index,
+                    started_offset_ns=request_started_offset_ns,
+                    duration_ns=request_duration_ns,
+                )
+            )
             action_plan.extend(chunk)
-            inference_ms.append(elapsed_ms)
+            inference_ms.append(request_duration_ns / 1_000_000)
             replan_index += 1
 
         action = action_plan.popleft()
         obs, _, done, _ = environment.step(list(action))
+        replay_images.append(image)
         control_steps += 1
         if bool(done):
             return _eval.AttemptResult(
@@ -339,6 +392,8 @@ def _run_attempt(
                 steps=control_steps,
                 replans=replan_index,
                 inference_ms=tuple(inference_ms),
+                inference_requests=tuple(inference_requests),
+                control_stalls=tuple(control_stalls),
                 replay_frames=tuple(replay_images),
             )
 
@@ -349,6 +404,8 @@ def _run_attempt(
         failure_kind="timeout",
         error="maximum rollout steps reached",
         inference_ms=tuple(inference_ms),
+        inference_requests=tuple(inference_requests),
+        control_stalls=tuple(control_stalls),
         replay_frames=tuple(replay_images),
     )
 
@@ -360,11 +417,115 @@ def _get_benchmark_suite(suite_name: str):
     return benchmark.get_benchmark_dict()[suite_name]()
 
 
+def _synchronous_stall_overlay_lines(
+    stall: _video_timing.ControlStall,
+) -> tuple[str, str]:
+    duration_seconds = stall.duration_ns / _video_timing.NANOSECONDS_PER_SECOND
+    return (
+        "Synchronous inference",
+        f"Control stalled: {duration_seconds:.2f} s",
+    )
+
+
+def _draw_video_overlay(frame, lines: tuple[str, ...]):
+    """Draw timing text with Pillow on the copy supplied by render_overlay."""
+    from PIL import Image, ImageDraw
+
+    image = Image.fromarray(np.asarray(frame).copy())
+    draw = ImageDraw.Draw(image)
+    overlay_height = min(image.height, 10 + 18 * len(lines))
+    draw.rectangle((0, 0, image.width, overlay_height), fill=(0, 0, 0))
+    for index, line in enumerate(lines):
+        draw.text((6, 4 + index * 18), line, fill=(255, 255, 255))
+    return np.asarray(image).copy()
+
+
+def _build_video_frames(
+    control_frames,
+    stalls: tuple[_video_timing.ControlStall, ...],
+    *,
+    control_hz: int,
+    video_fps: int,
+    show_inference_waits: bool,
+) -> tuple:
+    """Expand a selected rollout and insert measured synchronous stall holds."""
+    held_frames = _video_timing.expand_control_frames(
+        control_frames,
+        control_hz=control_hz,
+        video_fps=video_fps,
+    )
+    hold_count = video_fps // control_hz
+    frame_count = len(control_frames)
+    stall_frames_by_step = {}
+    for stall, stall_frame_count in zip(
+        stalls,
+        _video_timing.quantize_stall_frames(stalls, video_fps=video_fps),
+    ):
+        if stall.control_step > frame_count:
+            raise ValueError(
+                f"Control stall step {stall.control_step} exceeds {frame_count} replay frames"
+            )
+        stall_frames_by_step[stall.control_step] = (stall, stall_frame_count)
+
+    video_frames = []
+    for control_step, frame in enumerate(control_frames):
+        stall_event = stall_frames_by_step.get(control_step)
+        if stall_event is not None:
+            stall, stall_frame_count = stall_event
+            for _ in range(stall_frame_count):
+                if show_inference_waits:
+                    video_frames.append(
+                        _video_timing.render_overlay(
+                            frame,
+                            _synchronous_stall_overlay_lines(stall),
+                            renderer=_draw_video_overlay,
+                        )
+                    )
+                else:
+                    video_frames.append(frame)
+        held_start = control_step * hold_count
+        video_frames.extend(held_frames[held_start : held_start + hold_count])
+
+    trailing_stall = stall_frames_by_step.get(frame_count)
+    if trailing_stall is not None:
+        if not control_frames:
+            raise ValueError("Cannot render a control stall without a replay frame")
+        stall, stall_frame_count = trailing_stall
+        frame = control_frames[-1]
+        for _ in range(stall_frame_count):
+            if show_inference_waits:
+                video_frames.append(
+                    _video_timing.render_overlay(
+                        frame,
+                        _synchronous_stall_overlay_lines(stall),
+                        renderer=_draw_video_overlay,
+                    )
+                )
+            else:
+                video_frames.append(frame)
+    return tuple(video_frames)
+
+
+def _read_encoded_video(video_path: Path) -> tuple[float, int, float]:
+    reader = imageio.get_reader(video_path)
+    try:
+        metadata = reader.get_meta_data()
+        encoded_fps = metadata["fps"]
+        encoded_duration_s = metadata["duration"]
+        encoded_frame_count = reader.count_frames()
+    finally:
+        reader.close()
+    return float(encoded_fps), int(encoded_frame_count), float(encoded_duration_s)
+
+
 def _persist_episode_artifacts(
     record: _eval.EpisodeRecord,
     writer: _eval.ArtifactWriter,
     video_selector: _eval.VideoSelector,
     *,
+    control_hz: int = _video_timing.CONTROL_HZ,
+    video_fps: int = _video_timing.DEFAULT_VIDEO_FPS,
+    video_show_inference_waits: bool = False,
     video_encoder=None,
 ) -> tuple[_eval.EpisodeRecord, _eval.ArtifactError | None]:
     """Persist the rollout first, then encode or separately audit its video."""
@@ -387,11 +548,41 @@ def _persist_episode_artifacts(
     else:
         encoder = imageio.mimwrite if video_encoder is None else video_encoder
         try:
+            planned_audit = _video_timing.build_video_audit(
+                control_frame_count=len(replay_frames),
+                requests=persisted_record.inference_requests,
+                stalls=persisted_record.control_stalls,
+                control_hz=control_hz,
+                video_fps=video_fps,
+            )
+            video_frames = _build_video_frames(
+                replay_frames,
+                persisted_record.control_stalls,
+                control_hz=control_hz,
+                video_fps=video_fps,
+                show_inference_waits=video_show_inference_waits,
+            )
             encoder(
                 video_path,
-                [np.asarray(frame) for frame in replay_frames],
-                fps=LIBERO_NATIVE_HZ,
+                [np.asarray(frame) for frame in video_frames],
+                fps=video_fps,
             )
+            encoded_fps, encoded_frame_count, encoded_duration_s = _read_encoded_video(video_path)
+            video_audit = _eval.build_video_artifact_audit(
+                episode_id=persisted_record.identity.episode_id,
+                path=str(video_path),
+                planned=planned_audit,
+                encoded_fps=encoded_fps,
+                encoded_frame_count=encoded_frame_count,
+                encoded_duration_s=encoded_duration_s,
+            )
+            if video_audit.warning is not None:
+                logging.warning(
+                    "Video timing warning for %s: %s",
+                    persisted_record.identity.episode_id,
+                    video_audit.warning,
+                )
+            writer.append_video_audit(video_audit)
         except Exception as error:
             artifact_error = _eval.ArtifactError(
                 episode_id=persisted_record.identity.episode_id,
@@ -435,7 +626,12 @@ def eval_libero(args: Args) -> dict:
                         f"Task {suite_name}/{task_id} has {len(initial_states)} initial states, "
                         f"but {args.num_trials_per_task} were requested"
                     )
-                environment = _TaskEnvironment(task, LIBERO_ENV_RESOLUTION, args.eval_seed)
+                environment = _TaskEnvironment(
+                    task,
+                    LIBERO_ENV_RESOLUTION,
+                    args.eval_seed,
+                    args.control_freq,
+                )
                 try:
                     for init_state_index in tqdm.tqdm(
                         range(args.num_trials_per_task),
@@ -468,7 +664,14 @@ def eval_libero(args: Args) -> dict:
                             eval_seed=args.eval_seed,
                             infrastructure_retries=2,
                         )
-                        record, artifact_error = _persist_episode_artifacts(record, writer, video_selector)
+                        record, artifact_error = _persist_episode_artifacts(
+                            record,
+                            writer,
+                            video_selector,
+                            control_hz=args.control_freq,
+                            video_fps=args.video_fps,
+                            video_show_inference_waits=args.video_show_inference_waits,
+                        )
                         records.append(record)
                         if artifact_error is not None:
                             artifact_errors.append(artifact_error)
@@ -495,7 +698,7 @@ def eval_libero(args: Args) -> dict:
     return summary
 
 
-def _get_libero_env(task, resolution, seed):
+def _get_libero_env(task, resolution, seed, *, control_freq: int):
     """Initialize a task environment without importing LIBERO at module load."""
     from libero.libero import get_libero_path
     from libero.libero.envs import OffScreenRenderEnv
@@ -505,6 +708,7 @@ def _get_libero_env(task, resolution, seed):
         bddl_file_name=task_bddl_file,
         camera_heights=resolution,
         camera_widths=resolution,
+        control_freq=control_freq,
     )
     env.seed(seed)
     return env
