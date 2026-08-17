@@ -646,6 +646,11 @@ def validate_timing_events_v4(
         request = requests_by_id[activation.request_id]
         if activation.control_step < request.observation_control_step:
             raise ValueError("activation control_step cannot precede its observation step")
+        if (
+            request.dispatch == "blocking_replan"
+            and activation.control_step != request.observation_control_step
+        ):
+            raise ValueError("blocking replan must activate at its observation control step")
         latency = latencies_by_id.get(activation.request_id)
         if latency is None or latency.outcome != "success":
             raise ValueError("only a successful request may activate a plan")
@@ -715,6 +720,8 @@ def validate_timing_events_v4(
             raise ValueError("underflow must belong to one background request in an async mode")
         if underflow.control_step <= previous_underflow_step or underflow.control_step > step_count:
             raise ValueError("underflow control steps must be strictly ordered within 0..steps")
+        if underflow.control_step < request.observation_control_step:
+            raise ValueError("underflow control_step cannot precede its observation step")
         if underflow.started_offset_ns < request.submitted_offset_ns:
             raise ValueError("underflow cannot begin before request submission")
         underflow_end = underflow.started_offset_ns + underflow.duration_ns
@@ -770,14 +777,8 @@ def validate_timing_events_v4(
                 or stall_end > latency.completed_offset_ns
             ):
                 raise ValueError("synchronous stall must lie within its request interval")
-            activation = activations_by_request.get(stall.request_id)
-            expected_stall_step = (
-                activation.control_step
-                if activation is not None
-                else request.observation_control_step
-            )
-            if stall.control_step != expected_stall_step:
-                raise ValueError("blocking stall control_step must match its request activation")
+            if stall.control_step != request.observation_control_step:
+                raise ValueError("blocking stall control_step must match its request step")
             full_interval_required = (
                 request.dispatch == "blocking_initial"
                 or request.trigger == "bsp_curve_exhausted"

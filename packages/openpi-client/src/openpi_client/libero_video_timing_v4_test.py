@@ -618,6 +618,21 @@ def test_cross_event_chronology_binds_submissions_activation_steps_and_blocking_
             identity=_IDENTITY,
         ),
     )
+    _assert_raises(
+        ValueError,
+        lambda: timing.validate_timing_events_v4(
+            requests=sync_requests,
+            latencies=sync_latencies,
+            activations=sync_activations,
+            underflows=(),
+            stalls=(sync_stalls[0], dataclasses.replace(sync_stalls[1], control_step=2)),
+            steps=2,
+            episode_duration_ns=200,
+            execution_mode="baseline_sync_n5",
+            eval_seed=_EVAL_SEED,
+            identity=_IDENTITY,
+        ),
+    )
 
     failed_request = dataclasses.replace(sync_requests[1], disposition="failed")
     failed_latency = _latency(1, 200, 50, outcome="policy_failure")
@@ -649,6 +664,37 @@ def test_cross_event_chronology_binds_submissions_activation_steps_and_blocking_
             steps=1,
             episode_duration_ns=100,
             execution_mode="baseline_sync_n5",
+            eval_seed=_EVAL_SEED,
+            identity=_IDENTITY,
+        ),
+    )
+
+
+def test_background_policy_failure_underflow_cannot_precede_observation_step():
+    failed_request = dataclasses.replace(
+        _request(1, 150, observation_control_step=2),
+        disposition="failed",
+    )
+    underflow = timing.ActionUnderflowV4(1, 1, 175, 25)
+    stalls = (
+        _stall(0, 0, 0, 100, reason="synchronous_inference"),
+        _stall(1, 1, 175, 25, reason="async_action_underflow"),
+    )
+
+    _assert_raises(
+        ValueError,
+        lambda: timing.validate_timing_events_v4(
+            requests=(_initial_request(), failed_request),
+            latencies=(
+                _latency(0, 100, 100),
+                _latency(1, 200, 50, outcome="policy_failure"),
+            ),
+            activations=(_native_activation(0, 0, 0, 100, activation="initial"),),
+            underflows=(underflow,),
+            stalls=stalls,
+            steps=2,
+            episode_duration_ns=200,
+            execution_mode="baseline_rtc",
             eval_seed=_EVAL_SEED,
             identity=_IDENTITY,
         ),
