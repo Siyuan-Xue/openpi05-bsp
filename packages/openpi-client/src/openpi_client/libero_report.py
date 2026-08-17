@@ -16,6 +16,7 @@ import tempfile
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from openpi_client import libero_eval
+from openpi_client import libero_video_timing
 
 
 MILESTONES = (0, 1000, 2000, 5000, 10000)
@@ -63,6 +64,10 @@ _IDENTITY_FIELDS = (
 _SHARED_MANIFEST_FIELDS = (
     "code_sha",
     "dataset_revision",
+    "dataset_fps",
+    "source_demo_control_hz",
+    "control_freq_hz",
+    "inference_schedule",
     "container_digest",
     "train_seed",
     "eval_seed",
@@ -73,6 +78,9 @@ _SHARED_MANIFEST_FIELDS = (
     "max_steps_by_suite",
     "connection_timeout_s",
     "inference_timeout_s",
+    "infrastructure_retries",
+    "replan_steps",
+    "execution_horizon",
 )
 _PHASE_ONE_CONFIGS = {
     ("baseline", "full"): "pi05_libero_baseline_h16",
@@ -192,7 +200,12 @@ def _training_family(manifest: Mapping[str, Any]) -> str:
 def _validate_manifest(manifest: Mapping[str, Any]) -> Tuple[str, int]:
     required = (
         "schema_version",
-        "native_control_hz",
+        "dataset_fps",
+        "source_demo_control_hz",
+        "control_freq_hz",
+        "video_fps",
+        "video_show_inference_waits",
+        "inference_schedule",
         "replan_steps",
         "code_sha",
         "dataset_revision",
@@ -220,10 +233,32 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> Tuple[str, int]:
         "infrastructure_retries",
     )
     _require_fields(manifest, required, label="evaluation manifest")
-    if manifest["schema_version"] != 2:
-        raise ComparisonError("Phase-one comparison requires evaluation manifest schema_version 2")
-    if manifest["native_control_hz"] != 10 or manifest["replan_steps"] != 8:
-        raise ComparisonError("Evaluation manifest has an incompatible native-control protocol")
+    if manifest["schema_version"] != 3:
+        raise ComparisonError(
+            "Phase-one comparison requires schema_version 3; schema 2 is archive-only "
+            "and must be rerun with the schema-3 evaluator"
+        )
+    for field, expected in (
+        ("dataset_fps", 10),
+        ("source_demo_control_hz", 20),
+        ("control_freq_hz", 20),
+        ("replan_steps", 8),
+    ):
+        value = manifest[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+            raise ComparisonError("Evaluation manifest {} must be exactly {}".format(field, expected))
+    video_fps = manifest["video_fps"]
+    if (
+        isinstance(video_fps, bool)
+        or not isinstance(video_fps, int)
+        or video_fps <= 0
+        or video_fps % manifest["control_freq_hz"]
+    ):
+        raise ComparisonError("Evaluation manifest video_fps must be a positive control-rate multiple")
+    if not isinstance(manifest["video_show_inference_waits"], bool):
+        raise ComparisonError("Evaluation manifest video_show_inference_waits must be boolean")
+    if manifest["inference_schedule"] != libero_video_timing.SYNCHRONOUS_INFERENCE_SCHEDULE:
+        raise ComparisonError("Formal phase-one comparison currently requires synchronous inference_schedule")
     variant = manifest["policy_variant"]
     step = manifest["checkpoint_step"]
     if variant not in ("baseline", "bsp"):
@@ -372,6 +407,8 @@ def _validate_episode(record: Mapping[str, Any], manifest: Mapping[str, Any]) ->
         "replans",
         "inference_ms",
         "mean_inference_ms",
+        "inference_requests",
+        "control_stalls",
         "infrastructure_history",
     )
     _require_fields(record, required, label="episode record")
@@ -446,6 +483,7 @@ def _validate_episode(record: Mapping[str, Any], manifest: Mapping[str, Any]) ->
             raise ComparisonError("Episode mean_inference_ms is inconsistent with inference_ms")
     elif record["mean_inference_ms"] is not None:
         raise ComparisonError("Episode mean_inference_ms must be null when inference_ms is empty")
+    _validate_episode_timing_events(record, manifest, finite_timings)
     history = record["infrastructure_history"]
     if not isinstance(history, list):
         raise ComparisonError("Episode infrastructure_history must be a list")
@@ -461,6 +499,87 @@ def _validate_episode(record: Mapping[str, Any], manifest: Mapping[str, Any]) ->
             raise ComparisonError("Episode infrastructure history has an invalid kind")
         if not isinstance(entry["error"], str) or not entry["error"].strip():
             raise ComparisonError("Episode infrastructure history error must be non-empty")
+
+
+def _event_nonnegative_int(event: Mapping[str, Any], field: str, *, label: str) -> int:
+    value = event[field]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ComparisonError("{} {} must be a non-negative integer".format(label, field))
+    return value
+
+
+def _validate_episode_timing_events(
+    record: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    finite_timings: Sequence[float],
+) -> None:
+    requests = record["inference_requests"]
+    stalls = record["control_stalls"]
+    if not isinstance(requests, list) or not isinstance(stalls, list):
+        raise ComparisonError("Episode inference_requests and control_stalls must be lists")
+
+    parsed_requests = []
+    previous_end = 0
+    request_fields = {"clock", "replan_index", "started_offset_ns", "duration_ns"}
+    for expected_index, event in enumerate(requests):
+        if not isinstance(event, dict) or set(event) != request_fields:
+            raise ComparisonError("Inference request must contain exactly the schema-3 fields")
+        if event["clock"] != libero_video_timing.EPISODE_MONOTONIC_CLOCK:
+            raise ComparisonError("Inference request clock must be episode_monotonic_ns")
+        replan_index = _event_nonnegative_int(event, "replan_index", label="request")
+        started = _event_nonnegative_int(event, "started_offset_ns", label="request")
+        duration = _event_nonnegative_int(event, "duration_ns", label="request")
+        if replan_index != expected_index:
+            raise ComparisonError("Inference request replan indexes must be sequential from zero")
+        if started < previous_end:
+            raise ComparisonError("Inference requests must be chronological and non-overlapping")
+        parsed_requests.append((replan_index, started, duration))
+        previous_end = started + duration
+
+    parsed_stalls = []
+    previous_end = 0
+    previous_step = -1
+    stall_fields = {
+        "clock",
+        "control_step",
+        "replan_index",
+        "started_offset_ns",
+        "duration_ns",
+        "reason",
+    }
+    for event in stalls:
+        if not isinstance(event, dict) or set(event) != stall_fields:
+            raise ComparisonError("Control stall must contain exactly the schema-3 fields")
+        if event["clock"] != libero_video_timing.EPISODE_MONOTONIC_CLOCK:
+            raise ComparisonError("Control stall clock must be episode_monotonic_ns")
+        step = _event_nonnegative_int(event, "control_step", label="stall")
+        replan_index = _event_nonnegative_int(event, "replan_index", label="stall")
+        started = _event_nonnegative_int(event, "started_offset_ns", label="stall")
+        duration = _event_nonnegative_int(event, "duration_ns", label="stall")
+        if step <= previous_step or step > record["steps"]:
+            raise ComparisonError("Control stall steps must be strictly increasing within 0..steps")
+        if started < previous_end:
+            raise ComparisonError("Control stalls must be chronological and non-overlapping")
+        if event["reason"] != libero_video_timing.STALL_REASON_SYNCHRONOUS_INFERENCE:
+            raise ComparisonError("Synchronous control stalls must use reason synchronous_inference")
+        parsed_stalls.append((replan_index, started, duration))
+        previous_step = step
+        previous_end = started + duration
+
+    replans = record["replans"]
+    expected_counts = {replans}
+    if record["status"] == "policy_failure":
+        expected_counts.add(replans + 1)
+    if len(parsed_requests) not in expected_counts or len(parsed_stalls) != len(parsed_requests):
+        raise ComparisonError("Synchronous request/stall counts do not match episode replans")
+    if parsed_requests != parsed_stalls:
+        raise ComparisonError("Synchronous requests and control stalls must have matching intervals")
+    if manifest["inference_schedule"] != libero_video_timing.SYNCHRONOUS_INFERENCE_SCHEDULE:
+        raise ComparisonError("Episode timing validation currently accepts only synchronous schedules")
+    for index, timing_ms in enumerate(finite_timings):
+        expected_ms = parsed_requests[index][2] / 1_000_000
+        if not math.isclose(timing_ms, expected_ms, rel_tol=0.0, abs_tol=1e-12):
+            raise ComparisonError("Episode inference_ms must derive from successful request durations")
 
 
 def _derive_summary(records: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:

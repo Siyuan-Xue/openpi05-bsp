@@ -473,7 +473,6 @@ PY
 
 ```bash
 cd "$BSP_REPO_DIR"
-export BSP_CODE_SHA="$(git rev-parse HEAD)"
 export OFFICIAL_CONTAINER_CKPT=/openpi_assets/openpi-assets/checkpoints/pi05_libero
 export SERVER_ARGS="--env LIBERO policy:checkpoint --policy.config pi05_libero --policy.dir $OFFICIAL_CONTAINER_CKPT"
 
@@ -491,10 +490,12 @@ export CLIENT_ARGS="\
 --args.policy-variant baseline \
 --args.expected-action-horizon 10 \
 --args.num-trials-per-task 1 \
+--args.control-freq 20 \
+--args.video-fps 40 \
+--args.video-show-inference-waits \
 --args.output-dir /experiments/eval/official-h10-task0-smoke \
 --args.config-name pi05_libero \
 --args.checkpoint-step 30000 \
---args.code-sha $BSP_CODE_SHA \
 --args.dataset-revision v2.0 \
 --args.norm-hash $OFFICIAL_NORM_HASH \
 --args.checkpoint $OFFICIAL_CONTAINER_CKPT \
@@ -552,10 +553,12 @@ export CLIENT_ARGS="\
 --args.policy-variant baseline \
 --args.expected-action-horizon 10 \
 --args.num-trials-per-task 5 \
+--args.control-freq 20 \
+--args.video-fps 40 \
+--args.video-show-inference-waits \
 --args.output-dir /experiments/eval/official-h10-calibration-all-5 \
 --args.config-name pi05_libero \
 --args.checkpoint-step 30000 \
---args.code-sha $BSP_CODE_SHA \
 --args.dataset-revision v2.0 \
 --args.norm-hash $OFFICIAL_NORM_HASH \
 --args.checkpoint $OFFICIAL_CONTAINER_CKPT \
@@ -680,10 +683,12 @@ env \
   --args.policy-variant baseline \
   --args.expected-action-horizon 10 \
   --args.num-trials-per-task 1 \
+  --args.control-freq 20 \
+  --args.video-fps 40 \
+  --args.video-show-inference-waits \
   --args.output-dir "$EVAL_BASE/official-h10-task0-smoke-host" \
   --args.config-name pi05_libero \
   --args.checkpoint-step 30000 \
-  --args.code-sha "$BSP_CODE_SHA" \
   --args.dataset-revision v2.0 \
   --args.norm-hash "$OFFICIAL_NORM_HASH" \
   --args.checkpoint "$OFFICIAL_CKPT_LOCAL" \
@@ -708,10 +713,12 @@ env \
   --args.policy-variant baseline \
   --args.expected-action-horizon 10 \
   --args.num-trials-per-task 5 \
+  --args.control-freq 20 \
+  --args.video-fps 40 \
+  --args.video-show-inference-waits \
   --args.output-dir "$OFFICIAL_CAL_HOST" \
   --args.config-name pi05_libero \
   --args.checkpoint-step 30000 \
-  --args.code-sha "$BSP_CODE_SHA" \
   --args.dataset-revision v2.0 \
   --args.norm-hash "$OFFICIAL_NORM_HASH" \
   --args.checkpoint "$OFFICIAL_CKPT_LOCAL" \
@@ -1151,7 +1158,13 @@ done | tee "$LOG_BASE/phase1-checkpoints.sha256"
 
 ### 12.2 Docker 路线的十次正式评测
 
-每次评测是 4 suites × 10 tasks × 50 initial states = 2,000 episodes，共 20,000 episodes。baseline server 输出严格 horizon 16，执行前 8 步；BSP server 在反归一化后解码为严格 horizon 8。两者均在 10 Hz 下每 8 步重规划。
+每次评测是 4 suites × 10 tasks × 50 initial states = 2,000 episodes，共 20,000 episodes。baseline server 输出严格 horizon 16，执行前 8 步；BSP server 在反归一化后解码为严格 horizon 8。两者均在 20 Hz 下每 8 步重规划。
+
+正式评测使用 schema v3，并明确区分四个时钟：LeRobot dataset FPS 为 10（只负责训练时间戳和索引），来源专家示范环境为 20 Hz（来源身份），评测环境 `control_freq_hz` 固定 20 Hz（MuJoCo 动力学），MP4 默认 40 FPS（仅录像编码）。dataset/source 频率不参与视频帧数计算；录像只使用控制步数、20 Hz 控制频率、视频 FPS 和实测 `control_stalls`。同步模式下 request latency 与 stall 使用同一实测区间；未来异步模式可以有 latency 而没有 stall，只有 stall 才冻结画面。
+
+所有正式 evaluator 命令使用 `--args.control-freq 20 --args.video-fps 40 --args.video-show-inference-waits`。该开关只改变被 `VideoSelector` 选中的 MP4 和 `video_audit.jsonl`，不会增加 `env.step`、dummy action 或 sleep，不改变动作、done 或成功率。期望时长为 `control_steps / 20 + included_control_stall_seconds`，允许误差为一个输出帧（`1 / video_fps`）；编码或回读失败仍是 artifact error。
+
+schema v2 结果（包括历史 baseline-0）仅作不可变归档，不能与 v3 混合、自动升级或送入正式 comparator。已有 checkpoint 不需要重训，但十个正式输入必须由 clean schema-v3 checkout 重新评测，并写到全新的空输出目录。命令不再手工传 `--args.code-sha`；evaluator 会从 clean HEAD 自动记录 `manifest.code_sha`，源码冻结与恢复用的 `BSP_CODE_SHA` 门禁仍保留。
 
 定义通用完整性检查：
 
@@ -1166,7 +1179,11 @@ root, expected = pathlib.Path(sys.argv[1]), int(sys.argv[2])
 manifest = json.loads((root / "manifest.json").read_text())
 summary = json.loads((root / "summary.json").read_text())
 records = (root / "episodes.jsonl").read_text().splitlines()
-assert manifest["schema_version"] == 2
+assert manifest["schema_version"] == 3
+assert manifest["dataset_fps"] == 10
+assert manifest["source_demo_control_hz"] == 20
+assert manifest["control_freq_hz"] == 20
+assert manifest["inference_schedule"] == "synchronous"
 assert len(records) == expected
 assert summary["requested_episodes"] == expected
 assert summary["eligible_episodes"] == expected
@@ -1232,10 +1249,12 @@ run_phase1_eval() {
 --args.policy-variant $variant \
 --args.expected-action-horizon $expected_horizon \
 --args.num-trials-per-task 50 \
+--args.control-freq 20 \
+--args.video-fps 40 \
+--args.video-show-inference-waits \
 --args.output-dir /experiments/eval/$output_name \
 --args.config-name $config \
 --args.checkpoint-step $step \
---args.code-sha $BSP_CODE_SHA \
 --args.dataset-revision v2.0 \
 --args.norm-hash $norm_hash \
 --args.checkpoint $container_checkpoint \
@@ -1359,10 +1378,12 @@ run_phase1_eval_host() {
     --args.policy-variant "$variant" \
     --args.expected-action-horizon "$expected_horizon" \
     --args.num-trials-per-task 50 \
+    --args.control-freq 20 \
+    --args.video-fps 40 \
+    --args.video-show-inference-waits \
     --args.output-dir "$output" \
     --args.config-name "$config" \
     --args.checkpoint-step "$step" \
-    --args.code-sha "$BSP_CODE_SHA" \
     --args.dataset-revision v2.0 \
     --args.norm-hash "$norm_hash" \
     --args.checkpoint "$checkpoint" \

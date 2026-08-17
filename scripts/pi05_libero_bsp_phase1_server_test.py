@@ -73,7 +73,6 @@ class PhaseOneServerRunbookContractTest(unittest.TestCase):
             "output-dir",
             "config-name",
             "checkpoint-step",
-            "code-sha",
             "dataset-revision",
             "norm-hash",
             "checkpoint",
@@ -82,10 +81,14 @@ class PhaseOneServerRunbookContractTest(unittest.TestCase):
             "eval-seed",
             "bsp-cache-hash",
             "bsp-cache-manifest-fingerprint",
+            "control-freq",
+            "video-fps",
+            "video-show-inference-waits",
         }
 
         self.assertTrue(required.issubset(flags))
         self.assertEqual(flags.difference(fields), set())
+        self.assertNotIn("--args.code-sha", "\n".join(self.bash_blocks))
 
     def test_training_overrides_match_current_config_fields(self):
         config_path = _ROOT / "src" / "openpi" / "training" / "config.py"
@@ -183,6 +186,13 @@ class PhaseOneServerRunbookContractTest(unittest.TestCase):
             '--bsp-verification "$BSP_VERIFY"',
             '--norm-comparison "$NORM_COMPARISON"',
             "20,000 episodes",
+            "schema v3",
+            "dataset FPS 为 10",
+            "评测环境 `control_freq_hz` 固定 20 Hz",
+            "MP4 默认 40 FPS",
+            "video_audit.jsonl",
+            "control_steps / 20 + included_control_stall_seconds",
+            "schema v2 结果",
             "permanent_checkpoint_steps",
             "0k/1k/2k/5k/10k",
             "phase1-short10k-seed42-baseline",

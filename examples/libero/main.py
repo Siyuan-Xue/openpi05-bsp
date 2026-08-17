@@ -163,12 +163,24 @@ class _TaskEnvironment:
 def _resolve_code_sha(value: str) -> str:
     if value != "auto":
         return value
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    repo_root = Path(__file__).resolve().parents[2]
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        status = subprocess.run(
+            ["git", "-C", str(repo_root), "status", "--porcelain", "--untracked-files=all"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RuntimeError("Unable to resolve evaluator code identity from its Git checkout") from error
+    if status.stdout.strip():
+        raise RuntimeError("Evaluator Git checkout must be clean before writing a manifest")
     return result.stdout.strip()
 
 
@@ -222,6 +234,12 @@ def _make_manifest(
         connection_timeout_s=args.connection_timeout_s,
         inference_timeout_s=args.inference_timeout_s,
         infrastructure_retries=2,
+        dataset_fps=10,
+        source_demo_control_hz=20,
+        control_freq_hz=args.control_freq,
+        video_fps=args.video_fps,
+        video_show_inference_waits=args.video_show_inference_waits,
+        inference_schedule=_video_timing.SYNCHRONOUS_INFERENCE_SCHEDULE,
     )
 
 

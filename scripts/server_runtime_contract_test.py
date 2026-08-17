@@ -189,7 +189,6 @@ class ServerRuntimeContractTest(unittest.TestCase):
         required_identity_options = {
             "--args.config-name",
             "--args.checkpoint-step",
-            "--args.code-sha",
             "--args.dataset-revision",
             "--args.norm-hash",
             "--args.checkpoint",
@@ -197,6 +196,10 @@ class ServerRuntimeContractTest(unittest.TestCase):
         }
 
         self.assertTrue(required_identity_options.issubset(calibration))
+        self.assertNotIn("--args.code-sha", calibration)
+        self.assertEqual(_option_value(calibration, "--args.control-freq"), "20")
+        self.assertEqual(_option_value(calibration, "--args.video-fps"), "40")
+        self.assertIn("--args.video-show-inference-waits", calibration)
         self.assertEqual(_option_value(calibration, "--args.policy-variant"), "baseline")
         self.assertEqual(_option_value(calibration, "--args.task-suite-name"), "libero_spatial")
         self.assertEqual(_option_value(calibration, "--args.task-ids"), "0")
@@ -206,6 +209,7 @@ class ServerRuntimeContractTest(unittest.TestCase):
         self.assertEqual(_option_value(calibration, "--args.checkpoint-step"), "30000")
 
         self.assertTrue(required_identity_options.issubset(baseline))
+        self.assertNotIn("--args.code-sha", baseline)
         self.assertEqual(_option_value(baseline, "--args.policy-variant"), "baseline")
         self.assertEqual(_option_value(baseline, "--args.expected-action-horizon"), "16")
         self.assertEqual(_option_value(baseline, "--args.config-name"), "pi05_libero_baseline_h16")

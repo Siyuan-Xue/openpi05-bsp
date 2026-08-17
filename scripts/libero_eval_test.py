@@ -172,6 +172,46 @@ def test_single_task_smoke_filter_is_canonical_and_recorded_in_manifest():
     assert task_ids == (0,)
     assert manifest["task_ids"] == [0]
     assert manifest["trials_per_task"] == 1
+    assert manifest["schema_version"] == 3
+    assert manifest["dataset_fps"] == 10
+    assert manifest["source_demo_control_hz"] == 20
+    assert manifest["control_freq_hz"] == 20
+    assert manifest["video_fps"] == 40
+    assert manifest["video_show_inference_waits"] is False
+    assert manifest["inference_schedule"] == "synchronous"
+
+
+def test_automatic_code_sha_requires_clean_evaluator_checkout(monkeypatch):
+    calls = []
+
+    def clean_run(command, **kwargs):
+        calls.append(command)
+        output = "a" * 40 + "\n" if "rev-parse" in command else ""
+        return types.SimpleNamespace(stdout=output)
+
+    monkeypatch.setattr(libero_main.subprocess, "run", clean_run)
+
+    assert libero_main._resolve_code_sha("auto") == "a" * 40
+    assert calls[0][1:3] == ["-C", str(libero_main.Path(libero_main.__file__).resolve().parents[2])]
+    assert "--untracked-files=all" in calls[1]
+
+    def dirty_run(command, **kwargs):
+        output = "a" * 40 + "\n" if "rev-parse" in command else "?? untracked.txt\n"
+        return types.SimpleNamespace(stdout=output)
+
+    monkeypatch.setattr(libero_main.subprocess, "run", dirty_run)
+    with pytest.raises(RuntimeError, match="clean"):
+        libero_main._resolve_code_sha("auto")
+
+
+def test_manual_code_sha_compatibility_override_does_not_run_git(monkeypatch):
+    monkeypatch.setattr(
+        libero_main.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("manual compatibility override unexpectedly ran git"),
+    )
+
+    assert libero_main._resolve_code_sha("b" * 40) == "b" * 40
 
 
 @pytest.mark.parametrize("task_ids", [(), (0, 0), (-1,), (10,)])

@@ -521,6 +521,12 @@ class EvaluationManifest:
     connection_timeout_s: float = 30.0
     inference_timeout_s: float = 120.0
     infrastructure_retries: int = 2
+    dataset_fps: int = 10
+    source_demo_control_hz: int = 20
+    control_freq_hz: int = _video_timing.CONTROL_HZ
+    video_fps: int = _video_timing.DEFAULT_VIDEO_FPS
+    video_show_inference_waits: bool = False
+    inference_schedule: str = _video_timing.SYNCHRONOUS_INFERENCE_SCHEDULE
 
     def __post_init__(self) -> None:
         if self.policy_variant not in {"baseline", "bsp"}:
@@ -542,6 +548,20 @@ class EvaluationManifest:
             raise ValueError("Evaluation code_sha must be a lowercase 40- or 64-character Git SHA")
         if self.dataset_revision != "v2.0":
             raise ValueError("Physical Intelligence LIBERO evaluation requires dataset revision v2.0")
+        for name, value, expected in (
+            ("dataset_fps", self.dataset_fps, 10),
+            ("source_demo_control_hz", self.source_demo_control_hz, 20),
+            ("control_freq_hz", self.control_freq_hz, _video_timing.CONTROL_HZ),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+                raise ValueError(f"Evaluation {name} must be exactly {expected}")
+        _video_timing.validate_video_frequencies(
+            control_hz=self.control_freq_hz,
+            video_fps=self.video_fps,
+        )
+        if not isinstance(self.video_show_inference_waits, bool):
+            raise ValueError("Evaluation video_show_inference_waits must be a boolean")
+        _video_timing.validate_inference_schedule(self.inference_schedule)
         if not isinstance(self.container_digest, str) or re.fullmatch(
             r"sha256:[0-9a-f]{64}", self.container_digest
         ) is None:
@@ -606,8 +626,7 @@ class EvaluationManifest:
         payload["task_ids"] = list(self.task_ids)
         return {
             **payload,
-            "schema_version": 2,
-            "native_control_hz": 10,
+            "schema_version": 3,
             "replan_steps": _REPLAN_ACTIONS,
         }
 

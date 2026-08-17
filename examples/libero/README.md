@@ -10,6 +10,32 @@ This example requires only the LIBERO submodule for this benchmark:
 git submodule update --init --recursive third_party/libero
 ```
 
+## Evaluation clocks and schema v3 video artifacts
+
+The evaluator keeps four independent clocks: the LeRobot dataset is indexed at
+10 FPS, the source LIBERO demonstrations were collected from a 20 Hz
+environment, evaluation dynamics run at exactly 20 Hz, and selected MP4 files
+default to 40 FPS. Dataset and source rates are provenance; video synthesis
+uses only control steps, the 20 Hz control rate, the selected video FPS, and
+measured control stalls.
+
+Use `--args.control-freq 20 --args.video-fps 40`. Add
+`--args.video-show-inference-waits` to display synchronous inference stalls.
+The switch changes only selected MP4/video-audit artifacts: it adds no
+`env.step`, dummy action, or sleep and cannot change success. The expected
+duration is `control_steps / 20 + included_control_stall_seconds`, with a
+warning tolerance of one output frame (`1 / video_fps`). Encoder/readback
+errors remain artifact errors. Current synchronous requests measure latency
+and stall over the same interval; a future asynchronous scheduler may have
+latency without a stall, and only measured stalls freeze video.
+
+Formal comparisons accept schema v3 only. Schema-v2 outputs remain immutable
+historical archives and must not be mixed with v3. Existing checkpoints need
+no retraining, but every formal evaluation input must be rerun into a new,
+empty output directory. Formal commands omit `--args.code-sha`: the evaluator
+records the clean checkout HEAD automatically. Selected videos are audited in
+`video_audit.jsonl`.
+
 ## With Docker (recommended)
 
 The default Compose path is headless EGL and does not require an X server or
@@ -28,7 +54,6 @@ python3 scripts/libero_compose_preflight.py
 docker compose -f examples/libero/compose.yml config >/dev/null
 docker compose -f examples/libero/compose.yml build
 
-export CODE_SHA="$(git rev-parse HEAD)"
 export LIBERO_DATASET_REVISION=v2.0
 export POLICY_CONTAINER_DIGEST="$(docker image inspect openpi_server --format '{{.Id}}')"
 ```
@@ -49,10 +74,12 @@ export CLIENT_ARGS="\
 --args.policy-variant baseline \
 --args.expected-action-horizon 10 \
 --args.num-trials-per-task 1 \
+--args.control-freq 20 \
+--args.video-fps 40 \
+--args.video-show-inference-waits \
 --args.output-dir /experiments/eval/official-pi05-libero-h10-smoke \
 --args.config-name pi05_libero \
 --args.checkpoint-step 30000 \
---args.code-sha ${CODE_SHA} \
 --args.dataset-revision ${LIBERO_DATASET_REVISION} \
 --args.norm-hash ${OFFICIAL_NORM_HASH} \
 --args.checkpoint ${OFFICIAL_CHECKPOINT} \
@@ -76,10 +103,12 @@ export CLIENT_ARGS="\
 --args.policy-variant baseline \
 --args.expected-action-horizon 16 \
 --args.num-trials-per-task 1 \
+--args.control-freq 20 \
+--args.video-fps 40 \
+--args.video-show-inference-waits \
 --args.output-dir /experiments/eval/baseline-h16-libero-10-smoke \
 --args.config-name pi05_libero_baseline_h16 \
 --args.checkpoint-step 30000 \
---args.code-sha ${CODE_SHA} \
 --args.dataset-revision ${LIBERO_DATASET_REVISION} \
 --args.norm-hash ${BASELINE_NORM_HASH} \
 --args.checkpoint ${BASELINE_CHECKPOINT} \
