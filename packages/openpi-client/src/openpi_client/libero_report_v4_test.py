@@ -358,7 +358,7 @@ def _write_formal_run(root: Path, mode: str, step: int = 1000) -> Path:
     )
     (root / "summary.json").write_text(_json_text(_summary()), encoding="utf-8")
     (root / "video_audit.jsonl").write_text(
-        "".join(_json_text(_video_audit(episode)) for episode in episodes),
+        "".join(_json_text(_video_audit(episode)) for episode in episodes[:3]),
         encoding="utf-8",
     )
     (root / "artifact_errors.jsonl").write_text("", encoding="utf-8")
@@ -387,19 +387,18 @@ def _mutate_jsonl(path: Path, index: int, mutate: Any) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def test_load_run_v4_validates_formal_grid_and_hashes_all_five_artifacts(
+def test_load_run_v4_validates_formal_grid_selected_videos_and_four_hashes(
     formal_baseline_run: Path,
 ) -> None:
     run = libero_report_v4.load_run_v4(formal_baseline_run)
 
     assert len(run.records) == 2000
-    assert len(run.video_audits) == 2000
+    assert len(run.video_audits) == 3
     assert set(run.file_sha256) == {
         "manifest.json",
         "episodes.jsonl",
         "summary.json",
         "video_audit.jsonl",
-        "artifact_errors.jsonl",
     }
     for name, digest in run.file_sha256.items():
         assert digest == hashlib.sha256(
@@ -414,7 +413,6 @@ def test_load_run_v4_validates_formal_grid_and_hashes_all_five_artifacts(
         "episodes.jsonl",
         "summary.json",
         "video_audit.jsonl",
-        "artifact_errors.jsonl",
     ],
 )
 def test_load_run_v4_rejects_each_missing_artifact(
@@ -429,6 +427,31 @@ def test_load_run_v4_rejects_each_missing_artifact(
         libero_report_v4.ComparisonErrorV4,
         match="missing required artifacts",
     ):
+        libero_report_v4.load_run_v4(run_dir)
+
+
+def test_load_run_v4_accepts_missing_optional_artifact_error_ledger(
+    formal_baseline_run: Path,
+    tmp_path: Path,
+) -> None:
+    run_dir = _copy_run(formal_baseline_run, tmp_path)
+    (run_dir / "artifact_errors.jsonl").unlink()
+
+    run = libero_report_v4.load_run_v4(run_dir)
+
+    assert "artifact_errors.jsonl" not in run.file_sha256
+
+
+def test_load_run_v4_rejects_artifact_error_ledger_path_that_is_not_a_file(
+    formal_baseline_run: Path,
+    tmp_path: Path,
+) -> None:
+    run_dir = _copy_run(formal_baseline_run, tmp_path)
+    ledger = run_dir / "artifact_errors.jsonl"
+    ledger.unlink()
+    ledger.mkdir()
+
+    with pytest.raises(libero_report_v4.ComparisonErrorV4, match="not a file"):
         libero_report_v4.load_run_v4(run_dir)
 
 
@@ -561,17 +584,17 @@ def test_load_run_v4_rejects_duplicate_video_episode(
         libero_report_v4.load_run_v4(run_dir)
 
 
-def test_load_run_v4_rejects_episode_without_video_audit(
+def test_load_run_v4_accepts_no_selected_video_audits(
     formal_baseline_run: Path,
     tmp_path: Path,
 ) -> None:
     run_dir = _copy_run(formal_baseline_run, tmp_path)
     path = run_dir / "video_audit.jsonl"
-    lines = path.read_text(encoding="utf-8").splitlines()
-    path.write_text("\n".join(lines[:-1]) + "\n", encoding="utf-8")
+    path.write_text("", encoding="utf-8")
 
-    with pytest.raises(libero_report_v4.ComparisonErrorV4, match="exactly one"):
-        libero_report_v4.load_run_v4(run_dir)
+    run = libero_report_v4.load_run_v4(run_dir)
+
+    assert run.video_audits == ()
 
 
 def test_load_run_v4_rejects_artifact_errors(
