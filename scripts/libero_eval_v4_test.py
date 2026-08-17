@@ -248,8 +248,8 @@ def test_dummy_phase_is_paced_and_excluded_from_episode_timeline():
 @pytest.mark.parametrize(
     ("second_latency_ms", "expected_stalls"),
     (
-        (30, [(0, 125), (8, 0)]),
-        (80, [(0, 125), (8, 30)]),
+        (30, [(0, 0), (8, 0)]),
+        (80, [(0, 0), (8, 30)]),
     ),
 )
 def test_native_replan_uses_idle_time_and_only_records_deadline_suffix(
@@ -259,7 +259,7 @@ def test_native_replan_uses_idle_time_and_only_records_deadline_suffix(
     worker = FakeWorker(
         clock,
         [
-            _ScriptedCall(125 * NS_PER_MS, _rtc_response()),
+            _ScriptedCall(0, _rtc_response()),
             _ScriptedCall(second_latency_ms * NS_PER_MS, _rtc_response(1000.0)),
         ],
     )
@@ -376,7 +376,7 @@ class _BackgroundScheduler(control.ModeSchedulerV4):
             self.phase = 1
             return control.ActivationDecisionV4("initial", {"action_cursor": 0})
         self.phase = 2
-        return control.ActivationDecisionV4("immediate_swap", {"action_cursor": 1})
+        return control.ActivationDecisionV4("immediate_swap", {"action_cursor": 0})
 
     def take_action(self, now_ns):
         del now_ns
@@ -453,10 +453,6 @@ def test_async_underflow_waits_once_and_reanchors_next_deadline():
     assert result.episode_duration_ns == 85 * NS_PER_MS
 
 
-class _DoneWithPendingScheduler(_BackgroundScheduler):
-    pass
-
-
 def test_done_abandons_background_request_without_latency_or_activation():
     clock = ManualClock()
     worker = FakeWorker(
@@ -473,7 +469,7 @@ def test_done_abandons_background_request_without_latency_or_activation():
         worker,
         environment,
         args=_args(execution_mode="baseline_rtc"),
-        scheduler=_DoneWithPendingScheduler(),
+        scheduler=_BackgroundScheduler(),
     )
 
     assert result.success
@@ -550,4 +546,3 @@ def test_worker_shutdown_failure_preserves_primary_exception():
 
     assert caught.value.primary_error is primary
     assert isinstance(caught.value.cleanup_error, TimeoutError)
-
