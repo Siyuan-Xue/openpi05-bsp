@@ -194,6 +194,7 @@ def test_video_audit_rejects_exact_field_bool_nonfinite_wrong_object_and_identit
     malformed = (
         missing,
         dict(payload, extra=True),
+        dict(payload, schema_version=4.0),
         dict(payload, encoded_frame_count=True),
         dict(payload, encoded_fps=float("nan")),
         dict(payload, planned=[]),

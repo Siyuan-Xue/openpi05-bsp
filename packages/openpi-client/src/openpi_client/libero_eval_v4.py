@@ -396,7 +396,7 @@ class EvaluationManifestV4:
         self._validate()
 
     def _validate(self) -> None:
-        if isinstance(self.schema_version, bool) or self.schema_version != SCHEMA_VERSION:
+        if type(self.schema_version) is not int or self.schema_version != SCHEMA_VERSION:
             raise ValueError("manifest schema_version must be integer 4")
         for name, actual, expected in (
             ("dataset_fps", self.dataset_fps, DATASET_FPS),
@@ -808,7 +808,7 @@ class EpisodeRecordV4:
         )
 
     def _validate(self) -> None:
-        if isinstance(self.schema_version, bool) or self.schema_version != SCHEMA_VERSION:
+        if type(self.schema_version) is not int or self.schema_version != SCHEMA_VERSION:
             raise ValueError("episode schema_version must be integer 4")
         _require_nonempty_text(self.episode_id, name="episode_id")
         _require_nonempty_text(self.paired_key, name="paired_key")
@@ -1297,7 +1297,7 @@ class VideoArtifactAuditV4:
         ) // self.planned.video_fps
 
     def _validate(self) -> None:
-        if isinstance(self.schema_version, bool) or self.schema_version != SCHEMA_VERSION:
+        if type(self.schema_version) is not int or self.schema_version != SCHEMA_VERSION:
             raise ValueError("video artifact schema_version must be integer 4")
         _require_nonempty_text(self.episode_id, name="video episode_id")
         if self.execution_mode not in _control.EXECUTION_MODES:

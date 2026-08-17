@@ -273,6 +273,7 @@ def test_manifest_defensively_owns_nested_containers_and_rejects_exact_field_mut
     missing.pop("controller_period_ns")
     mutations.append(missing)
     mutations.append(dict(payload, extra=True))
+    mutations.append(dict(payload, schema_version=4.0))
     mutations.append(dict(payload, checkpoint_step=True))
     mutations.append(dict(payload, connection_timeout_s=float("inf")))
     mutations.append(dict(payload, suites=tuple(payload["suites"])))
@@ -400,6 +401,7 @@ def test_episode_record_rejects_missing_extra_bool_nonfinite_wrong_list_and_bad_
     malformed = (
         missing,
         dict(payload, extra=1),
+        dict(payload, schema_version=4.0),
         dict(payload, attempts=True),
         dict(payload, episode_duration_ns=float("nan")),
         dict(payload, inference_requests=tuple(payload["inference_requests"])),
