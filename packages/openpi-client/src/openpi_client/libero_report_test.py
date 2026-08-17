@@ -78,6 +78,22 @@ def _manifest(variant, step, *, family="full"):
     }
 
 
+def _manifest_v2(variant, step, *, family="full"):
+    manifest = _manifest(variant, step, family=family)
+    for field in (
+        "dataset_fps",
+        "source_demo_control_hz",
+        "control_freq_hz",
+        "video_fps",
+        "video_show_inference_waits",
+        "inference_schedule",
+    ):
+        manifest.pop(field)
+    manifest["schema_version"] = 2
+    manifest["native_control_hz"] = 10
+    return manifest
+
+
 def _write_json(path, payload):
     path.write_text(json.dumps(payload, allow_nan=False, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -292,12 +308,21 @@ class TestLiberoPhaseOneReport:
 
     def test_schema_two_is_archive_only_and_mixed_versions_are_rejected(self):
         valid = [_manifest(variant, step) for variant in ("baseline", "bsp") for step in _STEPS]
+        v2 = [_manifest_v2(variant, step) for variant in ("baseline", "bsp") for step in _STEPS]
         for manifests in (
-            [dict(manifest, schema_version=2) for manifest in valid],
-            [dict(valid[0], schema_version=2), *valid[1:]],
+            v2,
+            [v2[0], *valid[1:]],
         ):
             with pytest.raises(libero_report.ComparisonError, match="archive-only"):
                 libero_report.classify_phase_one_manifests(manifests)
+
+    @pytest.mark.parametrize("schema_version", (1, 4))
+    def test_unsupported_manifest_schema_versions_are_explicit(self, schema_version):
+        manifest = _manifest("baseline", 0)
+        manifest["schema_version"] = schema_version
+
+        with pytest.raises(libero_report.ComparisonError, match="unsupported schema_version"):
+            libero_report._validate_manifest(manifest)
 
     def test_artifact_only_video_settings_may_differ_but_metric_clocks_must_match(self):
         valid = [_manifest(variant, step) for variant in ("baseline", "bsp") for step in _STEPS]
@@ -613,6 +638,43 @@ class TestLiberoPhaseOneReport:
             record = dict(valid, infrastructure_history=history)
             with pytest.raises(libero_report.ComparisonError):
                 libero_report._validate_episode(record, manifest)
+
+    @pytest.mark.parametrize("eval_seed", (42.0, True))
+    def test_episode_validation_rejects_non_integer_eval_seed(self, eval_seed):
+        manifest = _manifest("baseline", 10000)
+        record = _episode("libero_spatial", 0, 0, True).to_dict()
+        record["eval_seed"] = eval_seed
+
+        with pytest.raises(libero_report.ComparisonError, match="eval_seed must be an integer"):
+            libero_report._validate_episode(record, manifest)
+
+    @pytest.mark.parametrize("attempt", (1.0, True))
+    def test_episode_validation_rejects_non_integer_history_attempt(self, attempt):
+        manifest = _manifest("baseline", 10000)
+        identity = _episode("libero_spatial", 0, 0, True).identity
+
+        def run_attempt(attempt_number):
+            if attempt_number == 1:
+                raise libero_eval.InfrastructureFailure("network", "socket timeout")
+            return libero_eval.AttemptResult(
+                success=True,
+                steps=1,
+                replans=1,
+                inference_ms=(1.0,),
+                inference_requests=(libero_video_timing.InferenceRequest(0, 0, 1_000_000),),
+                control_stalls=(libero_video_timing.ControlStall(0, 0, 0, 1_000_000),),
+            )
+
+        record = libero_eval.run_episode_with_retries(
+            identity,
+            run_attempt,
+            eval_seed=42,
+            infrastructure_retries=2,
+        ).to_dict()
+        record["infrastructure_history"][0]["attempt"] = attempt
+
+        with pytest.raises(libero_report.ComparisonError, match="history attempt must be an integer"):
+            libero_report._validate_episode(record, manifest)
 
     def test_schema_three_episode_timing_rejects_forged_events(self):
         manifest = _manifest("baseline", 10000)

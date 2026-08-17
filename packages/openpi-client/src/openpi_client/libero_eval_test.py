@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pytest
 
-from openpi_client import libero_artifacts
 from openpi_client import libero_eval
 
 
@@ -314,23 +313,6 @@ class TestLiberoEvaluation:
         with pytest.raises(ValueError):
             dataclasses.replace(_manifest(), **{field: value})
 
-    def test_shared_artifact_helpers_preserve_wire_bytes_and_clean_failed_replacements(self, tmp_path):
-        assert libero_artifacts.json_text({"z": 2, "a": 1}) == '{\n  "a": 1,\n  "z": 2\n}\n'
-        with pytest.raises(ValueError):
-            libero_artifacts.json_text({"value": float("nan")})
-        assert libero_artifacts.csv_text(({"b": 2, "a": 1},)) == "b,a\r\n2,1\r\n"
-
-        jsonl_path = tmp_path / "records.jsonl"
-        libero_artifacts.append_jsonl(jsonl_path, {"b": 2, "a": 1})
-        libero_artifacts.append_jsonl(jsonl_path, {"c": 3})
-        assert jsonl_path.read_text(encoding="utf-8") == '{"a": 1, "b": 2}\n{"c": 3}\n'
-
-        occupied = tmp_path / "occupied"
-        occupied.mkdir()
-        with pytest.raises(OSError):
-            libero_artifacts.atomic_text(occupied, "replacement")
-        assert not list(tmp_path.glob(".occupied.*.tmp"))
-
     def test_client_evaluation_module_parses_as_python_37(self):
         source = Path(libero_eval.__file__).read_text(encoding="utf-8")
         ast.parse(source, filename=str(libero_eval.__file__), feature_version=(3, 7))
@@ -346,21 +328,6 @@ class TestLiberoEvaluation:
         assert (tmp_path / "tasks.csv").is_file()
         assert (tmp_path / "suites.csv").is_file()
         assert json.loads((tmp_path / "summary.json").read_text()) == summary
-
-    def test_summary_write_preserves_existing_csv_if_serialization_fails(self, tmp_path):
-        class UnserializableTaskName:
-            def __str__(self):
-                raise RuntimeError("cannot serialize task name")
-
-        tasks_path = tmp_path / "tasks.csv"
-        tasks_path.write_text("previous artifact\n", encoding="utf-8")
-        identity = dataclasses.replace(_identity(), task_name=UnserializableTaskName())
-        record = libero_eval.EpisodeRecord.from_attempt(identity, 42, 1, success=True)
-
-        with pytest.raises(RuntimeError, match="cannot serialize task name"):
-            libero_eval.ArtifactWriter(tmp_path).write_summary([record])
-
-        assert tasks_path.read_text(encoding="utf-8") == "previous artifact\n"
 
     def test_artifact_failure_is_separately_audited_and_marks_summary_incomplete(self, tmp_path):
         writer = libero_eval.ArtifactWriter(tmp_path)

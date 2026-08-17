@@ -204,6 +204,21 @@ def _require_integer(value: Any, *, label: str) -> int:
 
 
 def _validate_manifest(manifest: Mapping[str, Any]) -> Tuple[str, int]:
+    _require_fields(manifest, ("schema_version",), label="evaluation manifest")
+    schema_version = _require_integer(
+        manifest["schema_version"], label="Evaluation manifest schema_version"
+    )
+    if schema_version == 2:
+        raise ComparisonError(
+            "Phase-one comparison requires schema_version 3; schema 2 is archive-only "
+            "and must be rerun with the schema-3 evaluator"
+        )
+    if schema_version != 3:
+        raise ComparisonError(
+            "Evaluation manifest has unsupported schema_version {}; expected 3".format(
+                schema_version
+            )
+        )
     required = (
         "schema_version",
         "dataset_fps",
@@ -239,14 +254,6 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> Tuple[str, int]:
         "infrastructure_retries",
     )
     _require_fields(manifest, required, label="evaluation manifest")
-    schema_version = _require_integer(
-        manifest["schema_version"], label="Evaluation manifest schema_version"
-    )
-    if schema_version != 3:
-        raise ComparisonError(
-            "Phase-one comparison requires schema_version 3; schema 2 is archive-only "
-            "and must be rerun with the schema-3 evaluator"
-        )
     for field, expected in (
         ("dataset_fps", 10),
         ("source_demo_control_hz", 20),
@@ -489,7 +496,8 @@ def _validate_episode(record: Mapping[str, Any], manifest: Mapping[str, Any]) ->
         raise ComparisonError("Episode paired_key is not canonical for its identity")
     if record["episode_id"] != canonical_identity.episode_id:
         raise ComparisonError("Episode episode_id is not canonical for its identity")
-    if record["eval_seed"] != manifest["eval_seed"]:
+    eval_seed = _require_integer(record["eval_seed"], label="Episode eval_seed")
+    if eval_seed != manifest["eval_seed"]:
         raise ComparisonError("Episode eval_seed does not match its manifest")
     if record["include_in_success_rate"] is not True:
         raise ComparisonError("Every phase-one episode must be eligible; infrastructure run is incomplete")
@@ -545,7 +553,10 @@ def _validate_episode(record: Mapping[str, Any], manifest: Mapping[str, Any]) ->
         if not isinstance(entry, dict):
             raise ComparisonError("Episode infrastructure history entries must be objects")
         _require_fields(entry, ("attempt", "kind", "error"), label="infrastructure history entry")
-        if entry["attempt"] != expected_attempt:
+        attempt = _require_integer(
+            entry["attempt"], label="Episode infrastructure history attempt"
+        )
+        if attempt != expected_attempt:
             raise ComparisonError("Episode infrastructure history attempts must be consecutive")
         if entry["kind"] not in ("simulator", "container", "network"):
             raise ComparisonError("Episode infrastructure history has an invalid kind")
