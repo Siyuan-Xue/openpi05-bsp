@@ -611,7 +611,7 @@ def _persist_episode_artifacts(
         video_frames = _build_video_frames(
             replay_frames,
             included_stalls,
-            stall_source_frames=stall_source_frames,
+            stall_source_frames=stall_source_frames if video_show_inference_waits else (),
             control_hz=control_hz,
             video_fps=video_fps,
             inference_schedule=inference_schedule,

@@ -752,6 +752,68 @@ def test_zero_quantized_first_wait_is_omitted_without_fabricating_a_control_fram
     assert audits[0].video_frame_count == 0
 
 
+def test_wait_display_off_ignores_transient_trailing_source_and_keeps_control_video(
+    monkeypatch, tmp_path
+):
+    encoded = []
+
+    class Writer:
+        def append_episode(self, record):
+            pass
+
+        def append_video_audit(self, audit):
+            assert audit.included_stall_count == 0
+
+        def append_artifact_error(self, error):
+            pytest.fail("disabled wait display consumed a transient stall source")
+
+    class Selector:
+        def claim(self, record):
+            return tmp_path / "failure.mp4"
+
+    class Reader:
+        def get_meta_data(self):
+            return {"fps": 40.0, "duration": 0.05}
+
+        def count_frames(self):
+            return 2
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(libero_main.imageio, "get_reader", lambda path: Reader())
+    result = libero_eval.AttemptResult(
+        success=False,
+        steps=1,
+        replans=1,
+        failure_kind="policy",
+        inference_requests=(
+            timing.InferenceRequest(0, 0, 1),
+            timing.InferenceRequest(1, 2, 50_000_000),
+        ),
+        control_stalls=(
+            timing.ControlStall(0, 0, 0, 1),
+            timing.ControlStall(1, 1, 2, 50_000_000),
+        ),
+        replay_frames=("control-frame",),
+        stall_source_frames=((1, "current-request-frame"),),
+    )
+    record = libero_eval.EpisodeRecord.from_attempt(
+        _identity(), 42, 1, success=False, failure_kind="policy", result=result
+    )
+
+    _, artifact_error = libero_main._persist_episode_artifacts(
+        record,
+        Writer(),
+        Selector(),
+        video_show_inference_waits=False,
+        video_encoder=lambda path, frames, *, fps: encoded.append(tuple(frames)),
+    )
+
+    assert artifact_error is None
+    assert encoded == [("control-frame", "control-frame")]
+
+
 def test_async_latency_without_underflow_adds_no_frames_but_partial_stall_uses_async_label():
     request = timing.InferenceRequest(0, 0, 300_000_000)
     renderer_calls = []
