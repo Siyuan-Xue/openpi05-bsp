@@ -4,6 +4,7 @@ import dataclasses
 import json
 
 import numpy as np
+from openpi_client import bsp_spline as client_bsp_spline
 from openpi_client import libero_eval
 import pytest
 
@@ -131,6 +132,35 @@ def test_knot_projection_repairs_only_descending_values():
 
     np.testing.assert_allclose(projected, [0.0, 2.0, 2.000001, 2.000002, 4.0])
     np.testing.assert_array_equal(project_knots(np.asarray([0.0, 0.0, 1.0])), [0.0, 0.0, 1.0])
+
+
+@pytest.mark.parametrize(
+    "knots",
+    [
+        np.arange(16, dtype=np.float32),
+        np.asarray([0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 9], dtype=np.float32),
+        np.asarray([0, 0, 0, 0, 2, 1, 1, 4, 5, 6, 7, 8, 9, 9, 9, 9], dtype=np.float32),
+    ],
+    ids=("regular", "repeated", "descending"),
+)
+def test_client_eight_point_decode_matches_the_server_scipy_decoder(knots):
+    """Changing client span or projection semantics would diverge from deployed server actions."""
+    parameters = np.zeros((16, 8), dtype=np.float32)
+    parameters[:, 7] = knots
+    parameters[:12, :7] = np.arange(84, dtype=np.float32).reshape(12, 7) / 17.0
+    response = {
+        "schema_version": 1,
+        "parameters": parameters,
+        "origin_hz": 10,
+        "degree": 3,
+        "speedup": 1,
+        "alignment": "disabled_delta_eff",
+    }
+
+    expected = decode_actions(parameters)
+    actual = client_bsp_spline.BspSpline.from_response(response).decode_eight()
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
 
 
 @pytest.mark.parametrize(

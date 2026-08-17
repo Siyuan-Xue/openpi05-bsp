@@ -117,5 +117,20 @@ class BspLiberoOutputs(transforms.DataTransformFn):
             raise ValueError(f"BSP policy output must have padded shape {expected_shape}, got {actions.shape}")
         if not np.isfinite(actions).all():
             raise ValueError("BSP policy output contains non-finite parameters")
-        parameters = actions[:, : settings.target_channels]
-        return {"actions": _bsp.decode_actions(parameters, settings)}
+        decode_parameters = actions[:, : settings.target_channels]
+        with np.errstate(over="ignore", invalid="ignore"):
+            wire_parameters = np.asarray(decode_parameters, dtype=np.float32).copy()
+        if not np.isfinite(wire_parameters).all():
+            raise ValueError("BSP policy parameters must be representable as finite float32 values")
+        decoded_actions = _bsp.decode_actions(decode_parameters, settings)
+        return {
+            "actions": decoded_actions,
+            "bsp": {
+                "schema_version": 1,
+                "parameters": wire_parameters,
+                "origin_hz": 10,
+                "degree": 3,
+                "speedup": 1,
+                "alignment": "disabled_delta_eff",
+            },
+        }
