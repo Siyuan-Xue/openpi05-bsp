@@ -561,6 +561,19 @@ def test_load_run_v4_rejects_duplicate_video_episode(
         libero_report_v4.load_run_v4(run_dir)
 
 
+def test_load_run_v4_rejects_episode_without_video_audit(
+    formal_baseline_run: Path,
+    tmp_path: Path,
+) -> None:
+    run_dir = _copy_run(formal_baseline_run, tmp_path)
+    path = run_dir / "video_audit.jsonl"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    path.write_text("\n".join(lines[:-1]) + "\n", encoding="utf-8")
+
+    with pytest.raises(libero_report_v4.ComparisonErrorV4, match="exactly one"):
+        libero_report_v4.load_run_v4(run_dir)
+
+
 def test_load_run_v4_rejects_artifact_errors(
     formal_baseline_run: Path,
     tmp_path: Path,
@@ -830,3 +843,21 @@ def test_write_five_checkpoint_report_uses_only_v4_suffixed_filenames(
     assert filenames
     assert all(Path(name).stem.endswith("_v4") for name in filenames)
     assert not filenames.intersection(libero_report.OUTPUT_FILENAMES)
+
+
+def test_write_report_accepts_one_four_run_checkpoint(
+    runs_by_mode: Mapping[str, libero_report_v4.RunDataV4],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(libero_report, "BOOTSTRAP_RESAMPLES", 1)
+
+    report = libero_report_v4.write_five_checkpoint_report_v4(
+        list(runs_by_mode.values()),
+        output_dir=tmp_path,
+    )
+
+    assert [row["checkpoint_step"] for row in report["checkpoints"]] == [1000]
+    assert {path.name for path in tmp_path.iterdir()} == set(
+        libero_report_v4.OUTPUT_FILENAMES_V4
+    )
