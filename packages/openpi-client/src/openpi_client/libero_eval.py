@@ -93,6 +93,21 @@ def _require_exact_string_tuple(
     return value
 
 
+def _require_exact_nonnegative_integer_tuple(
+    value: Any,
+    *,
+    name: str,
+    expected_count: int,
+) -> tuple[int, ...]:
+    if type(value) is not tuple:
+        raise TypeError(f"{name} must be a tuple")
+    if len(value) != expected_count:
+        raise ValueError(f"{name} must contain exactly {expected_count} entries")
+    for entry in value:
+        _require_exact_integer(entry, name=f"{name} entry")
+    return value
+
+
 def _validate_stall_source_frames(
     stall_source_frames: Sequence[tuple[int, Any]], *, steps: int
 ) -> None:
@@ -793,6 +808,7 @@ class VideoArtifactAudit:
     measured_control_stall_ns: int
     measured_stall_reasons: tuple[str, ...]
     included_stall_reasons: tuple[str, ...]
+    included_stall_frame_counts: tuple[int, ...]
     inserted_overlay_types: tuple[str, ...]
     encoded_fps: float
     encoded_frame_count: int
@@ -804,6 +820,33 @@ class VideoArtifactAudit:
     warning: str | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.planned, _video_timing.VideoTimingAudit):
+            raise TypeError("planned must be a VideoTimingAudit")
+        if type(self.video_show_inference_waits) is not bool:
+            raise TypeError("video_show_inference_waits must be a boolean")
+        _video_timing.validate_inference_schedule(self.inference_schedule)
+        _require_exact_integer(self.measured_stall_count, name="video measured_stall_count")
+        _require_exact_integer(
+            self.measured_control_stall_ns,
+            name="video measured_control_stall_ns",
+        )
+        _require_exact_integer(self.included_stall_count, name="video included_stall_count")
+        _require_exact_integer(
+            self.included_control_stall_ns,
+            name="video included_control_stall_ns",
+        )
+        _require_exact_integer(self.planned.stall_frame_count, name="video stall_frame_count")
+        _require_exact_integer(
+            self.artifact_padding_frame_count,
+            name="video artifact_padding_frame_count",
+        )
+        if self.artifact_padding_frame_count not in {0, 1}:
+            raise ValueError("Video artifact padding must contain at most one frame")
+        if self.planned.video_frame_count == 0:
+            if self.artifact_padding_frame_count != 1:
+                raise ValueError("An empty planned timeline requires one encoded padding frame")
+        elif self.artifact_padding_frame_count:
+            raise ValueError("Non-empty planned timelines cannot add artifact padding")
         _require_exact_string_tuple(
             self.measured_stall_reasons,
             name="video measured_stall_reasons",
@@ -816,6 +859,13 @@ class VideoArtifactAudit:
             allowed_values=_STALL_REASONS,
             expected_count=self.included_stall_count,
         )
+        _require_exact_nonnegative_integer_tuple(
+            self.included_stall_frame_counts,
+            name="video included_stall_frame_counts",
+            expected_count=self.included_stall_count,
+        )
+        if sum(self.included_stall_frame_counts) != self.planned.stall_frame_count:
+            raise ValueError("Included stall frame counts do not match the planned timeline")
         _require_exact_string_tuple(
             self.inserted_overlay_types,
             name="video inserted_overlay_types",
@@ -833,28 +883,24 @@ class VideoArtifactAudit:
                 raise ValueError("Included stall reasons must match measured stall reasons")
         elif self.included_stall_reasons or self.inserted_overlay_types:
             raise ValueError("Disabled inference waits cannot include stalls or overlays")
-        expected_overlay_type = _OVERLAY_TYPE_BY_STALL_REASON[expected_reason]
-        if any(overlay_type != expected_overlay_type for overlay_type in self.inserted_overlay_types):
-            raise ValueError("Inserted overlay type does not match inference schedule")
-        if len(self.inserted_overlay_types) > self.included_stall_count:
-            raise ValueError("Inserted overlays cannot outnumber included stalls")
-        overlay_expected = self.video_show_inference_waits and (
-            self.planned.stall_frame_count > 0
-            or (self.artifact_padding_frame_count == 1 and bool(self.included_stall_reasons))
+        expected_overlay_types = tuple(
+            _OVERLAY_TYPE_BY_STALL_REASON[reason]
+            for reason, frame_count in zip(  # noqa: B905 -- LIBERO client runs on Python 3.8.
+                self.included_stall_reasons,
+                self.included_stall_frame_counts,
+            )
+            if frame_count
         )
-        if bool(self.inserted_overlay_types) != overlay_expected:
+        if (
+            self.artifact_padding_frame_count
+            and self.video_show_inference_waits
+            and self.included_stall_reasons
+        ):
+            expected_overlay_types = (
+                _OVERLAY_TYPE_BY_STALL_REASON[self.included_stall_reasons[0]],
+            )
+        if self.inserted_overlay_types != expected_overlay_types:
             raise ValueError("Inserted overlay audit does not match the encoded video timeline")
-        _require_exact_integer(
-            self.artifact_padding_frame_count,
-            name="video artifact_padding_frame_count",
-        )
-        if self.artifact_padding_frame_count not in {0, 1}:
-            raise ValueError("Video artifact padding must contain at most one frame")
-        if self.planned.video_frame_count == 0:
-            if self.artifact_padding_frame_count != 1:
-                raise ValueError("An empty planned timeline requires one encoded padding frame")
-        elif self.artifact_padding_frame_count:
-            raise ValueError("Non-empty planned timelines cannot add artifact padding")
 
     @property
     def included_stall_count(self) -> int:
@@ -883,6 +929,7 @@ class VideoArtifactAudit:
             "measured_control_stall_ns": self.measured_control_stall_ns,
             "measured_stall_reasons": list(self.measured_stall_reasons),
             "included_stall_reasons": list(self.included_stall_reasons),
+            "included_stall_frame_counts": list(self.included_stall_frame_counts),
             "inserted_overlay_types": list(self.inserted_overlay_types),
             "encoded_fps": self.encoded_fps,
             "encoded_frame_count": self.encoded_frame_count,
@@ -990,14 +1037,15 @@ def build_video_artifact_audit(
         )
     measured_stall_reasons = tuple(stall.reason for stall in measured_stalls)
     included_stall_reasons = tuple(stall.reason for stall in included_stalls)
+    included_stall_frame_counts = _video_timing.quantize_stall_frames(
+        included_stalls,
+        video_fps=planned.video_fps,
+    )
     inserted_overlay_types = tuple(
         _OVERLAY_TYPE_BY_STALL_REASON[stall.reason]
         for stall, frame_count in zip(
             included_stalls,
-            _video_timing.quantize_stall_frames(
-                included_stalls,
-                video_fps=planned.video_fps,
-            ),
+            included_stall_frame_counts,
         )
         if frame_count
     )
@@ -1019,6 +1067,7 @@ def build_video_artifact_audit(
         measured_control_stall_ns=sum(stall.duration_ns for stall in measured_stalls),
         measured_stall_reasons=measured_stall_reasons,
         included_stall_reasons=included_stall_reasons,
+        included_stall_frame_counts=included_stall_frame_counts,
         inserted_overlay_types=inserted_overlay_types,
         encoded_fps=float(encoded_fps),
         encoded_frame_count=encoded_frame_count,

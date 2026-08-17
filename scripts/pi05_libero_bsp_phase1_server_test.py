@@ -65,7 +65,8 @@ class PhaseOneServerRunbookContractTest(unittest.TestCase):
 
     def test_evaluator_flags_are_real_nested_args(self):
         fields = _class_fields(_ROOT / "examples" / "libero" / "main.py", "Args")
-        flags = set(re.findall(r"--args\.([a-z0-9-]+)", self.runbook))
+        bash = "\n".join(self.bash_blocks)
+        flags = set(re.findall(r"--args\.([a-z0-9-]+)", bash))
         required = {
             "task-suite-name",
             "task-ids",
@@ -90,7 +91,8 @@ class PhaseOneServerRunbookContractTest(unittest.TestCase):
 
         self.assertTrue(required.issubset(flags))
         self.assertEqual(flags.difference(fields), set())
-        self.assertNotIn("--args.code-sha", "\n".join(self.bash_blocks))
+        self.assertNotIn("code-sha", fields)
+        self.assertNotIn("--args.code-sha", bash)
 
     def test_training_overrides_match_current_config_fields(self):
         config_path = _ROOT / "src" / "openpi" / "training" / "config.py"
@@ -249,6 +251,56 @@ class PhaseOneServerRunbookContractTest(unittest.TestCase):
                 with self.subTest(document=path.name):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertNotIn("runtime_evaluator_sha=", result.stdout)
+
+    def test_schema3_diagnostics_clean_gate_propagates_git_status_failure(self):
+        section = re.search(
+            r"### 12\.4 .*?```bash\n(.*?)\n```",
+            self.runbook,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(section)
+        block = section.group(1)
+        prefix = re.search(
+            r'(.*?test "\$\{#SCHEMA3_CODE_SHA\}" -eq 40)',
+            block,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(prefix)
+        self.assertIn(
+            'if ! schema3_git_status="$(git status '
+            '--porcelain --untracked-files=all)"; then',
+            block,
+        )
+        self.assertIn('if test -n "$schema3_git_status"; then', block)
+        self.assertNotIn(
+            'test -z "$(git status --porcelain --untracked-files=all)"',
+            block,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            fake_git = Path(directory) / "git"
+            fake_git.write_text(
+                "#!/bin/sh\n"
+                "case \"$*\" in\n"
+                "  *'status --porcelain --untracked-files=all'*) exit 17 ;;\n"
+                "  *'rev-parse HEAD'*) printf '%040d\\n' 0; exit 0 ;;\n"
+                "  *) exit 19 ;;\n"
+                "esac\n"
+            )
+            fake_git.chmod(0o755)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{directory}:{environment['PATH']}"
+            environment["BSP_REPO_DIR"] = directory
+            result = subprocess.run(
+                ["bash", "-ceu", prefix.group(1)],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=environment,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot inspect schema-v3 checkout", result.stderr)
 
     def test_final_audit_names_ten_runs_and_three_diagnostic_artifacts(self):
         self.assertNotIn("六个 h16/BSP 评测输入", self.runbook)

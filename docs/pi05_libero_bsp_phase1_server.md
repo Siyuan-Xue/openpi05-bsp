@@ -1442,7 +1442,15 @@ schema v2 历史诊断和 checkpoint 全部保留，不重训模型、不重建 
 
 ```bash
 cd "$BSP_REPO_DIR"
-test -z "$(git status --porcelain --untracked-files=all)"
+if ! schema3_git_status="$(git status --porcelain --untracked-files=all)"; then
+  echo "STOP: cannot inspect schema-v3 checkout" >&2
+  exit 2
+fi
+if test -n "$schema3_git_status"; then
+  echo "STOP: schema-v3 checkout is not clean" >&2
+  printf '%s\n' "$schema3_git_status" >&2
+  exit 2
+fi
 export SCHEMA3_CODE_SHA="$(git rev-parse HEAD)"
 case "$SCHEMA3_CODE_SHA" in
   *[!0-9a-f]*|'') echo "STOP: SCHEMA3_CODE_SHA must be lowercase hex" >&2; exit 2 ;;

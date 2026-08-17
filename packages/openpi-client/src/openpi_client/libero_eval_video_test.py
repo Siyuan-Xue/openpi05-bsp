@@ -72,10 +72,12 @@ def test_video_artifact_audit_records_explicit_synchronous_stall_and_overlay_typ
 
     assert audit.measured_stall_reasons == ("synchronous_inference",)
     assert audit.included_stall_reasons == ("synchronous_inference",)
+    assert audit.included_stall_frame_counts == (1,)
     assert audit.inserted_overlay_types == ("synchronous_inference",)
     payload = audit.to_dict()
     assert payload["measured_stall_reasons"] == ["synchronous_inference"]
     assert payload["included_stall_reasons"] == ["synchronous_inference"]
+    assert payload["included_stall_frame_counts"] == [1]
     assert payload["inserted_overlay_types"] == ["synchronous_inference"]
     payload["inserted_overlay_types"].append("mutated")
     assert audit.to_dict()["inserted_overlay_types"] == ["synchronous_inference"]
@@ -117,6 +119,7 @@ def test_video_artifact_audit_records_async_underflow_overlay_without_latency_in
     assert audit.measured_control_stall_ns == 50_000_000
     assert audit.measured_stall_reasons == ("async_action_underflow",)
     assert audit.included_stall_reasons == ("async_action_underflow",)
+    assert audit.included_stall_frame_counts == (2,)
     assert audit.inserted_overlay_types == ("waiting_for_policy_actions",)
 
 
@@ -128,10 +131,21 @@ def test_video_artifact_audit_reason_and_overlay_fields_require_exact_tuples():
     )
 
     invalid_overrides = (
+        {"measured_stall_count": True},
+        {"measured_stall_count": 1.0},
+        {"measured_control_stall_ns": True},
+        {"video_show_inference_waits": 1},
+        {"inference_schedule": "unknown"},
+        {"planned": dataclasses.replace(audit.planned, included_stall_count=True)},
+        {"planned": dataclasses.replace(audit.planned, included_control_stall_ns=25_000_000.0)},
+        {"planned": dataclasses.replace(audit.planned, stall_frame_count=True)},
         {"measured_stall_reasons": ["synchronous_inference"]},
         {"measured_stall_reasons": ("synchronous_inference", "synchronous_inference")},
         {"included_stall_reasons": ["synchronous_inference"]},
         {"included_stall_reasons": ()},
+        {"included_stall_frame_counts": [1]},
+        {"included_stall_frame_counts": (True,)},
+        {"included_stall_frame_counts": (0,)},
         {"inserted_overlay_types": ["synchronous_inference"]},
         {"inserted_overlay_types": ()},
         {"inserted_overlay_types": ("waiting_for_policy_actions",)},
@@ -143,6 +157,42 @@ def test_video_artifact_audit_reason_and_overlay_fields_require_exact_tuples():
             pass
         else:
             raise AssertionError(overrides)
+
+
+def test_video_artifact_audit_rejects_underreported_overlay_for_multiple_stalls():
+    stalls = (
+        timing.ControlStall(0, 0, 0, 25_000_000),
+        timing.ControlStall(1, 1, 25_000_000, 25_000_000),
+    )
+    planned = timing.build_video_audit(
+        control_frame_count=2,
+        requests=(),
+        stalls=stalls,
+    )
+    audit = libero_eval.build_video_artifact_audit(
+        episode_id="two-stalls",
+        path="videos/two-stalls.mp4",
+        planned=planned,
+        measured_stalls=stalls,
+        included_stalls=stalls,
+        video_show_inference_waits=True,
+        inference_schedule="synchronous",
+        encoded_fps=40.0,
+        encoded_frame_count=6,
+        encoded_duration_s=0.15,
+    )
+
+    assert audit.included_stall_frame_counts == (1, 1)
+    assert audit.inserted_overlay_types == (
+        "synchronous_inference",
+        "synchronous_inference",
+    )
+    try:
+        dataclasses.replace(audit, inserted_overlay_types=("synchronous_inference",))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("multi-stall audit accepted an underreported overlay")
 
 
 def test_video_artifact_audit_uses_ceiling_for_exact_60_fps_frame_tolerance():
@@ -216,6 +266,7 @@ def test_video_artifact_audit_records_real_one_frame_container_padding():
     assert audit.timing_gate_pass
     assert audit.measured_stall_reasons == ("synchronous_inference",)
     assert audit.included_stall_reasons == ("synchronous_inference",)
+    assert audit.included_stall_frame_counts == (0,)
     assert audit.inserted_overlay_types == ("synchronous_inference",)
 
 
@@ -484,6 +535,7 @@ def test_artifact_writer_appends_video_audit_jsonl(tmp_path):
     assert payload["included_control_stall_ns"] == 25_000_000
     assert payload["measured_stall_reasons"] == ["synchronous_inference"]
     assert payload["included_stall_reasons"] == ["synchronous_inference"]
+    assert payload["included_stall_frame_counts"] == [1]
     assert payload["inserted_overlay_types"] == ["synchronous_inference"]
     assert "timing_gate" not in payload
     assert "total_control_stall_ns" not in payload
@@ -504,6 +556,7 @@ def test_disabled_video_audit_keeps_measured_stalls_but_excludes_them_from_timel
     assert payload["included_stall_count"] == 0
     assert payload["included_control_stall_ns"] == 0
     assert payload["included_stall_reasons"] == []
+    assert payload["included_stall_frame_counts"] == []
     assert payload["inserted_overlay_types"] == []
     assert payload["expected_duration_ns"] == 100_000_000
     assert payload["encoded_duration_ns"] == 100_000_000
