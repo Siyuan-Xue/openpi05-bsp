@@ -256,7 +256,7 @@ def test_queued_job_and_connect_converge_on_same_owner_connection():
         worker.close()
 
 
-def test_queued_job_error_and_connect_share_snapshot_even_after_retirement():
+def test_queued_job_error_and_connect_share_snapshot_even_after_retirement(monkeypatch):
     error = OSError("inference failed")
     policy = _GatePolicy(metadata={"server": "queued-error"}, error=error)
     policy.release.set()
@@ -264,6 +264,16 @@ def test_queued_job_error_and_connect_share_snapshot_even_after_retirement():
     worker = async_inference.AsyncInferenceWorker(factory)
     connect_result = []
     connect_finished = threading.Event()
+    connect_registered = threading.Event()
+    real_condition_wait = worker._condition.wait
+    connect_thread = None
+
+    def registration_condition_wait(timeout=None):
+        if threading.current_thread() is connect_thread:
+            connect_registered.set()
+        return real_condition_wait(timeout)
+
+    monkeypatch.setattr(worker._condition, "wait", registration_condition_wait)
 
     def connect():
         try:
@@ -276,6 +286,7 @@ def test_queued_job_error_and_connect_share_snapshot_even_after_retirement():
         assert factory.started.wait(1.0)
         connect_thread = threading.Thread(target=connect)
         connect_thread.start()
+        assert connect_registered.wait(1.0)
 
         factory.release.set()
         assert connect_finished.wait(1.0)
