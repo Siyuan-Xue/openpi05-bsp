@@ -8,7 +8,22 @@ import dataclasses
 from copy import deepcopy
 import operator
 
+from openpi_client import libero_eval
 from openpi_client import libero_video_timing_v4 as timing
+
+
+_EVAL_SEED = 42
+_IDENTITY = libero_eval.EpisodeIdentity(
+    suite="libero_spatial",
+    task_id=0,
+    task_name="timing contract",
+    init_state_index=0,
+    init_state_fingerprint="a" * 64,
+)
+
+
+def _flow_seed(request_id):
+    return libero_eval.stable_replan_seed(_EVAL_SEED, _IDENTITY, request_id)
 
 
 def _assert_raises(exception_type, callback):
@@ -32,7 +47,7 @@ def _request(
     disposition="activated",
 ):
     if flow_seed is None:
-        flow_seed = 100 + request_id
+        flow_seed = _flow_seed(request_id)
     if scheduler_context is None:
         scheduler_context = {"s": 8, "d": 8}
     return timing.RequestEventV4(
@@ -51,7 +66,7 @@ def _initial_request(*, disposition="activated"):
     return _request(
         0,
         0,
-        flow_seed=100,
+        flow_seed=_flow_seed(0),
         dispatch="blocking_initial",
         trigger="initial_plan",
         scheduler_context={},
@@ -129,7 +144,7 @@ def test_event_records_round_trip_exact_fields_and_defensively_copy_contexts():
         "request_id": 3,
         "observation_control_step": 0,
         "submitted_offset_ns": 40,
-        "flow_seed": 103,
+        "flow_seed": _flow_seed(3),
         "dispatch": "background",
         "trigger": "rtc_launch",
         "scheduler_context": {"s": 8, "d": 8},
@@ -179,6 +194,15 @@ def test_every_event_rejects_missing_extra_bool_nonfinite_and_wrong_json_contain
     malformed_context = _initial_request().to_dict()
     malformed_context["scheduler_context"] = []
     _assert_raises(ValueError, lambda: timing.RequestEventV4.from_dict(malformed_context))
+    malformed_activation_context = records[2].to_dict()
+    malformed_activation_context["activation_context"] = []
+    _assert_raises(
+        ValueError,
+        lambda: timing.PlanActivationV4.from_dict(malformed_activation_context),
+    )
+    wrong_clock = records[1].to_dict()
+    wrong_clock["clock"] = "wall_clock"
+    _assert_raises(ValueError, lambda: timing.LatencyEventV4.from_dict(wrong_clock))
 
 
 def test_request_context_and_enum_validation_is_exact_and_trigger_aware():
@@ -235,7 +259,8 @@ def test_cross_event_validation_accepts_initial_sync_background_overlap_and_late
         steps=20,
         episode_duration_ns=1_000_000_000,
         execution_mode="baseline_rtc",
-        expected_flow_seeds=(100, 101, 102),
+        eval_seed=_EVAL_SEED,
+        identity=_IDENTITY,
     )
 
     assert normalized == events
@@ -257,7 +282,8 @@ def test_cross_event_validation_rejects_id_orphan_order_interval_and_seed_mutati
             "steps": 20,
             "episode_duration_ns": 1_000_000_000,
             "execution_mode": "baseline_rtc",
-            "expected_flow_seeds": (100, 101, 102),
+            "eval_seed": _EVAL_SEED,
+            "identity": _IDENTITY,
         }
         values.update(changes)
         timing.validate_timing_events_v4(**values)
@@ -291,6 +317,11 @@ def test_cross_event_validation_rejects_id_orphan_order_interval_and_seed_mutati
         latencies[1],
         dataclasses.replace(latencies[2], completed_offset_ns=1_000_000_001, duration_ns=200_000_001),
     )
+    wrong_seed_requests = (
+        requests[0],
+        dataclasses.replace(requests[1], flow_seed=(requests[1].flow_seed + 1) % (2**32)),
+        requests[2],
+    )
 
     mutations = (
         {"requests": gapped_requests},
@@ -301,10 +332,37 @@ def test_cross_event_validation_rejects_id_orphan_order_interval_and_seed_mutati
         {"requests": overlapping_requests},
         {"stalls": mismatched_stall},
         {"latencies": past_end_latency},
-        {"expected_flow_seeds": (100, 999, 102)},
+        {"requests": wrong_seed_requests},
     )
     for mutation in mutations:
         _assert_raises(ValueError, lambda mutation=mutation: validate(**mutation))
+
+
+def test_cross_event_validation_has_no_caller_supplied_seed_bypass():
+    requests, latencies, activations, underflows, stalls = _mixed_async_timeline()
+    forged_requests = (
+        requests[0],
+        dataclasses.replace(requests[1], flow_seed=(requests[1].flow_seed + 1) % (2**32)),
+        requests[2],
+    )
+    forged_expected = tuple(request.flow_seed for request in forged_requests)
+
+    _assert_raises(
+        TypeError,
+        lambda: timing.validate_timing_events_v4(
+            requests=forged_requests,
+            latencies=latencies,
+            activations=activations,
+            underflows=underflows,
+            stalls=stalls,
+            steps=20,
+            episode_duration_ns=1_000_000_000,
+            execution_mode="baseline_rtc",
+            eval_seed=_EVAL_SEED,
+            identity=_IDENTITY,
+            expected_flow_seeds=forged_expected,
+        ),
+    )
 
 
 def test_mode_aware_validation_rejects_invalid_rtc_and_bsp_contexts():
@@ -339,7 +397,8 @@ def test_mode_aware_validation_rejects_invalid_rtc_and_bsp_contexts():
         steps=2,
         episode_duration_ns=200,
         execution_mode="bsp_spline_async",
-        expected_flow_seeds=(100, 101),
+        eval_seed=_EVAL_SEED,
+        identity=_IDENTITY,
         expected_bsp_prefetch_budget_ns=50,
     )[0] == bsp_requests
 
@@ -358,10 +417,272 @@ def test_mode_aware_validation_rejects_invalid_rtc_and_bsp_contexts():
             steps=2,
             episode_duration_ns=200,
             execution_mode="bsp_spline_async",
-            expected_flow_seeds=(100, 101),
+            eval_seed=_EVAL_SEED,
+            identity=_IDENTITY,
             expected_bsp_prefetch_budget_ns=50,
         ),
     )
+
+    _assert_raises(
+        ValueError,
+        lambda: timing.validate_timing_events_v4(
+            requests=bsp_requests,
+            latencies=bsp_latencies,
+            activations=bsp_activations,
+            underflows=(),
+            stalls=bsp_stalls,
+            steps=2,
+            episode_duration_ns=200,
+            execution_mode="bsp_spline_async",
+            eval_seed=_EVAL_SEED,
+            identity=_IDENTITY,
+        ),
+    )
+    _assert_raises(
+        ValueError,
+        lambda: timing.validate_timing_events_v4(
+            requests=(_initial_request(),),
+            latencies=(_latency(0, 100, 100),),
+            activations=(
+                timing.PlanActivationV4(
+                    0,
+                    0,
+                    0,
+                    100,
+                    "initial",
+                    {"curve_elapsed_ns": 0},
+                ),
+            ),
+            underflows=(),
+            stalls=bsp_stalls,
+            steps=0,
+            episode_duration_ns=100,
+            execution_mode="bsp_spline_async",
+            eval_seed=_EVAL_SEED,
+            identity=_IDENTITY,
+        ),
+    )
+    timing.validate_timing_events_v4(
+        requests=(_initial_request(),),
+        latencies=(_latency(0, 100, 100),),
+        activations=(
+            timing.PlanActivationV4(
+                0,
+                0,
+                0,
+                100,
+                "initial",
+                {"curve_elapsed_ns": 0},
+            ),
+        ),
+        underflows=(),
+        stalls=bsp_stalls,
+        steps=0,
+        episode_duration_ns=100,
+        execution_mode="bsp_spline_async",
+        eval_seed=_EVAL_SEED,
+        identity=_IDENTITY,
+        expected_bsp_prefetch_budget_ns=0,
+    )
+    for invalid_budget in (True, -1):
+        _assert_raises(
+            ValueError,
+            lambda invalid_budget=invalid_budget: timing.validate_timing_events_v4(
+                requests=(_initial_request(),),
+                latencies=(_latency(0, 100, 100),),
+                activations=(
+                    timing.PlanActivationV4(
+                        0,
+                        0,
+                        0,
+                        100,
+                        "initial",
+                        {"curve_elapsed_ns": 0},
+                    ),
+                ),
+                underflows=(),
+                stalls=bsp_stalls,
+                steps=0,
+                episode_duration_ns=100,
+                execution_mode="bsp_spline_async",
+                eval_seed=_EVAL_SEED,
+                identity=_IDENTITY,
+                expected_bsp_prefetch_budget_ns=invalid_budget,
+            ),
+        )
+    _assert_raises(
+        ValueError,
+        lambda: timing.validate_timing_events_v4(
+            requests=(_initial_request(),),
+            latencies=(_latency(0, 100, 100),),
+            activations=(_native_activation(0, 0, 0, 100, activation="initial"),),
+            underflows=(),
+            stalls=bsp_stalls,
+            steps=0,
+            episode_duration_ns=100,
+            execution_mode="baseline_sync_n5",
+            eval_seed=_EVAL_SEED,
+            identity=_IDENTITY,
+            expected_bsp_prefetch_budget_ns=0,
+        ),
+    )
+
+
+def test_cross_event_chronology_binds_submissions_activation_steps_and_blocking_stalls():
+    requests, latencies, activations, underflows, stalls = _mixed_async_timeline()
+    delayed_prior_activation = (
+        dataclasses.replace(activations[0], activated_offset_ns=360_000_000),
+        activations[1],
+        activations[2],
+    )
+    _assert_raises(
+        ValueError,
+        lambda: timing.validate_timing_events_v4(
+            requests=requests,
+            latencies=latencies,
+            activations=delayed_prior_activation,
+            underflows=underflows,
+            stalls=stalls,
+            steps=20,
+            episode_duration_ns=1_000_000_000,
+            execution_mode="baseline_rtc",
+            eval_seed=_EVAL_SEED,
+            identity=_IDENTITY,
+        ),
+    )
+
+    bsp_requests = (
+        _initial_request(),
+        _request(
+            1,
+            150,
+            observation_control_step=2,
+            dispatch="background",
+            trigger="bsp_prefetch",
+            scheduler_context={"remaining_plan_ns": 50, "budget_ns": 50},
+        ),
+    )
+    bsp_activations = (
+        timing.PlanActivationV4(0, 0, 0, 100, "initial", {"curve_elapsed_ns": 0}),
+        timing.PlanActivationV4(1, 1, 1, 175, "immediate_swap", {"curve_elapsed_ns": 0}),
+    )
+    _assert_raises(
+        ValueError,
+        lambda: timing.validate_timing_events_v4(
+            requests=bsp_requests,
+            latencies=(_latency(0, 100, 100), _latency(1, 175, 25)),
+            activations=bsp_activations,
+            underflows=(),
+            stalls=(_stall(0, 0, 0, 100, reason="synchronous_inference"),),
+            steps=2,
+            episode_duration_ns=200,
+            execution_mode="bsp_spline_async",
+            eval_seed=_EVAL_SEED,
+            identity=_IDENTITY,
+            expected_bsp_prefetch_budget_ns=50,
+        ),
+    )
+
+    sync_requests = (
+        _initial_request(),
+        _request(
+            1,
+            150,
+            observation_control_step=1,
+            dispatch="blocking_replan",
+            trigger="baseline_chunk_exhausted",
+            scheduler_context={},
+        ),
+    )
+    sync_latencies = (_latency(0, 100, 100), _latency(1, 200, 50))
+    sync_activations = (
+        _native_activation(0, 0, 0, 100, activation="initial"),
+        _native_activation(1, 1, 2, 200, activation="blocking_replace"),
+    )
+    sync_stalls = (
+        _stall(0, 0, 0, 100, reason="synchronous_inference"),
+        _stall(1, 1, 175, 25, reason="synchronous_inference"),
+    )
+    _assert_raises(
+        ValueError,
+        lambda: timing.validate_timing_events_v4(
+            requests=sync_requests,
+            latencies=sync_latencies,
+            activations=sync_activations,
+            underflows=(),
+            stalls=sync_stalls,
+            steps=2,
+            episode_duration_ns=200,
+            execution_mode="baseline_sync_n5",
+            eval_seed=_EVAL_SEED,
+            identity=_IDENTITY,
+        ),
+    )
+
+    failed_request = dataclasses.replace(sync_requests[1], disposition="failed")
+    failed_latency = _latency(1, 200, 50, outcome="policy_failure")
+    _assert_raises(
+        ValueError,
+        lambda: timing.validate_timing_events_v4(
+            requests=(sync_requests[0], failed_request),
+            latencies=(sync_latencies[0], failed_latency),
+            activations=(sync_activations[0],),
+            underflows=(),
+            stalls=(sync_stalls[0], dataclasses.replace(sync_stalls[1], control_step=2)),
+            steps=2,
+            episode_duration_ns=200,
+            execution_mode="baseline_sync_n5",
+            eval_seed=_EVAL_SEED,
+            identity=_IDENTITY,
+        ),
+    )
+
+    wrong_initial_step = dataclasses.replace(sync_stalls[0], control_step=1)
+    _assert_raises(
+        ValueError,
+        lambda: timing.validate_timing_events_v4(
+            requests=(sync_requests[0],),
+            latencies=(sync_latencies[0],),
+            activations=(sync_activations[0],),
+            underflows=(),
+            stalls=(wrong_initial_step,),
+            steps=1,
+            episode_duration_ns=100,
+            execution_mode="baseline_sync_n5",
+            eval_seed=_EVAL_SEED,
+            identity=_IDENTITY,
+        ),
+    )
+
+
+def test_zero_duration_events_touch_at_endpoints_and_accept_control_step_equal_to_steps():
+    requests = (
+        _initial_request(),
+        _request(1, 0, observation_control_step=1),
+    )
+    latencies = (_latency(0, 0, 0), _latency(1, 0, 0))
+    activations = (
+        _native_activation(0, 0, 0, 0, activation="initial"),
+        _native_activation(1, 1, 1, 0, activation="immediate_swap"),
+    )
+    underflows = (timing.ActionUnderflowV4(1, 1, 0, 0),)
+    stalls = (
+        _stall(0, 0, 0, 0, reason="synchronous_inference"),
+        _stall(1, 1, 0, 0, reason="async_action_underflow"),
+    )
+
+    assert timing.validate_timing_events_v4(
+        requests=requests,
+        latencies=latencies,
+        activations=activations,
+        underflows=underflows,
+        stalls=stalls,
+        steps=1,
+        episode_duration_ns=0,
+        execution_mode="baseline_rtc",
+        eval_seed=_EVAL_SEED,
+        identity=_IDENTITY,
+    ) == (requests, latencies, activations, underflows, stalls)
 
 
 def test_failed_and_abandoned_requests_have_exactly_the_allowed_relations():
@@ -377,7 +698,8 @@ def test_failed_and_abandoned_requests_have_exactly_the_allowed_relations():
         steps=0,
         episode_duration_ns=25,
         execution_mode="baseline_sync_n5",
-        expected_flow_seeds=(100,),
+        eval_seed=_EVAL_SEED,
+        identity=_IDENTITY,
     )
 
     abandoned_request = dataclasses.replace(
@@ -393,7 +715,8 @@ def test_failed_and_abandoned_requests_have_exactly_the_allowed_relations():
         steps=1,
         episode_duration_ns=200,
         execution_mode="baseline_rtc",
-        expected_flow_seeds=(100, 101),
+        eval_seed=_EVAL_SEED,
+        identity=_IDENTITY,
     )
 
 
@@ -413,6 +736,18 @@ def test_reason_alone_selects_overlay_and_mixed_stalls_quantize_cumulatively():
         "Control stalled: 0.01 s",
     )
     assert timing.quantize_stall_frames_v4(stalls) == (0, 1, 0)
+
+    audit = timing.build_video_timing_audit_v4(
+        control_frame_count=0,
+        requests=(),
+        latencies=(),
+        activations=(),
+        underflows=(timing.ActionUnderflowV4(1, 1, 20_000_000, 12_500_000),),
+        stalls=stalls,
+        include_stalls=True,
+    )
+    assert audit.included_stall_frame_counts == (0, 1, 0)
+    assert audit.stall_frame_count == 1
 
 
 def test_control_frames_are_held_twice_and_fifty_ms_underflow_adds_two_frames():
@@ -544,7 +879,21 @@ def test_video_audit_from_dict_defensively_copies_included_lists():
     impossible_underflow_total = dict(payload, total_underflow_ns=50_000_001)
     wrong_underflow_reason_count = deepcopy(payload)
     wrong_underflow_reason_count["included_stall_reasons"] = ["synchronous_inference"]
-    for malformed in (impossible_underflow_total, wrong_underflow_reason_count):
+    coherent_quantization_tamper = deepcopy(payload)
+    coherent_quantization_tamper.update(
+        {
+            "included_stall_frame_counts": [3],
+            "stall_frame_count": 3,
+            "video_frame_count": 5,
+            "video_duration_ns": 125_000_000,
+            "duration_deviation_ns": 25_000_000,
+        }
+    )
+    for malformed in (
+        impossible_underflow_total,
+        wrong_underflow_reason_count,
+        coherent_quantization_tamper,
+    ):
         _assert_raises(ValueError, lambda malformed=malformed: timing.VideoTimingAuditV4.from_dict(malformed))
 
     restored = timing.VideoTimingAuditV4.from_dict(payload)

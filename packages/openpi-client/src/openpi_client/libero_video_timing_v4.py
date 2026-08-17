@@ -470,28 +470,15 @@ def _records_tuple(
     return records
 
 
-def _expected_seeds(
+def _stable_flow_seeds(
     requests: Sequence[RequestEventV4],
     *,
-    expected_flow_seeds: Optional[Sequence[int]],
-    eval_seed: Optional[int],
+    eval_seed: int,
     identity: Any,
 ) -> Tuple[int, ...]:
-    if expected_flow_seeds is not None:
-        if isinstance(expected_flow_seeds, (str, bytes)) or not isinstance(
-            expected_flow_seeds, Sequence
-        ):
-            raise ValueError("expected_flow_seeds must be a sequence")
-        seeds = tuple(
-            _require_integer(seed, name="expected flow seed", minimum=0, maximum=2**32 - 1)
-            for seed in expected_flow_seeds
-        )
-        if len(seeds) != len(requests):
-            raise ValueError("expected_flow_seeds length must equal request count")
-        return seeds
-    if eval_seed is None or identity is None:
-        raise ValueError("eval_seed and identity, or expected_flow_seeds, are required")
     _require_nonnegative_integer(eval_seed, name="eval_seed")
+    if identity is None:
+        raise ValueError("identity is required for stable flow-seed derivation")
     try:
         from openpi_client.libero_eval import stable_replan_seed
 
@@ -512,9 +499,8 @@ def validate_timing_events_v4(
     steps: int,
     episode_duration_ns: int,
     execution_mode: str,
-    expected_flow_seeds: Optional[Sequence[int]] = None,
-    eval_seed: Optional[int] = None,
-    identity: Any = None,
+    eval_seed: int,
+    identity: Any,
     expected_bsp_prefetch_budget_ns: Optional[int] = None,
 ) -> Tuple[
     Tuple[RequestEventV4, ...],
@@ -544,9 +530,8 @@ def validate_timing_events_v4(
     if not request_records:
         raise ValueError("timing event graph must contain an initial request")
 
-    seeds = _expected_seeds(
+    seeds = _stable_flow_seeds(
         request_records,
-        expected_flow_seeds=expected_flow_seeds,
         eval_seed=eval_seed,
         identity=identity,
     )
@@ -556,6 +541,17 @@ def validate_timing_events_v4(
         "bsp_spline_sync": ("blocking_replan", "bsp_curve_exhausted"),
         "bsp_spline_async": ("background", "bsp_prefetch"),
     }[execution_mode]
+    if execution_mode == "bsp_spline_async":
+        if expected_bsp_prefetch_budget_ns is None:
+            raise ValueError("bsp_spline_async requires its calibrated prefetch budget")
+        calibrated_bsp_budget = _require_nonnegative_integer(
+            expected_bsp_prefetch_budget_ns,
+            name="expected_bsp_prefetch_budget_ns",
+        )
+    else:
+        if expected_bsp_prefetch_budget_ns is not None:
+            raise ValueError("only bsp_spline_async accepts a prefetch budget")
+        calibrated_bsp_budget = None
     observed_bsp_budgets = set()
     previous_submission = -1
     previous_observation_step = -1
@@ -584,19 +580,12 @@ def validate_timing_events_v4(
         if request.trigger == "bsp_prefetch":
             budget = request.scheduler_context["budget_ns"]
             observed_bsp_budgets.add(budget)
-            if (
-                expected_bsp_prefetch_budget_ns is not None
-                and budget != expected_bsp_prefetch_budget_ns
-            ):
+            if budget != calibrated_bsp_budget:
                 raise ValueError("BSP prefetch budget does not match calibrated budget")
         previous_submission = request.submitted_offset_ns
         previous_observation_step = request.observation_control_step
     if len(observed_bsp_budgets) > 1:
         raise ValueError("all BSP prefetch requests must record one calibrated budget")
-    if expected_bsp_prefetch_budget_ns is not None:
-        _require_nonnegative_integer(
-            expected_bsp_prefetch_budget_ns, name="expected_bsp_prefetch_budget_ns"
-        )
 
     requests_by_id = {request.request_id: request for request in request_records}
     latencies_by_id: Dict[int, LatencyEventV4] = {}
@@ -655,6 +644,8 @@ def validate_timing_events_v4(
         if activation.activated_offset_ns > duration:
             raise ValueError("activation is past episode_duration_ns")
         request = requests_by_id[activation.request_id]
+        if activation.control_step < request.observation_control_step:
+            raise ValueError("activation control_step cannot precede its observation step")
         latency = latencies_by_id.get(activation.request_id)
         if latency is None or latency.outcome != "success":
             raise ValueError("only a successful request may activate a plan")
@@ -700,6 +691,15 @@ def validate_timing_events_v4(
         or first_activation.activation != "initial"
     ):
         raise ValueError("successful first request must install initial plan zero at step zero")
+    for request_index in range(1, len(request_records)):
+        previous_request = request_records[request_index - 1]
+        previous_activation = activations_by_request.get(previous_request.request_id)
+        if (
+            previous_activation is not None
+            and request_records[request_index].submitted_offset_ns
+            < previous_activation.activated_offset_ns
+        ):
+            raise ValueError("a request cannot be submitted before the prior plan activates")
 
     underflows_by_request: Dict[int, ActionUnderflowV4] = {}
     previous_underflow_end = -1
@@ -770,6 +770,14 @@ def validate_timing_events_v4(
                 or stall_end > latency.completed_offset_ns
             ):
                 raise ValueError("synchronous stall must lie within its request interval")
+            activation = activations_by_request.get(stall.request_id)
+            expected_stall_step = (
+                activation.control_step
+                if activation is not None
+                else request.observation_control_step
+            )
+            if stall.control_step != expected_stall_step:
+                raise ValueError("blocking stall control_step must match its request activation")
             full_interval_required = (
                 request.dispatch == "blocking_initial"
                 or request.trigger == "bsp_curve_exhausted"
@@ -991,6 +999,11 @@ class VideoTimingAuditV4:
             raise ValueError("included async stall reasons must match underflow_count")
         if self.stall_frame_count != sum(self.included_stall_frame_counts):
             raise ValueError("stall_frame_count must equal included per-stall frames")
+        cumulative_stall_frame_count = (
+            self.included_control_stall_ns * self.video_fps // NANOSECONDS_PER_SECOND
+        )
+        if self.stall_frame_count != cumulative_stall_frame_count:
+            raise ValueError("stall_frame_count must equal cumulative stall quantization")
         if self.video_frame_count != self.held_frame_count + self.stall_frame_count:
             raise ValueError("video_frame_count must equal held plus stall frames")
         expected_control_duration = (
