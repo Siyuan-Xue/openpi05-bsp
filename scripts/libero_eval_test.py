@@ -313,6 +313,20 @@ def test_first_request_policy_failure_keeps_current_frame_without_counting_a_ste
     assert environment.actions == []
     assert result.replay_frames == ()
     assert result.stall_source_frames == ((0, "current-request-frame"),)
+    record = libero_eval.EpisodeRecord.from_attempt(
+        _identity(), 42, 1, success=False, failure_kind="policy", result=result
+    )
+    video_frames = libero_main._build_video_frames(
+        record.replay_frames,
+        record.control_stalls,
+        stall_source_frames=record.stall_source_frames,
+        control_hz=20,
+        video_fps=40,
+        inference_schedule="synchronous",
+        overlay_renderer=lambda frame, lines: "first-failure-overlay",
+    )
+    assert video_frames == ("first-failure-overlay", "first-failure-overlay")
+    assert "stall_source_frames" not in record.to_dict()
 
 
 def test_later_replan_policy_failure_uses_latest_observation_without_extra_action(monkeypatch):
@@ -342,6 +356,22 @@ def test_later_replan_policy_failure_uses_latest_observation_without_extra_actio
     assert result.replans == 1
     assert result.replay_frames[-1] == "frame-observation-7"
     assert result.stall_source_frames == ((8, "frame-observation-8"),)
+    record = libero_eval.EpisodeRecord.from_attempt(
+        _identity(), 42, 1, success=False, failure_kind="policy", result=result
+    )
+    video_frames = libero_main._build_video_frames(
+        record.replay_frames,
+        record.control_stalls,
+        stall_source_frames=record.stall_source_frames,
+        control_hz=20,
+        video_fps=40,
+        inference_schedule="synchronous",
+        overlay_renderer=lambda frame, lines: "later-failure-overlay"
+        if frame == "frame-observation-8"
+        else pytest.fail("later failure used the wrong source frame"),
+    )
+    assert video_frames[-2:] == ("later-failure-overlay", "later-failure-overlay")
+    assert "stall_source_frames" not in record.to_dict()
 
 
 def test_synchronous_stall_overlay_uses_exact_current_mode_text():
@@ -633,7 +663,7 @@ def test_trailing_stall_uses_transient_request_frame_instead_of_last_control_fra
     ]
 
 
-def test_zero_step_policy_failure_encodes_only_quantized_wait_and_show_off_omits_cleanly(
+def test_zero_step_policy_failure_encodes_quantized_wait_or_single_raw_padding_frame(
     monkeypatch, tmp_path
 ):
     encoded = []
@@ -700,16 +730,22 @@ def test_zero_step_policy_failure_encodes_only_quantized_wait_and_show_off_omits
     assert enabled.steps == disabled.steps == record.steps == 0
     assert enabled.replans == disabled.replans == record.replans == 0
     assert enabled.success == disabled.success == record.success is False
-    assert encoded == [("wait-overlay", "wait-overlay")]
+    assert encoded == [
+        ("wait-overlay", "wait-overlay"),
+        ("current-request-frame",),
+    ]
     assert audits[0].encoded_frame_count == 2
-    assert audits[1].artifact_status == "omitted_empty_timeline"
-    assert audits[1].encoded_frame_count == 0
+    assert audits[0].artifact_padding_frame_count == 0
+    assert audits[1].artifact_padding_frame_count == 1
+    assert audits[1].expected_encoded_frame_count == 1
+    assert audits[1].encoded_frame_count == 1
 
 
-def test_zero_quantized_first_wait_is_omitted_without_fabricating_a_control_frame(
+def test_zero_quantized_first_wait_encodes_overlay_padding_without_fabricating_control_step(
     monkeypatch, tmp_path
 ):
     audits = []
+    encoded = []
 
     class Writer:
         def append_episode(self, record):
@@ -724,6 +760,19 @@ def test_zero_quantized_first_wait_is_omitted_without_fabricating_a_control_fram
     class Selector:
         def claim(self, record):
             return tmp_path / "failure.mp4"
+
+    class Reader:
+        def get_meta_data(self):
+            return {"fps": 40.0, "duration": 0.025}
+
+        def count_frames(self):
+            return 1
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(libero_main.imageio, "get_reader", lambda path: Reader())
+    monkeypatch.setattr(libero_main, "_draw_video_overlay", lambda frame, lines: "wait-overlay")
 
     result = libero_eval.AttemptResult(
         success=False,
@@ -743,13 +792,15 @@ def test_zero_quantized_first_wait_is_omitted_without_fabricating_a_control_fram
         Writer(),
         Selector(),
         video_show_inference_waits=True,
-        video_encoder=lambda *args, **kwargs: pytest.fail("empty timeline was encoded"),
+        video_encoder=lambda path, frames, *, fps: encoded.append(tuple(frames)),
     )
 
     assert artifact_error is None
-    assert audits[0].artifact_status == "omitted_empty_timeline"
     assert audits[0].control_frame_count == 0
     assert audits[0].video_frame_count == 0
+    assert audits[0].artifact_padding_frame_count == 1
+    assert audits[0].encoded_frame_count == 1
+    assert encoded == [("wait-overlay",)]
 
 
 def test_wait_display_off_ignores_transient_trailing_source_and_keeps_control_video(
@@ -812,6 +863,133 @@ def test_wait_display_off_ignores_transient_trailing_source_and_keeps_control_vi
 
     assert artifact_error is None
     assert encoded == [("control-frame", "control-frame")]
+
+
+def test_real_selector_keeps_first_zero_step_failure_mp4_and_summary_complete(
+    monkeypatch, tmp_path
+):
+    writer = libero_eval.ArtifactWriter(tmp_path / "run")
+    selector = libero_eval.VideoSelector(tmp_path / "run" / "videos")
+    encoded_paths = []
+
+    class Reader:
+        def get_meta_data(self):
+            return {"fps": 40.0, "duration": 0.025}
+
+        def count_frames(self):
+            return 1
+
+        def close(self):
+            pass
+
+    def encoder(path, frames, *, fps):
+        assert tuple(frames) == ("first-request-frame",)
+        path.write_bytes(b"real-selector-test-mp4")
+        encoded_paths.append(path)
+
+    monkeypatch.setattr(libero_main.imageio, "get_reader", lambda path: Reader())
+    records = []
+    errors = []
+    for init_index, frame in ((2, "first-request-frame"), (3, "later-failure-frame")):
+        identity = dataclasses.replace(_identity(), init_state_index=init_index)
+        result = libero_eval.AttemptResult(
+            success=False,
+            steps=0,
+            replans=0,
+            failure_kind="policy",
+            error="missing actions",
+            inference_requests=(timing.InferenceRequest(0, 0, 1),),
+            control_stalls=(timing.ControlStall(0, 0, 0, 1),),
+            stall_source_frames=((0, frame),),
+        )
+        record = libero_eval.EpisodeRecord.from_attempt(
+            identity, 42, 1, success=False, failure_kind="policy", result=result
+        )
+        persisted, artifact_error = libero_main._persist_episode_artifacts(
+            record,
+            writer,
+            selector,
+            video_show_inference_waits=False,
+            video_encoder=encoder,
+        )
+        records.append(persisted)
+        if artifact_error is not None:
+            errors.append(artifact_error)
+
+    summary = libero_eval.aggregate_records(records, artifact_errors=errors)
+    episode_lines = (tmp_path / "run" / "episodes.jsonl").read_text(encoding="utf-8").splitlines()
+    audit_lines = (tmp_path / "run" / "video_audit.jsonl").read_text(encoding="utf-8").splitlines()
+    video_files = tuple((tmp_path / "run" / "videos").rglob("*.mp4"))
+
+    assert len(episode_lines) == 2
+    assert len(audit_lines) == 1
+    assert len(encoded_paths) == len(video_files) == 1
+    assert video_files[0].is_file()
+    assert summary["eligible_episodes"] == 2
+    assert summary["successes"] == 0
+    assert summary["artifact_error_count"] == 0
+    assert summary["acceptance_complete"] is True
+
+
+def test_selected_zero_step_failure_without_request_frame_is_an_artifact_error(tmp_path):
+    errors = []
+
+    class Writer:
+        def append_episode(self, record):
+            pass
+
+        def append_artifact_error(self, error):
+            errors.append(error)
+
+    record = libero_eval.EpisodeRecord.from_attempt(
+        _identity(),
+        42,
+        1,
+        success=False,
+        failure_kind="policy",
+        result=libero_eval.AttemptResult(
+            success=False,
+            steps=0,
+            replans=0,
+            failure_kind="policy",
+            error="missing actions",
+        ),
+    )
+
+    _, artifact_error = libero_main._persist_episode_artifacts(
+        record,
+        Writer(),
+        libero_eval.VideoSelector(tmp_path / "videos"),
+        video_show_inference_waits=False,
+        video_encoder=lambda *args, **kwargs: pytest.fail("missing source reached encoder"),
+    )
+
+    assert artifact_error is not None
+    assert "request-time video source" in artifact_error.error
+    assert errors == [artifact_error]
+
+
+def test_discarded_infrastructure_attempt_cannot_leak_transient_frames_into_retry_record():
+    discarded = libero_eval.AttemptResult(
+        success=False,
+        steps=0,
+        replans=0,
+        failure_kind="policy",
+        stall_source_frames=((0, "discarded-frame"),),
+    )
+
+    def attempt(attempt_number):
+        if attempt_number == 1:
+            assert discarded.stall_source_frames == ((0, "discarded-frame"),)
+            raise libero_eval.InfrastructureFailure("network", "retry this attempt")
+        return libero_eval.AttemptResult(success=True, steps=1, replans=1)
+
+    record = libero_eval.run_episode_with_retries(_identity(), attempt, eval_seed=42)
+
+    assert record.success
+    assert record.attempts == 2
+    assert record.stall_source_frames == ()
+    assert "stall_source_frames" not in record.to_dict()
 
 
 def test_async_latency_without_underflow_adds_no_frames_but_partial_stall_uses_async_label():

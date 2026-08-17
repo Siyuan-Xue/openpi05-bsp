@@ -103,6 +103,36 @@ def test_video_artifact_audit_uses_ceiling_for_exact_60_fps_frame_tolerance():
     assert beyond_boundary.warning is not None
 
 
+def test_video_artifact_audit_records_real_one_frame_container_padding():
+    planned = timing.build_video_audit(
+        control_frame_count=0,
+        requests=(timing.InferenceRequest(0, 0, 1),),
+        stalls=(timing.ControlStall(0, 0, 0, 1),),
+    )
+
+    audit = libero_eval.build_video_artifact_audit(
+        episode_id="zero-step-failure",
+        path="videos/zero-step-failure.mp4",
+        planned=planned,
+        measured_stalls=(timing.ControlStall(0, 0, 0, 1),),
+        included_stalls=(timing.ControlStall(0, 0, 0, 1),),
+        video_show_inference_waits=True,
+        inference_schedule="synchronous",
+        artifact_padding_frame_count=1,
+        encoded_fps=40.0,
+        encoded_frame_count=1,
+        encoded_duration_s=0.025,
+    )
+
+    assert audit.planned.control_frame_count == 0
+    assert audit.planned.video_frame_count == 0
+    assert audit.artifact_padding_frame_count == 1
+    assert audit.expected_encoded_frame_count == 1
+    assert audit.encoded_frame_count == 1
+    assert audit.expected_duration_ns == 1
+    assert audit.timing_gate_pass
+
+
 def test_episode_record_preserves_sparse_request_and_stall_events():
     request = timing.InferenceRequest(0, started_offset_ns=10, duration_ns=25_000_000)
     stall = timing.ControlStall(0, 0, started_offset_ns=10, duration_ns=25_000_000)
@@ -228,6 +258,9 @@ def test_manifest_producer_rejects_numeric_impostors_and_noncanonical_containers
             }
         },
         {"bsp_parameters": dict(libero_eval.BSP_PARAMETERS, degree=3.0)},
+        {"config_name": 123},
+        {"checkpoint": 10000},
+        {"norm_hash": ["b"] * 64},
     )
 
     for overrides in invalid_overrides:
@@ -237,6 +270,67 @@ def test_manifest_producer_rejects_numeric_impostors_and_noncanonical_containers
             pass
         else:
             raise AssertionError(overrides)
+
+
+def test_bsp_manifest_producer_rejects_nonstring_cache_hashes():
+    common = {
+        "config_name": "pi05_libero_bsp_h16",
+        "checkpoint": "checkpoint/bsp/10000",
+        "policy_variant": "bsp",
+        "policy_protocol": "bsp_decoded_h8",
+        "expected_action_horizon": 8,
+    }
+    for overrides in (
+        {
+            "bsp_cache_hash": ["c"] * 64,
+            "bsp_cache_manifest_fingerprint": "d" * 64,
+        },
+        {
+            "bsp_cache_hash": "c" * 64,
+            "bsp_cache_manifest_fingerprint": tuple("d" * 64),
+        },
+    ):
+        try:
+            _formal_manifest(**dict(common, **overrides))
+        except (TypeError, ValueError):
+            pass
+        else:
+            raise AssertionError(overrides)
+
+
+def test_manifest_to_dict_revalidates_caller_owned_mutable_containers():
+    cases = []
+
+    parameters = dict(libero_eval.BSP_PARAMETERS)
+    cases.append((_formal_manifest(bsp_parameters=parameters), lambda: parameters.update(degree=3.0)))
+
+    suites = list(libero_eval.SUPPORTED_SUITES)
+    cases.append((_formal_manifest(suites=suites), suites.reverse))
+
+    task_ids = list(range(10))
+    cases.append((_formal_manifest(task_ids=task_ids), lambda: task_ids.__setitem__(0, True)))
+
+    max_steps = {
+        "libero_spatial": 220,
+        "libero_object": 280,
+        "libero_goal": 300,
+        "libero_10": 520,
+    }
+    cases.append(
+        (
+            _formal_manifest(max_steps_by_suite=max_steps),
+            lambda: max_steps.update(libero_spatial=220.0),
+        )
+    )
+
+    for manifest, mutate in cases:
+        mutate()
+        try:
+            manifest.to_dict()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("mutated caller-owned container bypassed schema-v3 validation")
 
 
 def test_video_artifact_audit_warns_but_does_not_error_on_duration_only_mismatch():

@@ -572,7 +572,7 @@ class EvaluationManifest:
     def __post_init__(self) -> None:
         if self.policy_variant not in {"baseline", "bsp"}:
             raise ValueError("Policy variant must be baseline or bsp")
-        required = {
+        required_text = {
             "code_sha": self.code_sha,
             "dataset_revision": self.dataset_revision,
             "config_name": self.config_name,
@@ -580,9 +580,13 @@ class EvaluationManifest:
             "checkpoint": self.checkpoint,
             "container_digest": self.container_digest,
         }
-        missing = sorted(key for key, value in required.items() if not value)
+        missing = sorted(
+            key
+            for key, value in required_text.items()
+            if not isinstance(value, str) or not value
+        )
         if missing:
-            raise ValueError(f"Evaluation manifest is missing required identities: {missing}")
+            raise ValueError(f"Evaluation manifest has missing or non-string identities: {missing}")
         if not isinstance(self.code_sha, str) or re.fullmatch(
             r"(?:[0-9a-f]{40}|[0-9a-f]{64})", self.code_sha
         ) is None:
@@ -610,7 +614,9 @@ class EvaluationManifest:
         _require_exact_integer(self.checkpoint_step, name="Evaluation checkpoint_step")
         _require_exact_integer(self.train_seed, name="Evaluation train_seed")
         _require_exact_integer(self.eval_seed, name="Evaluation eval_seed")
-        if len(self.norm_hash) != 64 or any(character not in "0123456789abcdef" for character in self.norm_hash):
+        if not isinstance(self.norm_hash, str) or len(self.norm_hash) != 64 or any(
+            character not in "0123456789abcdef" for character in self.norm_hash
+        ):
             raise ValueError("norm_hash must be the lowercase SHA256 of norm_stats.json")
         cache_identities_present = (self.bsp_cache_hash is not None, self.bsp_cache_manifest_fingerprint is not None)
         if self.policy_variant == "bsp" and cache_identities_present != (True, True):
@@ -618,12 +624,14 @@ class EvaluationManifest:
         if self.policy_variant == "baseline" and cache_identities_present != (False, False):
             raise ValueError("Baseline evaluation must record null BSP cache identities")
         if self.bsp_cache_hash is not None and (
-            len(self.bsp_cache_hash) != 64
+            not isinstance(self.bsp_cache_hash, str)
+            or len(self.bsp_cache_hash) != 64
             or any(character not in "0123456789abcdef" for character in self.bsp_cache_hash)
         ):
             raise ValueError("bsp_cache_hash must be the lowercase SHA256 of the actual sidecar NPZ")
         if self.bsp_cache_manifest_fingerprint is not None and (
-            len(self.bsp_cache_manifest_fingerprint) != 64
+            not isinstance(self.bsp_cache_manifest_fingerprint, str)
+            or len(self.bsp_cache_manifest_fingerprint) != 64
             or any(
                 character not in "0123456789abcdef"
                 for character in self.bsp_cache_manifest_fingerprint
@@ -693,6 +701,9 @@ class EvaluationManifest:
             raise ValueError("LIBERO evaluation protocol requires exactly two infrastructure retries")
 
     def to_dict(self) -> dict[str, Any]:
+        # frozen=True prevents attribute assignment, not mutation of caller-owned
+        # list/dict values. Revalidate immediately before schema-v3 serialization.
+        self.__post_init__()
         payload = dataclasses.asdict(self)
         payload["suites"] = list(self.suites)
         payload["task_ids"] = list(self.task_ids)
@@ -761,17 +772,21 @@ class VideoArtifactAudit:
     encoded_duration_deviation_ns: int
     timing_tolerance_ns: int
     timing_gate_pass: bool
-    artifact_status: str = "encoded"
-    omission_reason: str | None = None
+    artifact_padding_frame_count: int = 0
     warning: str | None = None
 
     def __post_init__(self) -> None:
-        if self.artifact_status not in {"encoded", "omitted_empty_timeline"}:
-            raise ValueError("Unsupported video artifact status")
-        if self.artifact_status == "encoded" and self.omission_reason is not None:
-            raise ValueError("Encoded video audit cannot have an omission reason")
-        if self.artifact_status == "omitted_empty_timeline" and not self.omission_reason:
-            raise ValueError("Omitted video audit requires an omission reason")
+        _require_exact_integer(
+            self.artifact_padding_frame_count,
+            name="video artifact_padding_frame_count",
+        )
+        if self.artifact_padding_frame_count not in {0, 1}:
+            raise ValueError("Video artifact padding must contain at most one frame")
+        if self.planned.video_frame_count == 0:
+            if self.artifact_padding_frame_count != 1:
+                raise ValueError("An empty planned timeline requires one encoded padding frame")
+        elif self.artifact_padding_frame_count:
+            raise ValueError("Non-empty planned timelines cannot add artifact padding")
 
     @property
     def included_stall_count(self) -> int:
@@ -784,6 +799,10 @@ class VideoArtifactAudit:
     @property
     def expected_duration_ns(self) -> int:
         return self.planned.expected_duration_ns
+
+    @property
+    def expected_encoded_frame_count(self) -> int:
+        return self.planned.video_frame_count + self.artifact_padding_frame_count
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -800,8 +819,8 @@ class VideoArtifactAudit:
             "encoded_duration_deviation_ns": self.encoded_duration_deviation_ns,
             "timing_tolerance_ns": self.timing_tolerance_ns,
             "timing_gate_pass": self.timing_gate_pass,
-            "artifact_status": self.artifact_status,
-            "omission_reason": self.omission_reason,
+            "artifact_padding_frame_count": self.artifact_padding_frame_count,
+            "expected_encoded_frame_count": self.expected_encoded_frame_count,
             "warning": self.warning,
         }
 
@@ -815,6 +834,7 @@ def build_video_artifact_audit(
     included_stalls: Sequence[_video_timing.ControlStall],
     video_show_inference_waits: bool,
     inference_schedule: str,
+    artifact_padding_frame_count: int = 0,
     encoded_fps: float,
     encoded_frame_count: int,
     encoded_duration_s: float,
@@ -853,16 +873,28 @@ def build_video_artifact_audit(
         raise ValueError(
             f"Encoded FPS {encoded_fps} does not match requested video FPS {planned.video_fps}"
         )
+    _require_exact_integer(
+        artifact_padding_frame_count,
+        name="video artifact_padding_frame_count",
+    )
+    if artifact_padding_frame_count not in {0, 1}:
+        raise ValueError("Video artifact padding must contain at most one frame")
+    if planned.video_frame_count == 0:
+        if artifact_padding_frame_count != 1:
+            raise ValueError("An empty planned timeline requires one encoded padding frame")
+    elif artifact_padding_frame_count:
+        raise ValueError("Non-empty planned timelines cannot add artifact padding")
     if (
         isinstance(encoded_frame_count, bool)
         or not isinstance(encoded_frame_count, int)
         or encoded_frame_count < 0
     ):
         raise ValueError("Encoded frame count must be a non-negative integer")
-    if encoded_frame_count != planned.video_frame_count:
+    expected_encoded_frame_count = planned.video_frame_count + artifact_padding_frame_count
+    if encoded_frame_count != expected_encoded_frame_count:
         raise ValueError(
             f"Encoded frame count {encoded_frame_count} does not match planned frame count "
-            f"{planned.video_frame_count}"
+            f"{expected_encoded_frame_count}"
         )
     if (
         isinstance(encoded_duration_s, bool)
@@ -899,39 +931,8 @@ def build_video_artifact_audit(
         encoded_duration_deviation_ns=deviation_ns,
         timing_tolerance_ns=tolerance_ns,
         timing_gate_pass=timing_gate_pass,
+        artifact_padding_frame_count=artifact_padding_frame_count,
         warning=warning,
-    )
-
-
-def build_omitted_video_artifact_audit(
-    *,
-    episode_id: str,
-    path: str,
-    planned: _video_timing.VideoTimingAudit,
-    measured_stalls: Sequence[_video_timing.ControlStall],
-    included_stalls: Sequence[_video_timing.ControlStall],
-    video_show_inference_waits: bool,
-    inference_schedule: str,
-) -> VideoArtifactAudit:
-    """Audit a selected zero-frame timeline without fabricating a control step or MP4."""
-    if planned.video_frame_count != 0:
-        raise ValueError("Only an empty video timeline may be omitted")
-    encoded = build_video_artifact_audit(
-        episode_id=episode_id,
-        path=path,
-        planned=planned,
-        measured_stalls=measured_stalls,
-        included_stalls=included_stalls,
-        video_show_inference_waits=video_show_inference_waits,
-        inference_schedule=inference_schedule,
-        encoded_fps=float(planned.video_fps),
-        encoded_frame_count=0,
-        encoded_duration_s=0.0,
-    )
-    return dataclasses.replace(
-        encoded,
-        artifact_status="omitted_empty_timeline",
-        omission_reason="selected rollout has no quantized control or stall frames",
     )
 
 

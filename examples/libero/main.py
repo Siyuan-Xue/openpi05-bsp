@@ -591,23 +591,6 @@ def _persist_episode_artifacts(
             control_hz=control_hz,
             video_fps=video_fps,
         )
-        if planned_audit.video_frame_count == 0:
-            video_audit = _eval.build_omitted_video_artifact_audit(
-                episode_id=persisted_record.identity.episode_id,
-                path=str(video_path),
-                planned=planned_audit,
-                measured_stalls=persisted_record.control_stalls,
-                included_stalls=included_stalls,
-                video_show_inference_waits=video_show_inference_waits,
-                inference_schedule=inference_schedule,
-            )
-            writer.append_video_audit(video_audit)
-            logging.warning(
-                "Video omitted for %s: %s",
-                persisted_record.identity.episode_id,
-                video_audit.omission_reason,
-            )
-            return persisted_record, None
         video_frames = _build_video_frames(
             replay_frames,
             included_stalls,
@@ -616,7 +599,30 @@ def _persist_episode_artifacts(
             video_fps=video_fps,
             inference_schedule=inference_schedule,
         )
-        if len(video_frames) != planned_audit.video_frame_count:
+        artifact_padding_frame_count = 0
+        if not video_frames:
+            if planned_audit.video_frame_count != 0:
+                raise ValueError("Non-empty planned video timeline expanded to zero frames")
+            source_by_step = dict(stall_source_frames)
+            source_frame = source_by_step.get(0)
+            if source_frame is None:
+                raise ValueError("Zero-step selected failure has no request-time video source")
+            if video_show_inference_waits and included_stalls:
+                stall = included_stalls[0]
+                source_frame = _video_timing.render_overlay(
+                    source_frame,
+                    _video_timing.stall_overlay_lines(
+                        stall,
+                        inference_schedule=inference_schedule,
+                    ),
+                    renderer=_draw_video_overlay,
+                )
+            video_frames = (source_frame,)
+            artifact_padding_frame_count = 1
+        expected_encoded_frame_count = (
+            planned_audit.video_frame_count + artifact_padding_frame_count
+        )
+        if len(video_frames) != expected_encoded_frame_count:
             raise ValueError("Expanded video frame count does not match planned audit")
         encoder(
             video_path,
@@ -632,6 +638,7 @@ def _persist_episode_artifacts(
             included_stalls=included_stalls,
             video_show_inference_waits=video_show_inference_waits,
             inference_schedule=inference_schedule,
+            artifact_padding_frame_count=artifact_padding_frame_count,
             encoded_fps=encoded_fps,
             encoded_frame_count=encoded_frame_count,
             encoded_duration_s=encoded_duration_s,
