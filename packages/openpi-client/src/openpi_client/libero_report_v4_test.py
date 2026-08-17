@@ -9,6 +9,7 @@ import shutil
 from typing import Any
 from typing import Dict
 from typing import Mapping
+from typing import Optional
 from typing import Sequence
 
 import pytest
@@ -32,7 +33,10 @@ def _sha(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _checkpoint_identity(mode: str, step: int) -> libero_control_v4.CheckpointIdentityV1:
+def _checkpoint_identity(
+    mode: str,
+    step: int,
+) -> libero_control_v4.CheckpointIdentityV1:
     family = "baseline" if mode.startswith("baseline_") else "bsp"
     bsp_hash = _sha("bsp-cache") if family == "bsp" else None
     bsp_manifest = _sha("bsp-cache-manifest") if family == "bsp" else None
@@ -72,7 +76,9 @@ def _calibration(
         bootstrap_request_fingerprint=(
             _sha("bootstrap") if mode == "baseline_rtc" else None
         ),
-        warmup_request_fingerprints=[_sha("warmup-{}".format(index)) for index in range(5)],
+        warmup_request_fingerprints=[
+            _sha("warmup-{}".format(index)) for index in range(5)
+        ],
         measurement_request_fingerprints=[
             _sha("measurement-{}".format(index)) for index in range(20)
         ],
@@ -95,7 +101,9 @@ def _manifest(mode: str, step: int = 1000) -> Dict[str, Any]:
         "video_show_inference_waits": True,
         "execution_mode": mode,
         "execution_parameters": spec.to_parameters_dict(),
-        "latency_calibration": calibration.to_dict() if calibration is not None else None,
+        "latency_calibration": (
+            calibration.to_dict() if calibration is not None else None
+        ),
         "server_metadata_fingerprint": _sha("server-metadata"),
         "code_sha": checkpoint.code_sha,
         "dataset_revision": "v2.0",
@@ -143,7 +151,12 @@ def _identity(suite: str, task_id: int, init_state_index: int) -> Dict[str, Any]
     }
 
 
-def _flow_seed(suite: str, task_id: int, init_state_index: int, fingerprint: str) -> int:
+def _flow_seed(
+    suite: str,
+    task_id: int,
+    init_state_index: int,
+    fingerprint: str,
+) -> int:
     payload = json.dumps(
         {
             "namespace": "openpi-libero-flow-noise-v1",
@@ -157,10 +170,19 @@ def _flow_seed(suite: str, task_id: int, init_state_index: int, fingerprint: str
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    return int.from_bytes(hashlib.sha256(payload).digest()[:4], "big", signed=False)
+    return int.from_bytes(
+        hashlib.sha256(payload).digest()[:4],
+        "big",
+        signed=False,
+    )
 
 
-def _episode(mode: str, suite: str, task_id: int, init_state_index: int) -> Dict[str, Any]:
+def _episode(
+    mode: str,
+    suite: str,
+    task_id: int,
+    init_state_index: int,
+) -> Dict[str, Any]:
     identity = _identity(suite, task_id, init_state_index)
     request = {
         "clock": "episode_monotonic_ns",
@@ -312,7 +334,10 @@ def _summary() -> Dict[str, Any]:
 
 
 def _json_text(value: Mapping[str, Any]) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+    return (
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        + "\n"
+    )
 
 
 def _write_formal_run(root: Path, mode: str, step: int = 1000) -> Path:
@@ -323,7 +348,10 @@ def _write_formal_run(root: Path, mode: str, step: int = 1000) -> Path:
         for task_id in range(10)
         for init_state_index in range(50)
     ]
-    (root / "manifest.json").write_text(_json_text(_manifest(mode, step)), encoding="utf-8")
+    (root / "manifest.json").write_text(
+        _json_text(_manifest(mode, step)),
+        encoding="utf-8",
+    )
     (root / "episodes.jsonl").write_text(
         "".join(_json_text(episode) for episode in episodes),
         encoding="utf-8",
@@ -339,7 +367,10 @@ def _write_formal_run(root: Path, mode: str, step: int = 1000) -> Path:
 
 @pytest.fixture(scope="module")
 def formal_baseline_run(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    return _write_formal_run(tmp_path_factory.mktemp("v4-formal") / "baseline", "baseline_sync_n5")
+    return _write_formal_run(
+        tmp_path_factory.mktemp("v4-formal") / "baseline",
+        "baseline_sync_n5",
+    )
 
 
 def _copy_run(source: Path, tmp_path: Path) -> Path:
@@ -371,10 +402,21 @@ def test_load_run_v4_validates_formal_grid_and_hashes_all_five_artifacts(
         "artifact_errors.jsonl",
     }
     for name, digest in run.file_sha256.items():
-        assert digest == hashlib.sha256((formal_baseline_run / name).read_bytes()).hexdigest()
+        assert digest == hashlib.sha256(
+            (formal_baseline_run / name).read_bytes()
+        ).hexdigest()
 
 
-@pytest.mark.parametrize("name", ["manifest.json", "episodes.jsonl", "summary.json", "video_audit.jsonl", "artifact_errors.jsonl"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "manifest.json",
+        "episodes.jsonl",
+        "summary.json",
+        "video_audit.jsonl",
+        "artifact_errors.jsonl",
+    ],
+)
 def test_load_run_v4_rejects_each_missing_artifact(
     formal_baseline_run: Path,
     tmp_path: Path,
@@ -383,7 +425,10 @@ def test_load_run_v4_rejects_each_missing_artifact(
     run_dir = _copy_run(formal_baseline_run, tmp_path)
     (run_dir / name).unlink()
 
-    with pytest.raises(libero_report_v4.ComparisonErrorV4, match="missing required artifacts"):
+    with pytest.raises(
+        libero_report_v4.ComparisonErrorV4,
+        match="missing required artifacts",
+    ):
         libero_report_v4.load_run_v4(run_dir)
 
 
@@ -456,7 +501,10 @@ def test_load_run_v4_rejects_nonfinite_json_numbers(
     manifest["connection_timeout_s"] = float("nan")
     path.write_text(json.dumps(manifest, allow_nan=True), encoding="utf-8")
 
-    with pytest.raises(libero_report_v4.ComparisonErrorV4, match="non-standard numeric"):
+    with pytest.raises(
+        libero_report_v4.ComparisonErrorV4,
+        match="non-standard numeric",
+    ):
         libero_report_v4.load_run_v4(run_dir)
 
 
@@ -478,7 +526,10 @@ def test_load_run_v4_rejects_duplicate_formal_grid_cell(
     ("mutation", "message"),
     [
         (lambda value: value.__setitem__("episode_id", "unknown-episode"), "unknown"),
-        (lambda value: value["planned"].__setitem__("request_count", 2), "planned timing"),
+        (
+            lambda value: value["planned"].__setitem__("request_count", 2),
+            "planned timing",
+        ),
         (lambda value: value.__setitem__("encoded_fps", 39.0), "encoded_fps"),
         (lambda value: value.__setitem__("encoded_frame_count", 2), "frame count"),
     ],
@@ -551,7 +602,11 @@ def test_load_run_v4_rejects_infrastructure_incomplete_episode(
                 "inference_latencies": [],
                 "control_stalls": [],
                 "infrastructure_history": [
-                    {"attempt": index, "kind": "network", "error": "network unavailable"}
+                    {
+                        "attempt": index,
+                        "kind": "network",
+                        "error": "network unavailable",
+                    }
                     for index in (1, 2, 3)
                 ],
             }
@@ -559,7 +614,10 @@ def test_load_run_v4_rejects_infrastructure_incomplete_episode(
 
     _mutate_jsonl(run_dir / "episodes.jsonl", 0, make_incomplete)
 
-    with pytest.raises(libero_report_v4.ComparisonErrorV4, match="infrastructure-incomplete"):
+    with pytest.raises(
+        libero_report_v4.ComparisonErrorV4,
+        match="infrastructure-incomplete",
+    ):
         libero_report_v4.load_run_v4(run_dir)
 
 
@@ -591,8 +649,17 @@ def test_classify_checkpoint_accepts_two_distinct_family_paths() -> None:
     ("manifests", "message"),
     [
         ([_manifest(mode) for mode in _MODES[:-1]], "exactly four"),
-        ([_manifest(mode) for mode in _MODES] + [_manifest(_MODES[0])], "exactly four"),
-        ([_manifest(mode, 2000 if mode == "bsp_spline_async" else 1000) for mode in _MODES], "checkpoint_step"),
+        (
+            [_manifest(mode) for mode in _MODES] + [_manifest(_MODES[0])],
+            "exactly four",
+        ),
+        (
+            [
+                _manifest(mode, 2000 if mode == "bsp_spline_async" else 1000)
+                for mode in _MODES
+            ],
+            "checkpoint_step",
+        ),
     ],
 )
 def test_classify_checkpoint_rejects_wrong_mode_or_step_sets(
@@ -625,9 +692,15 @@ def test_classify_checkpoint_rejects_cross_pair_checkpoint_mismatch() -> None:
         bsp_cache_hash=None,
         bsp_cache_manifest_fingerprint=None,
     )
-    manifests[1]["latency_calibration"] = _calibration("baseline_rtc", checkpoint).to_dict()
+    manifests[1]["latency_calibration"] = _calibration(
+        "baseline_rtc",
+        checkpoint,
+    ).to_dict()
 
-    with pytest.raises(libero_report_v4.ComparisonErrorV4, match="baseline family identity"):
+    with pytest.raises(
+        libero_report_v4.ComparisonErrorV4,
+        match="baseline family identity",
+    ):
         libero_report_v4.classify_checkpoint_manifests_v4(manifests)
 
 
@@ -661,13 +734,18 @@ def test_classify_five_checkpoint_manifests_rejects_wrong_count(drop: bool) -> N
         libero_report_v4.classify_five_checkpoint_manifests_v4(manifests)
 
 
-def _run_data(mode: str, step: int = 1000) -> libero_report_v4.RunDataV4:
-    records = tuple(
-        _episode(mode, suite, task_id, init_state_index)
-        for suite in libero_eval_v4.SUPPORTED_SUITES
-        for task_id in range(10)
-        for init_state_index in range(50)
-    )
+def _run_data(
+    mode: str,
+    step: int = 1000,
+    records: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> libero_report_v4.RunDataV4:
+    if records is None:
+        records = tuple(
+            _episode(mode, suite, task_id, init_state_index)
+            for suite in libero_eval_v4.SUPPORTED_SUITES
+            for task_id in range(10)
+            for init_state_index in range(50)
+        )
     return libero_report_v4.RunDataV4(
         path=Path("/runs/{}/{}".format(mode, step)),
         manifest=_manifest(mode, step),
@@ -696,8 +774,16 @@ def test_compare_checkpoint_emits_four_rates_and_only_two_primary_deltas(
         "baseline_rtc_minus_baseline_sync_n5",
         "bsp_spline_async_minus_bsp_spline_sync",
     }
-    assert comparison["diagnostics"]["baseline_sync_n5"]["calibration_p95_latency_ns"] is None
-    assert comparison["diagnostics"]["baseline_rtc"]["calibration_p95_latency_ns"] == 1018
+    assert (
+        comparison["diagnostics"]["baseline_sync_n5"][
+            "calibration_p95_latency_ns"
+        ]
+        is None
+    )
+    assert (
+        comparison["diagnostics"]["baseline_rtc"]["calibration_p95_latency_ns"]
+        == 1018
+    )
     assert "inference_ms_p95" not in comparison["diagnostics"]["baseline_rtc"]
 
 
@@ -709,13 +795,18 @@ def test_compare_checkpoint_rejects_cross_mode_rollout_identity_mismatch(
     changed = dict(runs_by_mode)
     records = list(changed["bsp_spline_async"].records)
     records[0] = dict(records[0])
-    records[0][field] = _sha("different-state") if field == "init_state_fingerprint" else 43
+    records[0][field] = (
+        _sha("different-state") if field == "init_state_fingerprint" else 43
+    )
     changed["bsp_spline_async"] = dataclasses.replace(
         changed["bsp_spline_async"],
         records=tuple(records),
     )
 
-    with pytest.raises(libero_report_v4.ComparisonErrorV4, match="rollout identity"):
+    with pytest.raises(
+        libero_report_v4.ComparisonErrorV4,
+        match="rollout identity",
+    ):
         libero_report_v4.compare_checkpoint_v4(changed)
 
 
@@ -726,10 +817,7 @@ def test_write_five_checkpoint_report_uses_only_v4_suffixed_filenames(
     monkeypatch.setattr(libero_report, "BOOTSTRAP_RESAMPLES", 1)
     mode_records = {mode: _run_data(mode).records for mode in _MODES}
     runs = [
-        dataclasses.replace(
-            _run_data(mode, step),
-            records=mode_records[mode],
-        )
+        _run_data(mode, step, records=mode_records[mode])
         for step in _STEPS
         for mode in _MODES
     ]
