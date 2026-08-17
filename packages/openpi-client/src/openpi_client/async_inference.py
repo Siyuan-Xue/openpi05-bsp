@@ -31,6 +31,7 @@ class _Completion:
     error: Optional[BaseException] = None
     stale: bool = False
     cancelled: bool = False
+    observed: bool = False
 
     def for_job(self, job: InferenceJob) -> InferenceOutcome:
         return InferenceOutcome(
@@ -51,6 +52,8 @@ class AsyncInferenceWorker:
 
     Completed outcomes are non-consuming: ``poll`` and ``wait`` may retrieve
     them repeatedly while the caller retains the corresponding job handle.
+    The first retrieval establishes the outcome across later generation resets;
+    a reset that acquires the state lock first invalidates an unseen outcome.
     Internal completion storage is weakly tied to that handle, so discarding it
     releases the payload and outcome instead of accumulating evaluation history.
     """
@@ -116,7 +119,9 @@ class AsyncInferenceWorker:
         with self._condition:
             self._validate_job_locked(job)
             completion = self._completions.get(job.request_id)
-            return None if completion is None else completion.for_job(job)
+            if completion is None:
+                return None
+            return self._observe_completion_locked(job.request_id, completion).for_job(job)
 
     def wait(self, job: InferenceJob, timeout: Optional[float] = None) -> InferenceOutcome:
         """Wait for exactly ``job`` without consuming it or cancelling it on timeout."""
@@ -130,7 +135,8 @@ class AsyncInferenceWorker:
                 if remaining is not None and remaining <= 0:
                     raise TimeoutError(f"Timed out waiting for inference job {job.request_id}")
                 self._condition.wait(remaining)
-            return self._completions[job.request_id].for_job(job)
+            completion = self._completions[job.request_id]
+            return self._observe_completion_locked(job.request_id, completion).for_job(job)
 
     def reset_generation(self) -> int:
         """Invalidate outstanding work and request owner-side socket retirement."""
@@ -326,11 +332,23 @@ class AsyncInferenceWorker:
         invalidated = False
         for request_id, job_reference in list(self._jobs.items()):
             job = job_reference()
-            if job is not None and job.generation < self._generation:
+            completion = self._completions.get(request_id)
+            if (
+                job is not None
+                and job.generation < self._generation
+                and (completion is None or not completion.observed)
+            ):
                 self._completions[request_id] = _Completion(stale=True, cancelled=True)
                 invalidated = True
         if invalidated:
             self._condition.notify_all()
+
+    def _observe_completion_locked(self, request_id: int, completion: _Completion) -> _Completion:
+        if completion.observed:
+            return completion
+        observed_completion = dataclasses.replace(completion, observed=True)
+        self._completions[request_id] = observed_completion
+        return observed_completion
 
     def _acknowledge_cancellation(self, cancel_event: threading.Event) -> None:
         with self._condition:

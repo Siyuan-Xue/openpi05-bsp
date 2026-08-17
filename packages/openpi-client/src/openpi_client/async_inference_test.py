@@ -328,6 +328,46 @@ def test_reset_invalidates_completed_unpolled_error():
         worker.close()
 
 
+def test_reset_preserves_completed_result_observed_by_wait():
+    policy = _GatePolicy(result={"observed": "result"})
+    policy.release.set()
+    worker = async_inference.AsyncInferenceWorker(_Factory([policy]))
+    try:
+        job = worker.submit({"generation": 0})
+        first_outcome = worker.wait(job, timeout=1.0)
+
+        assert worker.reset_generation() == 1
+        repeated_outcome = worker.poll(job)
+        assert repeated_outcome == first_outcome
+        assert repeated_outcome.result == {"observed": "result"}
+        assert repeated_outcome.error is None
+        assert not repeated_outcome.stale
+        assert not repeated_outcome.cancelled
+    finally:
+        worker.close()
+
+
+def test_reset_preserves_completed_error_observed_by_poll():
+    error = OSError("observed transport failure")
+    policy = _GatePolicy(error=error)
+    policy.release.set()
+    worker = async_inference.AsyncInferenceWorker(_Factory([policy]))
+    try:
+        job = worker.submit({"generation": 0})
+        _wait_for_stored_completion(worker, job)
+        first_outcome = worker.poll(job)
+
+        assert worker.reset_generation() == 1
+        repeated_outcome = worker.poll(job)
+        assert repeated_outcome == first_outcome
+        assert repeated_outcome.result is None
+        assert repeated_outcome.error is error
+        assert not repeated_outcome.stale
+        assert not repeated_outcome.cancelled
+    finally:
+        worker.close()
+
+
 def test_reset_of_queued_job_is_stale_without_transport_use():
     policy = _GatePolicy()
     factory = _BlockingFactory(policy)
@@ -536,10 +576,12 @@ def test_close_raises_timeout_if_non_daemon_owner_does_not_stop_in_bound():
             worker.close()
 
         policy.release.set()
+        worker._shutdown_timeout_s = 1.0
         worker.close()
         assert not worker._thread.is_alive()
     finally:
         policy.release.set()
+        worker._shutdown_timeout_s = 1.0
         worker.close()
 
 

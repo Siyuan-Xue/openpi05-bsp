@@ -270,49 +270,53 @@ def test_localhost_binary_protocol_uses_shared_websockets_sync_surface(monkeypat
 
     server = websockets.sync.server.serve(handler, "127.0.0.1", 0)
     server_thread = threading.Thread(target=server.serve_forever)
-    server_thread.start()
-    port = server.socket.getsockname()[1]
-    real_connect = websocket_client_policy.websockets.sync.client.connect
     connect_kwargs = []
     close_calls = []
-
-    class _RecordingConnection:
-        def __init__(self, connection):
-            self._connection = connection
-
-        def send(self, payload):
-            return self._connection.send(payload)
-
-        def recv(self, *args, **kwargs):
-            return self._connection.recv(*args, **kwargs)
-
-        def close(self):
-            close_calls.append(True)
-            return self._connection.close()
-
-    def recording_connect(uri, **kwargs):
-        connect_kwargs.append(kwargs)
-        return _RecordingConnection(real_connect(uri, **kwargs))
-
-    monkeypatch.setattr(websocket_client_policy.websockets.sync.client, "connect", recording_connect)
     client = None
+    server_thread.start()
     try:
-        client = websocket_client_policy.WebsocketClientPolicy(
-            "127.0.0.1",
-            port,
-            api_key="loopback",
-            connection_timeout=1.0,
-            inference_timeout=1.0,
-            close_timeout=0.25,
-        )
-        assert client.get_server_metadata() == {"robot": "libero"}
-        result = client.infer_packed(msgpack_numpy.packb({"observation": [1, 2]}))
-        assert result == {"actions": [[0.5, -0.5]]}
+        port = server.socket.getsockname()[1]
+        real_connect = websocket_client_policy.websockets.sync.client.connect
+
+        class _RecordingConnection:
+            def __init__(self, connection):
+                self._connection = connection
+
+            def send(self, payload):
+                return self._connection.send(payload)
+
+            def recv(self, *args, **kwargs):
+                return self._connection.recv(*args, **kwargs)
+
+            def close(self):
+                close_calls.append(True)
+                return self._connection.close()
+
+        def recording_connect(uri, **kwargs):
+            connect_kwargs.append(kwargs)
+            return _RecordingConnection(real_connect(uri, **kwargs))
+
+        monkeypatch.setattr(websocket_client_policy.websockets.sync.client, "connect", recording_connect)
+        try:
+            client = websocket_client_policy.WebsocketClientPolicy(
+                "127.0.0.1",
+                port,
+                api_key="loopback",
+                connection_timeout=1.0,
+                inference_timeout=1.0,
+                close_timeout=0.25,
+            )
+            assert client.get_server_metadata() == {"robot": "libero"}
+            result = client.infer_packed(msgpack_numpy.packb({"observation": [1, 2]}))
+            assert result == {"actions": [[0.5, -0.5]]}
+        finally:
+            if client is not None:
+                client.close()
     finally:
-        if client is not None:
-            client.close()
-        server.shutdown()
-        server_thread.join(1.0)
+        try:
+            server.shutdown()
+        finally:
+            server_thread.join(1.0)
 
     assert not server_thread.is_alive()
     assert handler_errors == []
