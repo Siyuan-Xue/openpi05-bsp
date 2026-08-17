@@ -18,6 +18,7 @@ from typing import TypeVar
 CONTROL_HZ = 20
 DEFAULT_VIDEO_FPS = 40
 NANOSECONDS_PER_SECOND = 1_000_000_000
+EPISODE_MONOTONIC_CLOCK = "episode_monotonic_ns"
 
 _Frame = TypeVar("_Frame")
 
@@ -42,57 +43,48 @@ def validate_video_frequencies(
 
 @dataclasses.dataclass(frozen=True)
 class InferenceRequest:
-    """A measured model-request interval, independent of control blocking."""
+    """A measured request on the episode-relative monotonic clock."""
 
     replan_index: int
-    started_ns: int
-    completed_ns: int
+    started_offset_ns: int
+    duration_ns: int
 
     def __post_init__(self) -> None:
         _require_nonnegative_integer(self.replan_index, name="replan_index")
-        _require_nonnegative_integer(self.started_ns, name="started_ns")
-        _require_nonnegative_integer(self.completed_ns, name="completed_ns")
-        if self.completed_ns < self.started_ns:
-            raise ValueError("completed_ns must not precede started_ns")
+        _require_nonnegative_integer(self.started_offset_ns, name="started_offset_ns")
+        _require_nonnegative_integer(self.duration_ns, name="duration_ns")
 
-    @property
-    def duration_ns(self) -> int:
-        return self.completed_ns - self.started_ns
-
-    def to_dict(self) -> dict[str, int]:
+    def to_dict(self) -> dict[str, int | str]:
         return {
+            "clock": EPISODE_MONOTONIC_CLOCK,
             "replan_index": self.replan_index,
-            "started_ns": self.started_ns,
-            "completed_ns": self.completed_ns,
-            "latency_ns": self.duration_ns,
+            "started_offset_ns": self.started_offset_ns,
+            "duration_ns": self.duration_ns,
         }
 
 
 @dataclasses.dataclass(frozen=True)
 class ControlStall:
-    """A measured interval in which control could not advance for a request."""
+    """A control-blocking interval on the episode-relative monotonic clock."""
 
+    control_step: int
     replan_index: int
-    started_ns: int
-    completed_ns: int
+    started_offset_ns: int
+    duration_ns: int
 
     def __post_init__(self) -> None:
+        _require_nonnegative_integer(self.control_step, name="control_step")
         _require_nonnegative_integer(self.replan_index, name="replan_index")
-        _require_nonnegative_integer(self.started_ns, name="started_ns")
-        _require_nonnegative_integer(self.completed_ns, name="completed_ns")
-        if self.completed_ns < self.started_ns:
-            raise ValueError("completed_ns must not precede started_ns")
+        _require_nonnegative_integer(self.started_offset_ns, name="started_offset_ns")
+        _require_nonnegative_integer(self.duration_ns, name="duration_ns")
 
-    @property
-    def duration_ns(self) -> int:
-        return self.completed_ns - self.started_ns
-
-    def to_dict(self) -> dict[str, int]:
+    def to_dict(self) -> dict[str, int | str]:
         return {
+            "clock": EPISODE_MONOTONIC_CLOCK,
+            "control_step": self.control_step,
             "replan_index": self.replan_index,
-            "started_ns": self.started_ns,
-            "completed_ns": self.completed_ns,
-            "stall_ns": self.duration_ns,
+            "started_offset_ns": self.started_offset_ns,
+            "duration_ns": self.duration_ns,
         }
 
 
@@ -112,13 +104,21 @@ def quantize_stall_frames(
     accumulated_ns = 0
     emitted_frames = 0
     event_frames = []
+    previous_control_step = -1
+    previous_end_offset_ns = 0
     for stall in stalls:
         if not isinstance(stall, ControlStall):
             raise TypeError("stalls must contain ControlStall records")
+        if stall.control_step <= previous_control_step:
+            raise ValueError("control stalls must be in strictly increasing control_step order")
+        if stall.started_offset_ns < previous_end_offset_ns:
+            raise ValueError("control stalls must be chronological and non-overlapping")
         accumulated_ns += stall.duration_ns
         total_frames = accumulated_ns * video_fps // NANOSECONDS_PER_SECOND
         event_frames.append(total_frames - emitted_frames)
         emitted_frames = total_frames
+        previous_control_step = stall.control_step
+        previous_end_offset_ns = stall.started_offset_ns + stall.duration_ns
     return tuple(event_frames)
 
 
@@ -144,9 +144,9 @@ class VideoTimingAudit:
     video_frame_count: int
     control_duration_ns: int
     request_count: int
-    request_latency_ns: int
+    total_request_latency_ns: int
     stall_count: int
-    control_stall_ns: int
+    total_control_stall_ns: int
     video_duration_ns: int
     expected_duration_ns: int
     duration_deviation_ns: int
@@ -187,9 +187,9 @@ def build_video_audit(
         video_frame_count=video_frame_count,
         control_duration_ns=control_duration_ns,
         request_count=len(requests),
-        request_latency_ns=sum(request.duration_ns for request in requests),
+        total_request_latency_ns=sum(request.duration_ns for request in requests),
         stall_count=len(stalls),
-        control_stall_ns=control_stall_ns,
+        total_control_stall_ns=control_stall_ns,
         video_duration_ns=video_duration_ns,
         expected_duration_ns=expected_duration_ns,
         duration_deviation_ns=video_duration_ns - expected_duration_ns,
