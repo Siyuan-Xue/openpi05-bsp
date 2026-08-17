@@ -282,7 +282,7 @@ class TestLiberoEvaluation:
             (bsp_manifest, "bsp_cache_hash"),
             (bsp_manifest, "bsp_cache_manifest_fingerprint"),
         ):
-            with pytest.raises(TypeError):
+            with pytest.raises(ValueError):
                 dataclasses.replace(candidate, **{field: 123})
         for field, value in (
             ("code_sha", "abc"),
