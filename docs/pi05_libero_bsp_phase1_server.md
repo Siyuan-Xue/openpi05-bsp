@@ -744,7 +744,7 @@ print("official host h10 calibration gate passed")
 PY
 ```
 
-必须先完成 task-0 × 1 的真实 host EGL 冒烟，再完成上述 200 回合校准；随后回到 policy server shell 按 `Ctrl-C` 正常停止服务。两个门禁都通过前不进入数据拟合/训练。后面的六次评测同理调用这两个直接 Python 进程，参数与第 12 节一致。
+必须先完成 task-0 × 1 的真实 host EGL 冒烟，再完成上述 200 回合校准；随后回到 policy server shell 按 `Ctrl-C` 正常停止服务。两个门禁都通过前不进入数据拟合/训练。后面的十次正式 schema-v3 评测同理调用这两个直接 Python 进程，参数与第 12 节一致，并分别写入新的空输出目录。
 
 ## 8. 构建并全量验证 BSP sidecar
 
@@ -805,7 +805,7 @@ print("BSP full verification gate passed")
 PY
 ```
 
-`$BSP_VERIFY` 是第 13 节比较器必须直接读取的 Task-6 原始诊断产物。
+`$BSP_VERIFY` 是 Task-6 原始历史诊断产物，必须保留且不得覆盖。若正式评测代码 SHA 与其记录的 `code_sha` 不同，第 12.4 节会对同一个现有 sidecar 做非破坏性 verify，并为第 13 节生成与 schema-v3 evaluator SHA 一致的新诊断产物。
 
 ## 9. 分别计算 A/B norm stats 并通过 state gate
 
@@ -1416,11 +1416,79 @@ run_phase1_eval_host baseline 10000
 run_phase1_eval_host bsp 10000
 ```
 
+### 12.4 为 schema-v3 正式报告刷新 sidecar diagnostics 身份
+
+schema v2 历史诊断和 checkpoint 全部保留，不重训模型、不重建 sidecar，也不覆盖第 8 节的 `$BSP_VERIFY`。正式 comparator 要求 BSP diagnostics 的 `code_sha` 与十个 schema-v3 manifest 的自动 clean-HEAD 身份一致，因此必须从运行十次正式评测的**同一个 clean schema-v3 checkout**，对现有 `$BSP_CACHE` 再执行一次 `--mode verify`，写入带 SHA 的全新路径：
+
+```bash
+cd "$BSP_REPO_DIR"
+test -z "$(git status --porcelain --untracked-files=all)"
+export SCHEMA3_CODE_SHA="$(git rev-parse HEAD)"
+case "$SCHEMA3_CODE_SHA" in
+  *[!0-9a-f]*|'') echo "STOP: SCHEMA3_CODE_SHA must be lowercase hex" >&2; exit 2 ;;
+esac
+test "${#SCHEMA3_CODE_SHA}" -eq 40
+
+export BSP_VERIFY_SCHEMA3="$BSP_ROOT/data/bspline-targets/libero-v2.0-bsp-v2.schema-v3-${SCHEMA3_CODE_SHA:0:12}.verification.json"
+export BSP_VERIFY_SCHEMA3_LOG="$LOG_BASE/bsp-verify-schema-v3-${SCHEMA3_CODE_SHA:0:12}.log"
+test -s "$BSP_CACHE"
+test -s "$BSP_VERIFY"
+test ! -e "$BSP_VERIFY_SCHEMA3"
+test ! -e "$BSP_VERIFY_SCHEMA3_LOG"
+
+"$OPENPI_PY" scripts/prepare_libero_bsp.py \
+  --mode verify \
+  --dataset-root "$LIBERO_DATASET_DIR" \
+  --cache-path "$BSP_CACHE" \
+  --diagnostics-path "$BSP_VERIFY_SCHEMA3" \
+  --repo-id physical-intelligence/libero \
+  --revision v2.0 \
+  --action-key actions \
+  2>&1 | tee "$BSP_VERIFY_SCHEMA3_LOG"
+```
+
+只读核对旧、新 diagnostics 和现有 NPZ 的 SHA、fingerprint、内容身份完全一致；唯一允许随验证 checkout 改变的身份是新 diagnostics 的 `code_sha`：
+
+```bash
+"$OPENPI_PY" - \
+  "$BSP_VERIFY" \
+  "$BSP_VERIFY_SCHEMA3" \
+  "$BSP_CACHE" \
+  "$SCHEMA3_CODE_SHA" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+old_path, new_path, cache_path = map(pathlib.Path, sys.argv[1:4])
+code_sha = sys.argv[4]
+old = json.loads(old_path.read_text())
+new = json.loads(new_path.read_text())
+hasher = hashlib.sha256()
+with cache_path.open("rb") as source:
+    for block in iter(lambda: source.read(1024 * 1024), b""):
+        hasher.update(block)
+cache_sha = hasher.hexdigest()
+
+assert old["verification_passed"] is True
+assert new["verification_passed"] is True
+assert new["code_sha"] == code_sha
+assert old["cache_sha256"] == new["cache_sha256"] == cache_sha
+assert old["cache_manifest_fingerprint"] == new["cache_manifest_fingerprint"]
+assert old["cache_contents_sha256"] == new["cache_contents_sha256"]
+assert old["rebuilt_contents_sha256"] == new["rebuilt_contents_sha256"]
+assert new["cache_contents_sha256"] == new["rebuilt_contents_sha256"]
+print("schema-v3 BSP diagnostics identity gate passed", new_path)
+PY
+```
+
+如果新路径碰撞、verify 失败或任一身份不一致，立即停止；不得删除旧诊断、改写 NPZ、切换 revision 或重新 build 来绕过门禁。
+
 ## 13. 严格生成第一阶段比较报告
 
 比较器只接受恰好十个 run，并且只根据 manifest 的 variant/step 识别它们。它会拒绝 official h10、缺失 0k/1k/2k/5k/10k、重复/额外里程碑、混合全量/LoRA 训练家族、不完整 20,000 回合、非配对初始状态、截断/NaN JSON、summary 不一致、infrastructure/artifact error 或任何身份不一致。
 
-直接传入第 8 节 prepare verify 生成的原始 `$BSP_VERIFY` 和第 9 节生成的原始 `$NORM_COMPARISON`：
+传入第 12.4 节由同一个 clean schema-v3 SHA 生成的 `$BSP_VERIFY_SCHEMA3`；第 8 节原始 `$BSP_VERIFY` 仅保留作历史审计。norm 身份未绑定代码 SHA，继续传第 9 节生成的原始 `$NORM_COMPARISON`：
 
 ```bash
 cd "$BSP_REPO_DIR"
@@ -1439,7 +1507,7 @@ PYTHONPATH="$BSP_REPO_DIR/packages/openpi-client/src" \
   "$EVAL_BASE/bsp-step-5000" \
   "$EVAL_BASE/baseline-step-10000" \
   "$EVAL_BASE/bsp-step-10000" \
-  --bsp-verification "$BSP_VERIFY" \
+  --bsp-verification "$BSP_VERIFY_SCHEMA3" \
   --norm-comparison "$NORM_COMPARISON" \
   --output-dir "$REPORT_DIR"
 

@@ -332,6 +332,47 @@ class TestLiberoPhaseOneReport:
         with pytest.raises(libero_report.ComparisonError):
             libero_report.classify_phase_one_manifests(manifests)
 
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        (
+            ("schema_version", 3.0),
+            ("schema_version", True),
+            ("checkpoint_step", 0.0),
+            ("checkpoint_step", False),
+            ("expected_action_horizon", 16.0),
+            ("expected_action_horizon", True),
+            ("execution_horizon", 8.0),
+            ("trials_per_task", 50.0),
+            ("num_steps_wait", 10.0),
+            ("infrastructure_retries", 2.0),
+            ("train_seed", 42.0),
+            ("eval_seed", True),
+            ("replan_steps", 8.0),
+        ),
+    )
+    def test_manifest_rejects_forged_non_integer_protocol_fields(self, field, value):
+        manifest = _manifest("baseline", 0)
+        manifest[field] = value
+        manifest = json.loads(json.dumps(manifest, allow_nan=False))
+        with pytest.raises(libero_report.ComparisonError):
+            libero_report._validate_manifest(manifest)
+
+    @pytest.mark.parametrize("value", [0.0, True])
+    def test_manifest_rejects_forged_task_ids_and_suite_max_steps(self, value):
+        manifest = _manifest("baseline", 0)
+        manifest["task_ids"] = list(manifest["task_ids"])
+        manifest["task_ids"][0] = value
+        manifest = json.loads(json.dumps(manifest, allow_nan=False))
+        with pytest.raises(libero_report.ComparisonError):
+            libero_report._validate_manifest(manifest)
+
+        manifest = _manifest("baseline", 0)
+        manifest["max_steps_by_suite"] = dict(manifest["max_steps_by_suite"])
+        manifest["max_steps_by_suite"]["libero_spatial"] = 220.0 if value == 0.0 else True
+        manifest = json.loads(json.dumps(manifest, allow_nan=False))
+        with pytest.raises(libero_report.ComparisonError):
+            libero_report._validate_manifest(manifest)
+
     def test_replan_protocol_is_not_mutable_through_public_bsp_parameters(self):
         original_parameters = dict(libero_eval.BSP_PARAMETERS)
         try:

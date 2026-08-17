@@ -197,6 +197,12 @@ def _training_family(manifest: Mapping[str, Any]) -> str:
     return matches[0]
 
 
+def _require_integer(value: Any, *, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ComparisonError("{} must be an integer".format(label))
+    return value
+
+
 def _validate_manifest(manifest: Mapping[str, Any]) -> Tuple[str, int]:
     required = (
         "schema_version",
@@ -233,7 +239,10 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> Tuple[str, int]:
         "infrastructure_retries",
     )
     _require_fields(manifest, required, label="evaluation manifest")
-    if manifest["schema_version"] != 3:
+    schema_version = _require_integer(
+        manifest["schema_version"], label="Evaluation manifest schema_version"
+    )
+    if schema_version != 3:
         raise ComparisonError(
             "Phase-one comparison requires schema_version 3; schema 2 is archive-only "
             "and must be rerun with the schema-3 evaluator"
@@ -244,8 +253,8 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> Tuple[str, int]:
         ("control_freq_hz", 20),
         ("replan_steps", 8),
     ):
-        value = manifest[field]
-        if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+        value = _require_integer(manifest[field], label="Evaluation manifest {}".format(field))
+        if value != expected:
             raise ComparisonError("Evaluation manifest {} must be exactly {}".format(field, expected))
     video_fps = manifest["video_fps"]
     if (
@@ -260,11 +269,11 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> Tuple[str, int]:
     if manifest["inference_schedule"] != libero_video_timing.SYNCHRONOUS_INFERENCE_SCHEDULE:
         raise ComparisonError("Formal phase-one comparison currently requires synchronous inference_schedule")
     variant = manifest["policy_variant"]
-    step = manifest["checkpoint_step"]
+    step = _require_integer(
+        manifest["checkpoint_step"], label="Evaluation manifest checkpoint_step"
+    )
     if variant not in ("baseline", "bsp"):
         raise ComparisonError("Evaluation manifest policy_variant must be baseline or bsp")
-    if isinstance(step, bool) or not isinstance(step, int):
-        raise ComparisonError("Evaluation manifest checkpoint_step must be an integer")
     if step not in MILESTONES:
         raise ComparisonError("Unexpected phase-one checkpoint_step {}".format(step))
     _training_family(manifest)
@@ -272,24 +281,56 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> Tuple[str, int]:
         "baseline": ("baseline_h16", 16),
         "bsp": ("bsp_decoded_h8", 8),
     }[variant]
-    actual = (manifest["policy_protocol"], manifest["expected_action_horizon"])
+    expected_action_horizon = _require_integer(
+        manifest["expected_action_horizon"],
+        label="Evaluation manifest expected_action_horizon",
+    )
+    actual = (manifest["policy_protocol"], expected_action_horizon)
     if actual != expected:
         raise ComparisonError(
             "{}@{} has config/protocol/horizon {}, expected {}".format(variant, step, actual, expected)
         )
-    if manifest["execution_horizon"] != 8:
+    execution_horizon = _require_integer(
+        manifest["execution_horizon"], label="Evaluation manifest execution_horizon"
+    )
+    if execution_horizon != 8:
         raise ComparisonError("Phase-one evaluation must execute exactly eight actions per replan")
     if tuple(manifest["suites"]) != tuple(libero_eval.SUPPORTED_SUITES):
         raise ComparisonError("Phase-one evaluation requires all four suites in canonical order")
-    if tuple(manifest["task_ids"]) != tuple(range(TASKS_PER_SUITE)):
+    if not isinstance(manifest["task_ids"], list):
+        raise ComparisonError("Evaluation manifest task_ids must be a JSON list")
+    task_ids = tuple(
+        _require_integer(value, label="Evaluation manifest task_ids item")
+        for value in manifest["task_ids"]
+    )
+    if task_ids != tuple(range(TASKS_PER_SUITE)):
         raise ComparisonError("Phase-one evaluation requires task ids 0..9")
-    if manifest["trials_per_task"] != TRIALS_PER_TASK:
+    trials_per_task = _require_integer(
+        manifest["trials_per_task"], label="Evaluation manifest trials_per_task"
+    )
+    if trials_per_task != TRIALS_PER_TASK:
         raise ComparisonError("Phase-one evaluation requires exactly 50 trials per task")
-    if manifest["num_steps_wait"] != 10 or manifest["max_steps_by_suite"] != _MAX_STEPS_BY_SUITE:
+    num_steps_wait = _require_integer(
+        manifest["num_steps_wait"], label="Evaluation manifest num_steps_wait"
+    )
+    max_steps = manifest["max_steps_by_suite"]
+    if not isinstance(max_steps, dict) or set(max_steps) != set(_MAX_STEPS_BY_SUITE):
+        raise ComparisonError("Evaluation manifest max_steps_by_suite must contain all four suites")
+    exact_max_steps = {
+        suite: _require_integer(value, label="Evaluation manifest max_steps_by_suite value")
+        for suite, value in max_steps.items()
+    }
+    if num_steps_wait != 10 or exact_max_steps != _MAX_STEPS_BY_SUITE:
         raise ComparisonError("Evaluation wait/max-step protocol does not match phase one")
-    if manifest["infrastructure_retries"] != 2:
+    infrastructure_retries = _require_integer(
+        manifest["infrastructure_retries"],
+        label="Evaluation manifest infrastructure_retries",
+    )
+    if infrastructure_retries != 2:
         raise ComparisonError("Evaluation must retain exactly two infrastructure retries")
-    if manifest["train_seed"] != 42 or manifest["eval_seed"] != 42:
+    train_seed = _require_integer(manifest["train_seed"], label="Evaluation manifest train_seed")
+    eval_seed = _require_integer(manifest["eval_seed"], label="Evaluation manifest eval_seed")
+    if train_seed != 42 or eval_seed != 42:
         raise ComparisonError("Phase-one training and evaluation seeds must both be 42")
     for field in ("code_sha", "dataset_revision", "checkpoint", "container_digest"):
         if not isinstance(manifest[field], str) or not manifest[field]:
@@ -307,7 +348,13 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> Tuple[str, int]:
         raise ComparisonError("Evaluation checkpoint terminal component must equal checkpoint_step")
     if not _is_sha256(manifest["norm_hash"]):
         raise ComparisonError("Evaluation manifest norm_hash must be a lowercase SHA256")
-    if manifest["bsp_parameters"] != libero_eval.BSP_PARAMETERS:
+    bsp_parameters = manifest["bsp_parameters"]
+    if not isinstance(bsp_parameters, dict) or set(bsp_parameters) != set(libero_eval.BSP_PARAMETERS):
+        raise ComparisonError("Evaluation manifest BSP parameters do not match the fixed protocol")
+    if any(
+        type(bsp_parameters[field]) is not type(expected) or bsp_parameters[field] != expected
+        for field, expected in libero_eval.BSP_PARAMETERS.items()
+    ):
         raise ComparisonError("Evaluation manifest BSP parameters do not match the fixed protocol")
     if variant == "baseline":
         if manifest["bsp_cache_hash"] is not None or manifest["bsp_cache_manifest_fingerprint"] is not None:
