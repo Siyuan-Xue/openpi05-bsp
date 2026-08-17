@@ -295,7 +295,12 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> Tuple[str, int]:
     )
     if execution_horizon != 8:
         raise ComparisonError("Phase-one evaluation must execute exactly eight actions per replan")
-    if tuple(manifest["suites"]) != tuple(libero_eval.SUPPORTED_SUITES):
+    suites = manifest["suites"]
+    if not isinstance(suites, list):
+        raise ComparisonError("Evaluation manifest suites must be a JSON list")
+    if any(not isinstance(suite, str) or not suite or suite not in libero_eval.SUPPORTED_SUITES for suite in suites):
+        raise ComparisonError("Evaluation manifest suites must contain supported non-empty strings")
+    if tuple(suites) != tuple(libero_eval.SUPPORTED_SUITES):
         raise ComparisonError("Phase-one evaluation requires all four suites in canonical order")
     if not isinstance(manifest["task_ids"], list):
         raise ComparisonError("Evaluation manifest task_ids must be a JSON list")

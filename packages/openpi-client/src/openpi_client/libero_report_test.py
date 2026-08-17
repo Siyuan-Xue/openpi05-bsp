@@ -366,6 +366,49 @@ class TestLiberoPhaseOneReport:
         with pytest.raises(libero_report.ComparisonError):
             libero_report._validate_manifest(manifest)
 
+    @pytest.mark.parametrize(
+        "suites",
+        (
+            {suite: None for suite in libero_eval.SUPPORTED_SUITES},
+            tuple(libero_eval.SUPPORTED_SUITES),
+            "".join(libero_eval.SUPPORTED_SUITES),
+        ),
+    )
+    def test_manifest_requires_suites_to_be_a_json_list(self, suites):
+        manifest = _manifest("baseline", 0)
+        manifest["suites"] = suites
+        with pytest.raises(libero_report.ComparisonError):
+            libero_report._validate_manifest(manifest)
+
+    @pytest.mark.parametrize("value", [0, True, None, ""])
+    def test_manifest_requires_nonempty_supported_string_suite_items(self, value):
+        manifest = _manifest("baseline", 0)
+        manifest["suites"] = list(manifest["suites"])
+        manifest["suites"][0] = value
+        manifest = json.loads(json.dumps(manifest, allow_nan=False))
+        with pytest.raises(libero_report.ComparisonError):
+            libero_report._validate_manifest(manifest)
+
+    def test_manifest_accepts_canonical_suite_json_list(self):
+        manifest = _manifest("baseline", 0)
+        manifest = json.loads(json.dumps(manifest, allow_nan=False))
+        assert manifest["suites"] == list(libero_eval.SUPPORTED_SUITES)
+        assert libero_report._validate_manifest(manifest) == ("baseline", 0)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        (
+            ("task_ids", tuple(range(10))),
+            ("max_steps_by_suite", list(_manifest("baseline", 0)["max_steps_by_suite"].items())),
+            ("bsp_parameters", list(libero_eval.BSP_PARAMETERS.items())),
+        ),
+    )
+    def test_manifest_rejects_non_json_sequence_and_mapping_containers(self, field, value):
+        manifest = _manifest("baseline", 0)
+        manifest[field] = value
+        with pytest.raises(libero_report.ComparisonError):
+            libero_report._validate_manifest(manifest)
+
         manifest = _manifest("baseline", 0)
         manifest["max_steps_by_suite"] = dict(manifest["max_steps_by_suite"])
         manifest["max_steps_by_suite"]["libero_spatial"] = 220.0 if value == 0.0 else True
