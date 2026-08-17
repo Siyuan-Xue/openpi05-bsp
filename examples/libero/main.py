@@ -347,6 +347,7 @@ def _run_attempt(
                         replan_index=replan_index,
                         started_offset_ns=request_started_offset_ns,
                         duration_ns=request_duration_ns,
+                        reason=_video_timing.STALL_REASON_SYNCHRONOUS_INFERENCE,
                     )
                 )
                 return _eval.AttemptResult(
@@ -376,6 +377,7 @@ def _run_attempt(
                     replan_index=replan_index,
                     started_offset_ns=request_started_offset_ns,
                     duration_ns=request_duration_ns,
+                    reason=_video_timing.STALL_REASON_SYNCHRONOUS_INFERENCE,
                 )
             )
             action_plan.extend(chunk)
@@ -420,10 +422,9 @@ def _get_benchmark_suite(suite_name: str):
 def _synchronous_stall_overlay_lines(
     stall: _video_timing.ControlStall,
 ) -> tuple[str, str]:
-    duration_seconds = stall.duration_ns / _video_timing.NANOSECONDS_PER_SECOND
-    return (
-        "Synchronous inference",
-        f"Control stalled: {duration_seconds:.2f} s",
+    return _video_timing.stall_overlay_lines(
+        stall,
+        inference_schedule=_video_timing.SYNCHRONOUS_INFERENCE_SCHEDULE,
     )
 
 
@@ -446,9 +447,12 @@ def _build_video_frames(
     *,
     control_hz: int,
     video_fps: int,
-    show_inference_waits: bool,
+    inference_schedule: str,
+    overlay_renderer=None,
 ) -> tuple:
-    """Expand a selected rollout and insert measured synchronous stall holds."""
+    """Expand a selected rollout and insert labeled, measured stall holds."""
+    _video_timing.validate_inference_schedule(inference_schedule)
+    renderer = _draw_video_overlay if overlay_renderer is None else overlay_renderer
     held_frames = _video_timing.expand_control_frames(
         control_frames,
         control_hz=control_hz,
@@ -465,24 +469,27 @@ def _build_video_frames(
             raise ValueError(
                 f"Control stall step {stall.control_step} exceeds {frame_count} replay frames"
             )
-        stall_frames_by_step[stall.control_step] = (stall, stall_frame_count)
+        stall_frames_by_step[stall.control_step] = (
+            stall,
+            stall_frame_count,
+            _video_timing.stall_overlay_lines(
+                stall,
+                inference_schedule=inference_schedule,
+            ),
+        )
 
     video_frames = []
     for control_step, frame in enumerate(control_frames):
         stall_event = stall_frames_by_step.get(control_step)
         if stall_event is not None:
-            stall, stall_frame_count = stall_event
-            for _ in range(stall_frame_count):
-                if show_inference_waits:
-                    video_frames.append(
-                        _video_timing.render_overlay(
-                            frame,
-                            _synchronous_stall_overlay_lines(stall),
-                            renderer=_draw_video_overlay,
-                        )
-                    )
-                else:
-                    video_frames.append(frame)
+            _, stall_frame_count, overlay_lines = stall_event
+            if stall_frame_count:
+                rendered_stall = _video_timing.render_overlay(
+                    frame,
+                    overlay_lines,
+                    renderer=renderer,
+                )
+                video_frames.extend(rendered_stall for _ in range(stall_frame_count))
         held_start = control_step * hold_count
         video_frames.extend(held_frames[held_start : held_start + hold_count])
 
@@ -490,19 +497,15 @@ def _build_video_frames(
     if trailing_stall is not None:
         if not control_frames:
             raise ValueError("Cannot render a control stall without a replay frame")
-        stall, stall_frame_count = trailing_stall
+        _, stall_frame_count, overlay_lines = trailing_stall
         frame = control_frames[-1]
-        for _ in range(stall_frame_count):
-            if show_inference_waits:
-                video_frames.append(
-                    _video_timing.render_overlay(
-                        frame,
-                        _synchronous_stall_overlay_lines(stall),
-                        renderer=_draw_video_overlay,
-                    )
-                )
-            else:
-                video_frames.append(frame)
+        if stall_frame_count:
+            rendered_stall = _video_timing.render_overlay(
+                frame,
+                overlay_lines,
+                renderer=renderer,
+            )
+            video_frames.extend(rendered_stall for _ in range(stall_frame_count))
     return tuple(video_frames)
 
 
@@ -526,6 +529,7 @@ def _persist_episode_artifacts(
     control_hz: int = _video_timing.CONTROL_HZ,
     video_fps: int = _video_timing.DEFAULT_VIDEO_FPS,
     video_show_inference_waits: bool = False,
+    inference_schedule: str = _video_timing.SYNCHRONOUS_INFERENCE_SCHEDULE,
     video_encoder=None,
 ) -> tuple[_eval.EpisodeRecord, _eval.ArtifactError | None]:
     """Persist the rollout first, then encode or separately audit its video."""
@@ -548,19 +552,22 @@ def _persist_episode_artifacts(
     else:
         encoder = imageio.mimwrite if video_encoder is None else video_encoder
         try:
+            included_stalls = (
+                persisted_record.control_stalls if video_show_inference_waits else ()
+            )
             planned_audit = _video_timing.build_video_audit(
                 control_frame_count=len(replay_frames),
                 requests=persisted_record.inference_requests,
-                stalls=persisted_record.control_stalls,
+                stalls=included_stalls,
                 control_hz=control_hz,
                 video_fps=video_fps,
             )
             video_frames = _build_video_frames(
                 replay_frames,
-                persisted_record.control_stalls,
+                included_stalls,
                 control_hz=control_hz,
                 video_fps=video_fps,
-                show_inference_waits=video_show_inference_waits,
+                inference_schedule=inference_schedule,
             )
             encoder(
                 video_path,
@@ -572,6 +579,10 @@ def _persist_episode_artifacts(
                 episode_id=persisted_record.identity.episode_id,
                 path=str(video_path),
                 planned=planned_audit,
+                measured_stalls=persisted_record.control_stalls,
+                included_stalls=included_stalls,
+                video_show_inference_waits=video_show_inference_waits,
+                inference_schedule=inference_schedule,
                 encoded_fps=encoded_fps,
                 encoded_frame_count=encoded_frame_count,
                 encoded_duration_s=encoded_duration_s,
@@ -671,6 +682,7 @@ def eval_libero(args: Args) -> dict:
                             control_hz=args.control_freq,
                             video_fps=args.video_fps,
                             video_show_inference_waits=args.video_show_inference_waits,
+                            inference_schedule=_video_timing.SYNCHRONOUS_INFERENCE_SCHEDULE,
                         )
                         records.append(record)
                         if artifact_error is not None:

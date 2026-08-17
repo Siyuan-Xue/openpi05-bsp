@@ -24,7 +24,11 @@ def test_synchronous_and_async_request_stall_records_keep_latency_separate_from_
     )
     future_async_request = timing.InferenceRequest(replan_index=4, started_offset_ns=400, duration_ns=300)
     future_async_stall = timing.ControlStall(
-        control_step=32, replan_index=4, started_offset_ns=900, duration_ns=0
+        control_step=32,
+        replan_index=4,
+        started_offset_ns=900,
+        duration_ns=0,
+        reason="async_action_underflow",
     )
 
     assert request.duration_ns == 250
@@ -43,7 +47,40 @@ def test_synchronous_and_async_request_stall_records_keep_latency_separate_from_
         "replan_index": 4,
         "started_offset_ns": 900,
         "duration_ns": 0,
+        "reason": "async_action_underflow",
     }
+
+
+def test_stall_reason_and_schedule_select_exact_sync_and_async_overlay_labels():
+    synchronous = timing.ControlStall(0, 0, 0, 125_000_000)
+    asynchronous = timing.ControlStall(
+        1,
+        1,
+        200_000_000,
+        75_000_000,
+        reason="async_action_underflow",
+    )
+
+    assert timing.stall_overlay_lines(synchronous, inference_schedule="synchronous") == (
+        "Synchronous inference",
+        "Control stalled: 0.12 s",
+    )
+    assert timing.stall_overlay_lines(asynchronous, inference_schedule="asynchronous") == (
+        "Waiting for policy actions",
+        "Control stalled: 0.07 s",
+    )
+    for invalid in (
+        lambda: timing.ControlStall(0, 0, 0, 1, reason="network"),
+        lambda: timing.stall_overlay_lines(synchronous, inference_schedule="asynchronous"),
+        lambda: timing.stall_overlay_lines(asynchronous, inference_schedule="synchronous"),
+        lambda: timing.stall_overlay_lines(synchronous, inference_schedule="batched"),
+    ):
+        try:
+            invalid()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(invalid)
 
 
 def test_control_frames_hold_exactly_twice_at_40_fps_without_dataset_rate_input():
@@ -145,8 +182,8 @@ def test_audit_uses_exact_integer_durations_and_cumulative_stall_frames():
         "control_duration_ns": 150_000_000,
         "request_count": 2,
         "total_request_latency_ns": 350_000_000,
-        "stall_count": 2,
-        "total_control_stall_ns": 25_000_000,
+        "included_stall_count": 2,
+        "included_control_stall_ns": 25_000_000,
         "video_duration_ns": 175_000_000,
         "expected_duration_ns": 175_000_000,
         "duration_deviation_ns": 0,
@@ -155,15 +192,44 @@ def test_audit_uses_exact_integer_durations_and_cumulative_stall_frames():
 
 def test_audit_uses_same_replan_zero_stall_instead_of_async_request_latency():
     request = timing.InferenceRequest(replan_index=4, started_offset_ns=100, duration_ns=300_000_000)
-    zero_stall = timing.ControlStall(control_step=7, replan_index=4, started_offset_ns=400_000_000, duration_ns=0)
+    zero_stall = timing.ControlStall(
+        control_step=7,
+        replan_index=4,
+        started_offset_ns=400_000_000,
+        duration_ns=0,
+        reason="async_action_underflow",
+    )
 
     audit = timing.build_video_audit(control_frame_count=3, requests=(request,), stalls=(zero_stall,))
 
     assert audit.total_request_latency_ns == 300_000_000
-    assert audit.total_control_stall_ns == 0
+    assert audit.included_control_stall_ns == 0
     assert audit.stall_frame_count == 0
     assert audit.video_frame_count == 6
     assert audit.duration_deviation_ns == 0
+
+
+def test_partial_async_underflow_freezes_only_the_measured_stall_duration():
+    request = timing.InferenceRequest(4, started_offset_ns=100, duration_ns=300_000_000)
+    partial_stall = timing.ControlStall(
+        7,
+        4,
+        started_offset_ns=350_000_000,
+        duration_ns=50_000_000,
+        reason="async_action_underflow",
+    )
+
+    audit = timing.build_video_audit(
+        control_frame_count=3,
+        requests=(request,),
+        stalls=(partial_stall,),
+    )
+
+    assert audit.total_request_latency_ns == 300_000_000
+    assert audit.included_control_stall_ns == 50_000_000
+    assert audit.stall_frame_count == 2
+    assert audit.video_frame_count == 8
+    assert audit.expected_duration_ns == 200_000_000
 
 
 if __name__ == "__main__":

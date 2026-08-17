@@ -19,6 +19,18 @@ CONTROL_HZ = 20
 DEFAULT_VIDEO_FPS = 40
 NANOSECONDS_PER_SECOND = 1_000_000_000
 EPISODE_MONOTONIC_CLOCK = "episode_monotonic_ns"
+SYNCHRONOUS_INFERENCE_SCHEDULE = "synchronous"
+ASYNCHRONOUS_INFERENCE_SCHEDULE = "asynchronous"
+STALL_REASON_SYNCHRONOUS_INFERENCE = "synchronous_inference"
+STALL_REASON_ASYNC_ACTION_UNDERFLOW = "async_action_underflow"
+_INFERENCE_SCHEDULES = (
+    SYNCHRONOUS_INFERENCE_SCHEDULE,
+    ASYNCHRONOUS_INFERENCE_SCHEDULE,
+)
+_STALL_REASONS = (
+    STALL_REASON_SYNCHRONOUS_INFERENCE,
+    STALL_REASON_ASYNC_ACTION_UNDERFLOW,
+)
 
 _Frame = TypeVar("_Frame")
 
@@ -71,12 +83,15 @@ class ControlStall:
     replan_index: int
     started_offset_ns: int
     duration_ns: int
+    reason: str = STALL_REASON_SYNCHRONOUS_INFERENCE
 
     def __post_init__(self) -> None:
         _require_nonnegative_integer(self.control_step, name="control_step")
         _require_nonnegative_integer(self.replan_index, name="replan_index")
         _require_nonnegative_integer(self.started_offset_ns, name="started_offset_ns")
         _require_nonnegative_integer(self.duration_ns, name="duration_ns")
+        if self.reason not in _STALL_REASONS:
+            raise ValueError(f"Unsupported control stall reason: {self.reason}")
 
     def to_dict(self) -> dict[str, int | str]:
         return {
@@ -85,7 +100,42 @@ class ControlStall:
             "replan_index": self.replan_index,
             "started_offset_ns": self.started_offset_ns,
             "duration_ns": self.duration_ns,
+            "reason": self.reason,
         }
+
+
+def validate_inference_schedule(inference_schedule: str) -> str:
+    if inference_schedule not in _INFERENCE_SCHEDULES:
+        raise ValueError(f"Unsupported inference schedule: {inference_schedule}")
+    return inference_schedule
+
+
+def stall_overlay_lines(
+    stall: ControlStall,
+    *,
+    inference_schedule: str,
+) -> tuple[str, str]:
+    """Return the exact presentation label for a measured control stall."""
+    validate_inference_schedule(inference_schedule)
+    if not isinstance(stall, ControlStall):
+        raise TypeError("stall must be a ControlStall record")
+    expected_reason = (
+        STALL_REASON_SYNCHRONOUS_INFERENCE
+        if inference_schedule == SYNCHRONOUS_INFERENCE_SCHEDULE
+        else STALL_REASON_ASYNC_ACTION_UNDERFLOW
+    )
+    if stall.reason != expected_reason:
+        raise ValueError(
+            f"Control stall reason {stall.reason} does not match inference schedule "
+            f"{inference_schedule}"
+        )
+    duration_seconds = stall.duration_ns / NANOSECONDS_PER_SECOND
+    label = (
+        "Synchronous inference"
+        if inference_schedule == SYNCHRONOUS_INFERENCE_SCHEDULE
+        else "Waiting for policy actions"
+    )
+    return label, f"Control stalled: {duration_seconds:.2f} s"
 
 
 def expand_control_frames(
@@ -145,8 +195,8 @@ class VideoTimingAudit:
     control_duration_ns: int
     request_count: int
     total_request_latency_ns: int
-    stall_count: int
-    total_control_stall_ns: int
+    included_stall_count: int
+    included_control_stall_ns: int
     video_duration_ns: int
     expected_duration_ns: int
     duration_deviation_ns: int
@@ -188,8 +238,8 @@ def build_video_audit(
         control_duration_ns=control_duration_ns,
         request_count=len(requests),
         total_request_latency_ns=sum(request.duration_ns for request in requests),
-        stall_count=len(stalls),
-        total_control_stall_ns=control_stall_ns,
+        included_stall_count=len(stalls),
+        included_control_stall_ns=control_stall_ns,
         video_duration_ns=video_duration_ns,
         expected_duration_ns=expected_duration_ns,
         duration_deviation_ns=video_duration_ns - expected_duration_ns,

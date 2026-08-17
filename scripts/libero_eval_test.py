@@ -364,40 +364,75 @@ def test_unselected_video_is_not_expanded_or_encoded(monkeypatch):
     assert calls == ["episode"]
 
 
-def test_selected_video_expands_to_40_fps_reads_back_and_appends_audit(monkeypatch, tmp_path):
-    calls = []
+def test_selected_video_disabled_enabled_pair_changes_only_artifact_timing(monkeypatch, tmp_path):
     encoded = {}
+    audits = {}
+    rollout_results = {}
+    rollout_actions = {}
+
+    monkeypatch.setattr(libero_main, "_prepare_observation", lambda obs, prompt, size: ({}, "frame"))
+    for mode, show_waits in (("disabled", False), ("enabled", True)):
+        environment = _Environment()
+        rollout_results[mode] = libero_main._run_attempt(
+            environment=environment,
+            client_holder=_ClientHolder([_actions()]),
+            initial_state=object(),
+            identity=_identity(),
+            task_description="pick up the block",
+            args=dataclasses.replace(_args(), video_show_inference_waits=show_waits),
+            max_steps=1,
+        )
+        rollout_actions[mode] = tuple(tuple(action) for action in environment.actions)
+
+    assert rollout_actions["disabled"] == rollout_actions["enabled"] == (tuple(_actions()[0]),)
+    assert (
+        rollout_results["disabled"].steps,
+        rollout_results["disabled"].success,
+    ) == (
+        rollout_results["enabled"].steps,
+        rollout_results["enabled"].success,
+    ) == (1, True)
 
     class Writer:
+        def __init__(self, mode):
+            self.mode = mode
+
         def append_episode(self, record):
-            calls.append("episode")
+            pass
 
         def append_video_audit(self, audit):
-            calls.append("video_audit")
-            encoded["audit"] = audit
+            audits[self.mode] = audit
 
         def append_artifact_error(self, error):
-            calls.append("artifact_error")
+            pytest.fail(f"unexpected artifact error: {error}")
 
     class Selector:
+        def __init__(self, mode):
+            self.mode = mode
+
         def claim(self, record):
-            return tmp_path / "video.mp4"
+            return tmp_path / f"{self.mode}.mp4"
 
     class Reader:
+        def __init__(self, path):
+            self.path = path
+
         def get_meta_data(self):
-            return {"fps": 40.0, "duration": 0.125}
+            frames = encoded[self.path]
+            return {"fps": 40.0, "duration": len(frames) / 40.0}
 
         def count_frames(self):
-            return 5
+            return len(encoded[self.path])
 
         def close(self):
-            calls.append("reader_close")
+            pass
 
     def encoder(path, frames, *, fps):
-        calls.append("video")
-        encoded.update(path=path, frames=tuple(frames), fps=fps)
+        assert fps == 40
+        encoded[path] = tuple(frames)
 
-    monkeypatch.setattr(libero_main.imageio, "get_reader", lambda path: Reader())
+    monkeypatch.setattr(libero_main.imageio, "get_reader", Reader)
+    monkeypatch.setattr(libero_main, "_draw_video_overlay", lambda frame, lines: frame)
     attempt = libero_eval.AttemptResult(
         success=True,
         steps=2,
@@ -414,20 +449,96 @@ def test_selected_video_expands_to_40_fps_reads_back_and_appends_audit(monkeypat
         _identity(), 42, 1, success=True, result=attempt
     )
 
-    _, artifact_error = libero_main._persist_episode_artifacts(
-        record,
-        Writer(),
-        Selector(),
+    persisted = {}
+    for mode, show_waits in (("disabled", False), ("enabled", True)):
+        persisted[mode], artifact_error = libero_main._persist_episode_artifacts(
+            record,
+            Writer(mode),
+            Selector(mode),
+            video_fps=40,
+            video_show_inference_waits=show_waits,
+            video_encoder=encoder,
+        )
+        assert artifact_error is None
+
+    policy_fields = ("status", "success", "steps", "replans", "inference_requests", "control_stalls")
+    assert tuple(getattr(persisted["disabled"], field) for field in policy_fields) == tuple(
+        getattr(persisted["enabled"], field) for field in policy_fields
+    )
+    assert persisted["disabled"].steps == record.steps == len(record.replay_frames) == 2
+    assert len(encoded[tmp_path / "disabled.mp4"]) == 4
+    assert len(encoded[tmp_path / "enabled.mp4"]) == 5
+    assert audits["disabled"].measured_stall_count == 1
+    assert audits["disabled"].included_stall_count == 0
+    assert audits["disabled"].expected_duration_ns == 100_000_000
+    assert audits["enabled"].measured_stall_count == 1
+    assert audits["enabled"].included_stall_count == 1
+    assert audits["enabled"].expected_duration_ns == 125_000_000
+
+
+def test_multi_frame_stall_renders_one_overlay_and_reuses_the_same_array_reference():
+    rendered_overlay = object()
+    renderer_calls = []
+
+    def renderer(frame, lines):
+        renderer_calls.append((frame, lines))
+        return rendered_overlay
+
+    stall = timing.ControlStall(0, 0, 0, 100_000_000)
+
+    frames = libero_main._build_video_frames(
+        ("frame",),
+        (stall,),
+        control_hz=20,
         video_fps=40,
-        video_show_inference_waits=False,
-        video_encoder=encoder,
+        inference_schedule="synchronous",
+        overlay_renderer=renderer,
     )
 
-    assert artifact_error is None
-    assert encoded["fps"] == 40
-    assert len(encoded["frames"]) == 5
-    assert encoded["audit"].timing_gate
-    assert calls == ["episode", "video", "reader_close", "video_audit"]
+    assert renderer_calls == [
+        (
+            "frame",
+            ("Synchronous inference", "Control stalled: 0.10 s"),
+        )
+    ]
+    assert all(frame is rendered_overlay for frame in frames[:4])
+    assert frames[4:] == ("frame", "frame")
+
+
+def test_async_latency_without_underflow_adds_no_frames_but_partial_stall_uses_async_label():
+    request = timing.InferenceRequest(0, 0, 300_000_000)
+    renderer_calls = []
+
+    no_stall_frames = libero_main._build_video_frames(
+        ("frame",),
+        (),
+        control_hz=20,
+        video_fps=40,
+        inference_schedule="asynchronous",
+        overlay_renderer=lambda frame, lines: renderer_calls.append(lines),
+    )
+    partial_stall = timing.ControlStall(
+        0,
+        0,
+        250_000_000,
+        50_000_000,
+        reason="async_action_underflow",
+    )
+    partial_frames = libero_main._build_video_frames(
+        ("frame",),
+        (partial_stall,),
+        control_hz=20,
+        video_fps=40,
+        inference_schedule="asynchronous",
+        overlay_renderer=lambda frame, lines: renderer_calls.append(lines) or "async-overlay",
+    )
+
+    assert request.duration_ns == 300_000_000
+    assert no_stall_frames == ("frame", "frame")
+    assert partial_frames == ("async-overlay", "async-overlay", "frame", "frame")
+    assert renderer_calls == [
+        ("Waiting for policy actions", "Control stalled: 0.05 s"),
+    ]
 
 
 def test_duration_only_mismatch_logs_warning_without_artifact_error(monkeypatch, caplog, tmp_path):
@@ -475,9 +586,10 @@ def test_duration_only_mismatch_logs_warning_without_artifact_error(monkeypatch,
         Writer(),
         Selector(),
         video_fps=40,
+        video_show_inference_waits=True,
         video_encoder=lambda *args, **kwargs: None,
     )
 
     assert artifact_error is None
-    assert not audits[0].timing_gate
+    assert not audits[0].timing_gate_pass
     assert "encoded duration deviates" in caplog.text

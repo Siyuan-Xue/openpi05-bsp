@@ -660,25 +660,45 @@ class VideoArtifactAudit:
     episode_id: str
     path: str
     planned: _video_timing.VideoTimingAudit
+    inference_schedule: str
+    video_show_inference_waits: bool
+    measured_stall_count: int
+    measured_control_stall_ns: int
     encoded_fps: float
     encoded_frame_count: int
     encoded_duration_ns: int
     encoded_duration_deviation_ns: int
     timing_tolerance_ns: int
-    timing_gate: bool
+    timing_gate_pass: bool
     warning: str | None = None
+
+    @property
+    def included_stall_count(self) -> int:
+        return self.planned.included_stall_count
+
+    @property
+    def included_control_stall_ns(self) -> int:
+        return self.planned.included_control_stall_ns
+
+    @property
+    def expected_duration_ns(self) -> int:
+        return self.planned.expected_duration_ns
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "episode_id": self.episode_id,
             "path": self.path,
             **self.planned.to_dict(),
+            "inference_schedule": self.inference_schedule,
+            "video_show_inference_waits": self.video_show_inference_waits,
+            "measured_stall_count": self.measured_stall_count,
+            "measured_control_stall_ns": self.measured_control_stall_ns,
             "encoded_fps": self.encoded_fps,
             "encoded_frame_count": self.encoded_frame_count,
             "encoded_duration_ns": self.encoded_duration_ns,
             "encoded_duration_deviation_ns": self.encoded_duration_deviation_ns,
             "timing_tolerance_ns": self.timing_tolerance_ns,
-            "timing_gate": self.timing_gate,
+            "timing_gate_pass": self.timing_gate_pass,
             "warning": self.warning,
         }
 
@@ -688,6 +708,10 @@ def build_video_artifact_audit(
     episode_id: str,
     path: str,
     planned: _video_timing.VideoTimingAudit,
+    measured_stalls: Sequence[_video_timing.ControlStall],
+    included_stalls: Sequence[_video_timing.ControlStall],
+    video_show_inference_waits: bool,
+    inference_schedule: str,
     encoded_fps: float,
     encoded_frame_count: int,
     encoded_duration_s: float,
@@ -697,6 +721,24 @@ def build_video_artifact_audit(
         raise ValueError("Video audit identity and path must be non-empty")
     if not isinstance(planned, _video_timing.VideoTimingAudit):
         raise TypeError("planned must be a VideoTimingAudit")
+    if not isinstance(video_show_inference_waits, bool):
+        raise ValueError("video_show_inference_waits must be a boolean")
+    _video_timing.validate_inference_schedule(inference_schedule)
+    measured_stalls = tuple(measured_stalls)
+    included_stalls = tuple(included_stalls)
+    if any(not isinstance(stall, _video_timing.ControlStall) for stall in measured_stalls):
+        raise TypeError("measured_stalls must contain ControlStall records")
+    if any(not isinstance(stall, _video_timing.ControlStall) for stall in included_stalls):
+        raise TypeError("included_stalls must contain ControlStall records")
+    expected_included_stalls = measured_stalls if video_show_inference_waits else ()
+    if included_stalls != expected_included_stalls:
+        raise ValueError("Included stalls do not match video_show_inference_waits")
+    for stall in measured_stalls:
+        _video_timing.stall_overlay_lines(stall, inference_schedule=inference_schedule)
+    if planned.included_stall_count != len(included_stalls) or planned.included_control_stall_ns != sum(
+        stall.duration_ns for stall in included_stalls
+    ):
+        raise ValueError("Planned audit does not match included control stalls")
     if (
         isinstance(encoded_fps, bool)
         or not isinstance(encoded_fps, (int, float))
@@ -730,9 +772,9 @@ def build_video_artifact_audit(
     encoded_duration_ns = round(float(encoded_duration_s) * _video_timing.NANOSECONDS_PER_SECOND)
     deviation_ns = encoded_duration_ns - planned.expected_duration_ns
     tolerance_ns = _video_timing.NANOSECONDS_PER_SECOND // planned.video_fps
-    timing_gate = abs(deviation_ns) <= tolerance_ns
+    timing_gate_pass = abs(deviation_ns) <= tolerance_ns
     warning = None
-    if not timing_gate:
+    if not timing_gate_pass:
         warning = (
             "encoded duration deviates from expected duration by "
             f"{abs(deviation_ns) / _video_timing.NANOSECONDS_PER_SECOND:.6f} s "
@@ -742,12 +784,16 @@ def build_video_artifact_audit(
         episode_id=episode_id,
         path=path,
         planned=planned,
+        inference_schedule=inference_schedule,
+        video_show_inference_waits=video_show_inference_waits,
+        measured_stall_count=len(measured_stalls),
+        measured_control_stall_ns=sum(stall.duration_ns for stall in measured_stalls),
         encoded_fps=float(encoded_fps),
         encoded_frame_count=encoded_frame_count,
         encoded_duration_ns=encoded_duration_ns,
         encoded_duration_deviation_ns=deviation_ns,
         timing_tolerance_ns=tolerance_ns,
-        timing_gate=timing_gate,
+        timing_gate_pass=timing_gate_pass,
         warning=warning,
     )
 
