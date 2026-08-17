@@ -17,6 +17,7 @@ class _GatePolicy:
         result=None,
         error=None,
         metadata=None,
+        metadata_error=None,
         return_after_cancel=False,
         ignore_cancel=False,
         close_gate=None,
@@ -25,6 +26,7 @@ class _GatePolicy:
         self.result = {"actions": [1, 2, 3]} if result is None else result
         self.error = error
         self.metadata = {"server": "test"} if metadata is None else metadata
+        self.metadata_error = metadata_error
         self.return_after_cancel = return_after_cancel
         self.ignore_cancel = ignore_cancel
         self.close_gate = close_gate
@@ -43,6 +45,8 @@ class _GatePolicy:
 
     def get_server_metadata(self):
         self.metadata_thread_ids.append(threading.get_ident())
+        if self.metadata_error is not None:
+            raise self.metadata_error
         return self.metadata
 
     def infer_packed(self, payload, *, cancel_event=None, recv_poll_interval_s=None):
@@ -103,6 +107,21 @@ class _BlockingFactory:
                 raise RuntimeError("fake connect retry cancelled")
         self.created_policies.append(self.policy)
         return self.policy
+
+
+class _GatedSequenceFactory:
+    def __init__(self, policies):
+        self.policies = list(policies)
+        self.started = [threading.Event() for _ in self.policies]
+        self.release = [threading.Event() for _ in self.policies]
+        self.cancel_events = []
+
+    def __call__(self, cancel_event):
+        index = len(self.cancel_events)
+        self.cancel_events.append(cancel_event)
+        self.started[index].set()
+        self.release[index].wait()
+        return self.policies[index]
 
 
 class _FailingFactory:
@@ -270,6 +289,73 @@ def test_queued_job_error_and_connect_share_snapshot_even_after_retirement():
     finally:
         factory.release.set()
         policy.release.set()
+        worker.close()
+
+
+def test_delayed_connect_waiter_keeps_exact_registered_attempt_across_reconnect(monkeypatch):
+    first_policy = _GatePolicy(metadata={"server": "first"}, result={"request": "first"})
+    first_policy.release.set()
+    second_policy = _GatePolicy(metadata={"server": "second"})
+    factory = _GatedSequenceFactory([first_policy, second_policy])
+    worker = async_inference.AsyncInferenceWorker(factory)
+    waiter_registered = threading.Event()
+    waiter_woke = threading.Event()
+    release_waiter = threading.Event()
+    first_connect_result = []
+    real_condition_wait = worker._condition.wait
+    delayed_once = []
+    connect_thread = None
+
+    def delayed_condition_wait(timeout=None):
+        if threading.current_thread() is connect_thread:
+            waiter_registered.set()
+        result = real_condition_wait(timeout)
+        if threading.current_thread() is connect_thread and not delayed_once:
+            delayed_once.append(True)
+            waiter_woke.set()
+            worker._condition.release()
+            try:
+                release_waiter.wait()
+            finally:
+                worker._condition.acquire()
+        return result
+
+    monkeypatch.setattr(worker._condition, "wait", delayed_condition_wait)
+
+    def connect_first():
+        first_connect_result.append(worker.connect(timeout=1.0))
+
+    try:
+        job = worker.submit({"request": "first"})
+        assert factory.started[0].wait(1.0)
+        connect_thread = threading.Thread(target=connect_first)
+        connect_thread.start()
+        assert waiter_registered.wait(1.0)
+
+        factory.release[0].set()
+        assert waiter_woke.wait(1.0)
+        first_outcome = worker.wait(job, timeout=1.0)
+        first_connection = first_outcome.connection
+
+        generation = worker.reset_generation()
+        worker.wait_until_ready(generation, timeout=1.0)
+        factory.release[1].set()
+        second_connection = worker.connect(timeout=1.0)
+
+        release_waiter.set()
+        connect_thread.join()
+        assert first_connect_result == [first_connection]
+        assert second_connection.connection_id == first_connection.connection_id + 1
+        assert msgpack_numpy.unpackb(first_connect_result[0].metadata_payload) == {"server": "first"}
+        assert msgpack_numpy.unpackb(second_connection.metadata_payload) == {"server": "second"}
+    finally:
+        release_waiter.set()
+        for release in factory.release:
+            release.set()
+        first_policy.release.set()
+        second_policy.release.set()
+        if connect_thread is not None:
+            connect_thread.join()
         worker.close()
 
 
@@ -733,6 +819,8 @@ def test_policy_close_failure_is_fatal_and_observable_on_readiness_and_close():
         assert old_policy.closed.wait(1.0)
 
         assert worker.poll(old_job).stale
+        with pytest.raises(ValueError, match="Generation 0 is not current"):
+            worker.wait_until_ready(0, timeout=1.0)
         with pytest.raises(OSError, match="close handshake failed"):
             worker.wait_until_ready(generation, timeout=1.0)
         with pytest.raises(OSError, match="close handshake failed"):
@@ -747,6 +835,67 @@ def test_policy_close_failure_is_fatal_and_observable_on_readiness_and_close():
         try:
             worker.close()
         except OSError:
+            pass
+
+
+def test_metadata_and_close_failure_publish_job_error_before_fatal_retirement():
+    metadata_error = ValueError("metadata malformed")
+    close_error = OSError("metadata candidate close failed")
+    policy = _GatePolicy(metadata_error=metadata_error, close_error=close_error)
+    worker = async_inference.AsyncInferenceWorker(_Factory([policy]))
+    try:
+        job = worker.submit({"request": "metadata-error"})
+        assert policy.closed.wait(1.0)
+
+        outcome = worker.poll(job)
+        assert outcome.error is metadata_error
+        assert outcome.completed_monotonic_ns is None
+        assert outcome.connection is None
+        with pytest.raises(OSError, match="metadata candidate close failed"):
+            worker.close()
+    finally:
+        try:
+            worker.close()
+        except OSError:
+            pass
+
+
+def test_metadata_and_close_failure_preserve_explicit_connect_error():
+    metadata_error = ValueError("metadata unavailable")
+    close_error = OSError("failed to retire metadata candidate")
+    policy = _GatePolicy(metadata_error=metadata_error, close_error=close_error)
+    worker = async_inference.AsyncInferenceWorker(_Factory([policy]))
+    try:
+        with pytest.raises(ValueError, match="metadata unavailable"):
+            worker.connect(timeout=1.0)
+        assert policy.closed.wait(1.0)
+        with pytest.raises(OSError, match="failed to retire metadata candidate"):
+            worker.close()
+    finally:
+        try:
+            worker.close()
+        except OSError:
+            pass
+
+
+def test_poll_raises_terminal_fatal_when_job_has_no_completion():
+    policy = _GatePolicy()
+    factory = _BlockingFactory(policy, ignore_cancel=True)
+    fatal_error = RuntimeError("owner terminated")
+    worker = async_inference.AsyncInferenceWorker(factory)
+    try:
+        job = worker.submit({"request": "never-completed"})
+        assert factory.started.wait(1.0)
+        worker._record_fatal_error(fatal_error)
+
+        with pytest.raises(RuntimeError, match="owner terminated"):
+            worker.poll(job)
+    finally:
+        factory.release.set()
+        policy.release.set()
+        try:
+            worker.close()
+        except RuntimeError:
             pass
 
 

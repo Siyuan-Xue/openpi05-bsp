@@ -14,6 +14,17 @@ class ConnectionSnapshot:
     metadata_payload: bytes
 
 
+@dataclasses.dataclass(frozen=True, eq=False)
+class _ConnectionAttempt:
+    generation: int
+
+
+@dataclasses.dataclass(frozen=True)
+class _ConnectionAttemptResult:
+    snapshot: Optional[ConnectionSnapshot] = None
+    error: Optional[BaseException] = None
+
+
 @dataclasses.dataclass(frozen=True)
 class InferenceJob:
     request_id: int
@@ -99,11 +110,9 @@ class AsyncInferenceWorker:
         self._cancel_event = threading.Event()
         self._cancel_pending = False
         self._retirement_pending = False
-        self._connect_requested = False
-        self._connection_error = None  # type: Optional[BaseException]
+        self._connection_attempt = None  # type: Optional[_ConnectionAttempt]
+        self._connection_attempt_results = weakref.WeakKeyDictionary()
         self._connection = None  # type: Optional[ConnectionSnapshot]
-        self._last_published_connection = None  # type: Optional[ConnectionSnapshot]
-        self._connection_publication_count = 0
         self._next_connection_id = 0
         self._fatal_error = None  # type: Optional[BaseException]
         self._closing = False
@@ -139,7 +148,6 @@ class AsyncInferenceWorker:
                 submitted_monotonic_ns=submitted_monotonic_ns,
             )
             self._next_request_id += 1
-            self._connection_error = None
             self._queued_job = job
             self._remember_job_locked(job)
             self._condition.notify_all()
@@ -158,27 +166,28 @@ class AsyncInferenceWorker:
                 return self._connection
 
             requested_generation = self._generation
-            publication_count = self._connection_publication_count
-            self._connection_error = None
-            self._connect_requested = True
+            attempt = self._connection_attempt
+            if attempt is None:
+                attempt = _ConnectionAttempt(generation=requested_generation)
+                self._connection_attempt = attempt
             self._condition.notify_all()
-            while self._connection is None:
+            while True:
+                attempt_result = self._connection_attempt_results.get(attempt)
+                if attempt_result is not None:
+                    if attempt_result.error is not None:
+                        raise attempt_result.error
+                    if attempt_result.snapshot is None:
+                        raise RuntimeError("Connection attempt result is missing its snapshot")
+                    return attempt_result.snapshot
+                if requested_generation != self._generation:
+                    raise ValueError("Connection request was invalidated by a generation reset")
                 self._raise_fatal_locked()
                 if self._closing or self._closed:
                     raise RuntimeError("Async inference worker is closed")
-                if requested_generation != self._generation:
-                    raise ValueError("Connection request was invalidated by a generation reset")
-                if self._connection_publication_count != publication_count:
-                    if self._last_published_connection is None:
-                        raise RuntimeError("Connection publication is missing its snapshot")
-                    return self._last_published_connection
-                if self._connection_error is not None and not self._connect_requested:
-                    raise self._connection_error
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
                     raise TimeoutError("Timed out waiting for async inference connection")
                 self._condition.wait(remaining)
-            return self._connection
 
     def poll(self, job: InferenceJob) -> Optional[InferenceOutcome]:
         """Return a completed outcome for exactly ``job`` without blocking or consuming it."""
@@ -186,6 +195,7 @@ class AsyncInferenceWorker:
             self._validate_job_locked(job)
             completion = self._completions.get(job.request_id)
             if completion is None:
+                self._raise_fatal_locked()
                 return None
             return self._observe_completion_locked(job.request_id, completion).for_job(job)
 
@@ -214,11 +224,11 @@ class AsyncInferenceWorker:
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._condition:
             while True:
-                self._raise_fatal_locked()
                 if generation != self._generation:
                     raise ValueError(
                         f"Generation {generation} is not current (current generation is {self._generation})"
                     )
+                self._raise_fatal_locked()
                 if self._closing or self._closed:
                     raise RuntimeError("Async inference worker is closed")
                 if not self._cancel_pending and not self._retirement_pending:
@@ -243,8 +253,7 @@ class AsyncInferenceWorker:
             if self._active_job is not None:
                 self._publish_cancelled_locked(self._active_job)
 
-            self._connect_requested = False
-            self._connection_error = None
+            self._connection_attempt = None
             self._connection = None
             self._cancel_pending = True
             self._cancel_event.set()
@@ -262,7 +271,7 @@ class AsyncInferenceWorker:
                     self._queued_job = None
                 if self._active_job is not None:
                     self._publish_cancelled_locked(self._active_job)
-                self._connect_requested = False
+                self._connection_attempt = None
                 self._connection = None
                 self._cancel_pending = True
                 self._cancel_event.set()
@@ -286,7 +295,7 @@ class AsyncInferenceWorker:
                         and self._fatal_error is None
                         and not self._cancel_pending
                         and self._queued_job is None
-                        and not self._connect_requested
+                        and self._connection_attempt is None
                     ):
                         self._condition.wait()
 
@@ -300,6 +309,10 @@ class AsyncInferenceWorker:
                     elif policy is None:
                         action = "connect"
                         job = self._queued_job
+                        connection_attempt = self._connection_attempt
+                        if connection_attempt is None:
+                            connection_attempt = _ConnectionAttempt(generation=self._generation)
+                            self._connection_attempt = connection_attempt
                     elif self._queued_job is not None:
                         action = "infer"
                         job = self._queued_job
@@ -309,8 +322,15 @@ class AsyncInferenceWorker:
                         if connection is None:
                             raise RuntimeError("Live policy is missing its connection snapshot")
                     else:
-                        self._connect_requested = False
-                        self._condition.notify_all()
+                        connection_attempt = self._connection_attempt
+                        if connection_attempt is not None:
+                            if self._connection is None:
+                                raise RuntimeError("Live policy is missing its connection snapshot")
+                            self._publish_connection_attempt_locked(
+                                connection_attempt,
+                                snapshot=self._connection,
+                            )
+                            connection_attempt = None
                         continue
 
                 if action == "retire":
@@ -328,23 +348,24 @@ class AsyncInferenceWorker:
                         candidate = self._policy_factory(cancel_event)
                         metadata_payload = msgpack_numpy.packb(candidate.get_server_metadata())
                     except BaseException as error:
-                        candidate, retirement_error = self._retire_policy(candidate)
-                        if retirement_error is not None:
-                            self._record_fatal_error(retirement_error)
-                            return
                         with self._condition:
                             cancelled = (
                                 self._closing
                                 or self._cancel_pending
                                 or cancel_event.is_set()
                                 or cancel_event is not self._cancel_event
+                                or self._fatal_error is not None
+                                or connection_attempt.generation != self._generation
+                                or self._connection_attempt is not connection_attempt
                             )
                             failed_job = self._queued_job
                             if failed_job is not None and failed_job.generation != self._generation:
                                 cancelled = True
-                            self._connect_requested = False
                             if not cancelled:
-                                self._connection_error = error
+                                self._publish_connection_attempt_locked(
+                                    connection_attempt,
+                                    error=error,
+                                )
                                 if failed_job is not None:
                                     self._queued_job = None
                                     self._publish_error_locked(
@@ -353,10 +374,18 @@ class AsyncInferenceWorker:
                                         completed_monotonic_ns=None,
                                         connection=None,
                                     )
+                            if candidate is not None:
+                                self._retirement_pending = True
                             self._condition.notify_all()
+                        candidate, retirement_error = self._retire_policy(candidate)
+                        if retirement_error is not None:
+                            self._record_fatal_error(retirement_error)
+                            return
+                        self._acknowledge_retirement()
                         if cancelled:
                             self._acknowledge_cancellation(cancel_event)
                         job = None
+                        connection_attempt = None
                         continue
 
                     with self._condition:
@@ -365,7 +394,10 @@ class AsyncInferenceWorker:
                             or self._cancel_pending
                             or cancel_event is not self._cancel_event
                             or cancel_event.is_set()
+                            or self._fatal_error is not None
                             or (job is not None and job.generation != self._generation)
+                            or connection_attempt.generation != self._generation
+                            or self._connection_attempt is not connection_attempt
                         )
                         if not candidate_is_stale:
                             connection = ConnectionSnapshot(
@@ -375,11 +407,10 @@ class AsyncInferenceWorker:
                             self._next_connection_id += 1
                             policy = candidate
                             self._connection = connection
-                            self._last_published_connection = connection
-                            self._connection_publication_count += 1
-                            self._connection_error = None
-                            self._connect_requested = False
-                            self._condition.notify_all()
+                            self._publish_connection_attempt_locked(
+                                connection_attempt,
+                                snapshot=connection,
+                            )
 
                     if candidate_is_stale:
                         candidate, retirement_error = self._retire_policy(candidate)
@@ -389,6 +420,7 @@ class AsyncInferenceWorker:
                         self._acknowledge_cancellation(cancel_event)
                     candidate = None
                     job = None
+                    connection_attempt = None
                     continue
 
                 result = None
@@ -456,7 +488,7 @@ class AsyncInferenceWorker:
             with self._condition:
                 self._queued_job = None
                 self._active_job = None
-                self._connect_requested = False
+                self._connection_attempt = None
                 self._connection = None
                 self._cancel_pending = False
                 self._retirement_pending = False
@@ -540,6 +572,25 @@ class AsyncInferenceWorker:
         self._completions[request_id] = observed_completion
         return observed_completion
 
+    def _publish_connection_attempt_locked(
+        self,
+        attempt: _ConnectionAttempt,
+        *,
+        snapshot: Optional[ConnectionSnapshot] = None,
+        error: Optional[BaseException] = None,
+    ) -> None:
+        if (snapshot is None) == (error is None):
+            raise RuntimeError("Connection attempt must publish exactly one snapshot or error")
+        if attempt in self._connection_attempt_results:
+            raise RuntimeError("Connection attempt already has a terminal result")
+        self._connection_attempt_results[attempt] = _ConnectionAttemptResult(
+            snapshot=snapshot,
+            error=error,
+        )
+        if self._connection_attempt is attempt:
+            self._connection_attempt = None
+        self._condition.notify_all()
+
     def _raise_fatal_locked(self) -> None:
         if self._fatal_error is not None:
             raise self._fatal_error
@@ -548,7 +599,7 @@ class AsyncInferenceWorker:
         with self._condition:
             if self._fatal_error is None:
                 self._fatal_error = error
-            self._connect_requested = False
+            self._connection_attempt = None
             self._connection = None
             self._condition.notify_all()
 
