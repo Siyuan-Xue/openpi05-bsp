@@ -54,9 +54,25 @@ python3 scripts/libero_compose_preflight.py
 docker compose -f examples/libero/compose.yml config >/dev/null
 docker compose -f examples/libero/compose.yml build
 
+docker compose -f examples/libero/compose.yml run --no-deps \
+  --name libero-git-identity-preflight \
+  --entrypoint /bin/bash runtime -ceu '
+    container_sha="$(git -C /app rev-parse HEAD)"
+    test "${#container_sha}" -eq 40
+    test -z "$(git -C /app status --porcelain --untracked-files=all)"
+    printf "runtime_evaluator_sha=%s\n" "$container_sha"
+  '
+
 export LIBERO_DATASET_REVISION=v2.0
 export POLICY_CONTAINER_DIGEST="$(docker image inspect openpi_server --format '{{.Id}}')"
 ```
+
+The runtime image installs Git explicitly. Compose applies
+`GIT_OPTIONAL_LOCKS=0` and exact `/app` and pinned LIBERO-submodule
+`safe.directory` entries so the
+clean-status operation used by the evaluator succeeds against the read-only
+source bind mount. The preflight above creates a retained audit container; a
+name collision is a stop condition rather than permission to remove it.
 
 The official `pi05_libero` checkpoint emits horizon 10. The following is a
 true one-task, one-rollout EGL/connectivity smoke on task 0 of

@@ -165,6 +165,51 @@ class PhaseOneServerRunbookContractTest(unittest.TestCase):
             self.runbook.index("--name libero-official-h10-task0-smoke runtime"),
         )
 
+    def test_docker_runtime_proves_automatic_git_identity(self):
+        dockerfile = (_ROOT / "examples" / "libero" / "Dockerfile").read_text()
+        compose = (_ROOT / "examples" / "libero" / "compose.yml").read_text()
+        readme = (_ROOT / "examples" / "libero" / "README.md").read_text()
+
+        apt_install = re.search(
+            r"apt-get install -y(?: --no-install-recommends)?(.*?)(?:\n\s*$|\n\s*&&)",
+            dockerfile,
+            re.DOTALL | re.MULTILINE,
+        )
+        self.assertIsNotNone(apt_install)
+        self.assertRegex(apt_install.group(1), r"(?:^|\s)git(?:\s|$)")
+
+        for value in (
+            "GIT_OPTIONAL_LOCKS=0",
+            "GIT_CONFIG_COUNT=2",
+            "GIT_CONFIG_KEY_0=safe.directory",
+            "GIT_CONFIG_VALUE_0=/app",
+            "GIT_CONFIG_KEY_1=safe.directory",
+            "GIT_CONFIG_VALUE_1=/app/third_party/libero",
+        ):
+            with self.subTest(compose_environment=value):
+                self.assertIn(value, compose)
+
+        for document in (readme, self.runbook):
+            with self.subTest(document="README" if document is readme else "runbook"):
+                self.assertIn("--name libero-git-identity-preflight", document)
+                self.assertIn("git -C /app rev-parse HEAD", document)
+                self.assertIn(
+                    "git -C /app status --porcelain --untracked-files=all", document
+                )
+                bash = "\n".join(re.findall(r"```bash\n(.*?)```", document, flags=re.DOTALL))
+                self.assertNotIn("--args.code-sha", bash)
+
+    def test_final_audit_names_ten_runs_and_three_diagnostic_artifacts(self):
+        self.assertNotIn("六个 h16/BSP 评测输入", self.runbook)
+        for fragment in (
+            "十个 h16/BSP 评测输入",
+            "历史 BSP diagnostics",
+            "schema-v3 BSP diagnostics",
+            "norm diagnostics",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, self.runbook)
+
     def test_fixed_protocol_and_audit_artifacts_are_complete(self):
         required_fragments = (
             "1,693 episodes",

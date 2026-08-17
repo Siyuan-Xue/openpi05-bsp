@@ -414,9 +414,21 @@ export MUJOCO_GL=egl
 "$OPENPI_PY" scripts/libero_compose_preflight.py
 docker compose -f examples/libero/compose.yml config --quiet
 docker compose -f examples/libero/compose.yml build
+
+docker compose -f examples/libero/compose.yml run --no-deps \
+  --name libero-git-identity-preflight \
+  -e EXPECTED_REPO_SHA="$BSP_CODE_SHA" \
+  --entrypoint /bin/bash runtime -ceu '
+    container_sha="$(git -C /app rev-parse HEAD)"
+    test "$container_sha" = "$EXPECTED_REPO_SHA"
+    test -z "$(git -C /app status --porcelain --untracked-files=all)"
+    printf "runtime_evaluator_sha=%s\n" "$container_sha"
+  '
 ```
 
 preflight 会拒绝空值、相对路径、不存在路径、根目录、普通文件和彼此重叠的 bind root。源码在两个容器内都只读；只有 simulator 的 `/experiments` 和 policy server 的 OpenPI/JAX cache 可写。policy 镜像运行时直接执行 `/.venv/bin/python`，不会再调用 uv。
+
+runtime 镜像显式安装 Git。Compose 只为只读 `/app` 和其锁定的 `third_party/libero` 子模块配置两个精确的 `safe.directory`，并通过 `GIT_OPTIONAL_LOCKS=0` 禁止可选 index refresh lock。上面的实际 runtime 容器门禁执行 evaluator 使用的同一组 `rev-parse` 和 clean-status 命令，并要求容器内 SHA 精确等于冻结的 `$BSP_CODE_SHA`。它不会恢复手工 `--args.code-sha`。预检容器会保留作审计；同名碰撞时停止，不删除旧容器。
 
 记录两张镜像的真实内容 ID，并按 `openpi_server` 后 `libero` 的固定顺序生成 manifest 要求的单一容器栈摘要：
 
@@ -588,7 +600,7 @@ print("official h10 calibration gate passed", expected)
 PY
 ```
 
-校准成功率只用来发现环境、图像、动作或版本的明显错误，不进入第一阶段 A/B 比较，也不得作为六个 h16/BSP 评测输入。
+校准成功率只用来发现环境、图像、动作或版本的明显错误，不进入第一阶段 A/B 比较，也不得作为十个 h16/BSP 评测输入。
 
 ## 7. 仅在嵌套 Docker 不可用时：隔离双环境备选
 
@@ -1548,7 +1560,7 @@ learning_curve.svg
 - `{1,2,4,8}` 在 A/B 中全部以独立进程探测，选择共同稳定且有余量的最大值；有效 batch 一直为 256。
 - A/B 各 100 optimizer-step pilot 通过，随后从同一 `pi05_base` 用 seed 42 分别完成 10k。
 - 十个不同 checkpoint 的 0k/1k/2k/5k/10k 评测各 2,000 回合，总计 20,000，且全部可审计/可配对。
-- 比较器直接读取原始 BSP/norm diagnostics，返回 0 并且只生成六个固定报告产物。
+- 比较器直接读取与十次 schema-v3 评测同一 clean SHA 生成的 schema-v3 BSP diagnostics，以及原始 norm diagnostics；历史 BSP diagnostics 只作不可变审计，返回 0 并且只生成六个固定报告产物。
 - seed 43/44 只有预留目录，没有实际运行；没有评测 2×/4×，没有选择 best checkpoint。
 
-保留 `${BSP_ROOT}/experiments/logs`、十个评测目录、两个原始 diagnostics、十个 checkpoint 和六个报告文件。它们共同构成第一阶段验收证据，不要在报告生成后重写其中任何身份文件。
+保留 `${BSP_ROOT}/experiments/logs`、十个评测目录、历史 BSP diagnostics、同一 clean SHA 刷新的 schema-v3 BSP diagnostics、原始 norm diagnostics、十个 checkpoint 和六个报告文件。这三类 diagnostics 与其余产物共同构成第一阶段验收证据，不要在报告生成后重写其中任何身份文件。

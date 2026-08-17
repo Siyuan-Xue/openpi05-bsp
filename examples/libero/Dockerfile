@@ -10,10 +10,11 @@ FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04@sha256:2d913b09e6be8387e1a109
 COPY --from=ghcr.io/astral-sh/uv:0.5.1 /uv /uvx /bin/
 
 RUN apt-get update && \
-    apt-get install -y \
+    apt-get install -y --no-install-recommends \
     make \
     g++ \
     clang \
+    git \
     libosmesa6-dev \
     libgl1-mesa-glx \
     libegl1 \
@@ -23,7 +24,8 @@ RUN apt-get update && \
     libglib2.0-0 \
     libsm6 \
     libxrender1 \
-    libxext6
+    libxext6 && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
