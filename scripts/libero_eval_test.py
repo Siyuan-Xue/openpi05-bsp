@@ -1,12 +1,12 @@
 import dataclasses
+import json
 import sys
 import types
-
-import pytest
 
 from openpi_client import inference
 from openpi_client import libero_eval
 from openpi_client import libero_video_timing as timing
+import pytest
 
 from examples.libero import main as libero_main
 
@@ -85,6 +85,42 @@ def _args():
 
 def _actions(horizon=16):
     return [[float(row + column) for column in range(7)] for row in range(horizon)]
+
+
+class _RecordingVideoBackend:
+    """Keep selector/writer/persistence real while replacing external MP4 I/O."""
+
+    def __init__(self):
+        self.frames_by_path = {}
+        self.fps_by_path = {}
+
+    def encode(self, path, frames, *, fps):
+        path.write_bytes(b"recording-video-backend")
+        self.frames_by_path[path] = tuple(
+            frame.item() if getattr(frame, "ndim", None) == 0 else frame.tolist()
+            for frame in frames
+        )
+        self.fps_by_path[path] = fps
+
+    def get_reader(self, path):
+        frames = self.frames_by_path[path]
+        fps = self.fps_by_path[path]
+
+        class Reader:
+            def get_meta_data(self):
+                return {"fps": float(fps), "duration": len(frames) / fps}
+
+            def count_frames(self):
+                return len(frames)
+
+            def close(self):
+                pass
+
+        return Reader()
+
+
+def _read_jsonl(path):
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
 def test_evaluator_defaults_to_the_real_official_dataset_revision():
@@ -285,7 +321,9 @@ def test_run_attempt_records_synchronous_request_and_stall_without_extra_steps(m
     assert len(environment.actions) == result.steps == 1
 
 
-def test_first_request_policy_failure_keeps_current_frame_without_counting_a_step(monkeypatch):
+def test_first_request_policy_failure_persists_current_frame_and_claims_first_failure_slot(
+    monkeypatch, tmp_path
+):
     environment = _Environment()
     holder = _ClientHolder([])
     monkeypatch.setattr(holder.client, "infer", lambda request: {})
@@ -316,20 +354,73 @@ def test_first_request_policy_failure_keeps_current_frame_without_counting_a_ste
     record = libero_eval.EpisodeRecord.from_attempt(
         _identity(), 42, 1, success=False, failure_kind="policy", result=result
     )
-    video_frames = libero_main._build_video_frames(
-        record.replay_frames,
-        record.control_stalls,
-        stall_source_frames=record.stall_source_frames,
-        control_hz=20,
-        video_fps=40,
-        inference_schedule="synchronous",
-        overlay_renderer=lambda frame, lines: "first-failure-overlay",
+    backend = _RecordingVideoBackend()
+    monkeypatch.setattr(libero_main.imageio, "get_reader", backend.get_reader)
+    monkeypatch.setattr(
+        libero_main,
+        "_draw_video_overlay",
+        lambda frame, lines: f"first-failure-overlay:{frame}",
     )
-    assert video_frames == ("first-failure-overlay", "first-failure-overlay")
-    assert "stall_source_frames" not in record.to_dict()
+    output_dir = tmp_path / "first-failure-run"
+    writer = libero_eval.ArtifactWriter(output_dir)
+    selector = libero_eval.VideoSelector(output_dir / "videos")
+
+    first_persisted, first_error = libero_main._persist_episode_artifacts(
+        record,
+        writer,
+        selector,
+        video_show_inference_waits=True,
+        video_encoder=backend.encode,
+    )
+    later_identity = dataclasses.replace(_identity(), init_state_index=3)
+    later_record = libero_eval.EpisodeRecord.from_attempt(
+        later_identity, 42, 1, success=False, failure_kind="policy", result=result
+    )
+    later_persisted, later_error = libero_main._persist_episode_artifacts(
+        later_record,
+        writer,
+        selector,
+        video_show_inference_waits=True,
+        video_encoder=backend.encode,
+    )
+
+    records = (first_persisted, later_persisted)
+    errors = tuple(error for error in (first_error, later_error) if error is not None)
+    summary = libero_eval.aggregate_records(records, artifact_errors=errors)
+    assert first_error is later_error is None
+
+    videos = tuple((output_dir / "videos").rglob("*.mp4"))
+    audits = _read_jsonl(output_dir / "video_audit.jsonl")
+    episodes = _read_jsonl(output_dir / "episodes.jsonl")
+    expected_video = (
+        output_dir
+        / "videos/libero_spatial/task-000-pick-up-the-block"
+        / f"failure-init-002-{first_persisted.identity.episode_id}.mp4"
+    )
+
+    assert first_persisted.steps == later_persisted.steps == 0
+    assert first_persisted.replans == later_persisted.replans == 0
+    assert first_persisted.stall_source_frames == later_persisted.stall_source_frames == ()
+    assert videos == (expected_video,)
+    assert tuple(backend.frames_by_path) == (expected_video,)
+    assert len(audits) == 1
+    assert backend.frames_by_path[expected_video] == (
+        "first-failure-overlay:current-request-frame",
+        "first-failure-overlay:current-request-frame",
+    )
+    assert audits[0]["episode_id"] == first_persisted.identity.episode_id
+    assert audits[0]["path"] == str(expected_video)
+    assert audits[0]["control_frame_count"] == 0
+    assert audits[0]["video_frame_count"] == audits[0]["encoded_frame_count"] == 2
+    assert audits[0]["artifact_padding_frame_count"] == 0
+    assert all("stall_source_frames" not in episode for episode in episodes)
+    assert summary["artifact_error_count"] == 0
+    assert summary["acceptance_complete"] is True
 
 
-def test_later_replan_policy_failure_uses_latest_observation_without_extra_action(monkeypatch):
+def test_later_replan_policy_failure_persists_latest_observation_without_extra_action(
+    monkeypatch, tmp_path
+):
     environment = _ContinuingEnvironment()
     holder = _ClientHolder([_actions(), [[float("nan")] * 7 for _ in range(16)]])
     clock = iter((1_000, 2_000, 3_000, 4_000, 50_004_000))
@@ -359,19 +450,56 @@ def test_later_replan_policy_failure_uses_latest_observation_without_extra_actio
     record = libero_eval.EpisodeRecord.from_attempt(
         _identity(), 42, 1, success=False, failure_kind="policy", result=result
     )
-    video_frames = libero_main._build_video_frames(
-        record.replay_frames,
-        record.control_stalls,
-        stall_source_frames=record.stall_source_frames,
-        control_hz=20,
-        video_fps=40,
-        inference_schedule="synchronous",
-        overlay_renderer=lambda frame, lines: "later-failure-overlay"
-        if frame == "frame-observation-8"
-        else pytest.fail("later failure used the wrong source frame"),
+    backend = _RecordingVideoBackend()
+    monkeypatch.setattr(libero_main.imageio, "get_reader", backend.get_reader)
+    monkeypatch.setattr(
+        libero_main,
+        "_draw_video_overlay",
+        lambda frame, lines: f"later-failure-overlay:{frame}",
     )
-    assert video_frames[-2:] == ("later-failure-overlay", "later-failure-overlay")
-    assert "stall_source_frames" not in record.to_dict()
+    output_dir = tmp_path / "later-failure-run"
+    writer = libero_eval.ArtifactWriter(output_dir)
+    selector = libero_eval.VideoSelector(output_dir / "videos")
+
+    persisted, artifact_error = libero_main._persist_episode_artifacts(
+        record,
+        writer,
+        selector,
+        video_show_inference_waits=True,
+        video_encoder=backend.encode,
+    )
+
+    videos = tuple((output_dir / "videos").rglob("*.mp4"))
+    audits = _read_jsonl(output_dir / "video_audit.jsonl")
+    episode = _read_jsonl(output_dir / "episodes.jsonl")[0]
+    expected_video = (
+        output_dir
+        / "videos/libero_spatial/task-000-pick-up-the-block"
+        / f"failure-init-002-{persisted.identity.episode_id}.mp4"
+    )
+    summary = libero_eval.aggregate_records(
+        (persisted,), artifact_errors=(() if artifact_error is None else (artifact_error,))
+    )
+
+    assert artifact_error is None
+    assert videos == (expected_video,)
+    assert tuple(backend.frames_by_path) == (expected_video,)
+    assert len(audits) == 1
+    assert backend.frames_by_path[expected_video][-2:] == (
+        "later-failure-overlay:frame-observation-8",
+        "later-failure-overlay:frame-observation-8",
+    )
+    assert persisted.steps == len(environment.actions) == 8
+    assert persisted.replans == 1
+    assert persisted.stall_source_frames == ()
+    assert "stall_source_frames" not in episode
+    assert audits[0]["episode_id"] == persisted.identity.episode_id
+    assert audits[0]["path"] == str(expected_video)
+    assert audits[0]["control_frame_count"] == 8
+    assert audits[0]["video_frame_count"] == audits[0]["encoded_frame_count"] == 18
+    assert audits[0]["artifact_padding_frame_count"] == 0
+    assert summary["artifact_error_count"] == 0
+    assert summary["acceptance_complete"] is True
 
 
 def test_synchronous_stall_overlay_uses_exact_current_mode_text():
@@ -388,12 +516,17 @@ def test_synchronous_stall_overlay_uses_exact_current_mode_text():
     )
 
 
-def test_network_retry_invalidates_client_and_reuses_init_state_and_seed(monkeypatch):
+def test_network_retry_persists_only_the_successful_attempt_frames(monkeypatch, tmp_path):
     environment = _Environment()
     holder = _ClientHolder([TimeoutError("stalled"), _actions()])
     initial_state = object()
     identity = _identity()
-    monkeypatch.setattr(libero_main, "_prepare_observation", lambda obs, prompt, size: ({}, "frame"))
+    request_frames = iter(("discarded-retry-frame", "accepted-retry-frame"))
+    monkeypatch.setattr(
+        libero_main,
+        "_prepare_observation",
+        lambda obs, prompt, size: ({}, next(request_frames)),
+    )
 
     def attempt(_attempt_number):
         return libero_main._run_attempt(
@@ -408,14 +541,62 @@ def test_network_retry_invalidates_client_and_reuses_init_state_and_seed(monkeyp
 
     record = libero_eval.run_episode_with_retries(identity, attempt, eval_seed=42)
 
-    assert record.success
-    assert record.attempts == 2
+    assert record.replay_frames == ("accepted-retry-frame",)
+    assert record.stall_source_frames == ()
+    assert "stall_source_frames" not in record.to_dict()
+
+    backend = _RecordingVideoBackend()
+    monkeypatch.setattr(libero_main.imageio, "get_reader", backend.get_reader)
+    output_dir = tmp_path / "retry-run"
+    writer = libero_eval.ArtifactWriter(output_dir)
+    selector = libero_eval.VideoSelector(output_dir / "videos")
+    persisted, artifact_error = libero_main._persist_episode_artifacts(
+        record,
+        writer,
+        selector,
+        video_show_inference_waits=False,
+        video_encoder=backend.encode,
+    )
+
+    videos = tuple((output_dir / "videos").rglob("*.mp4"))
+    audits = _read_jsonl(output_dir / "video_audit.jsonl")
+    episode = _read_jsonl(output_dir / "episodes.jsonl")[0]
+    expected_video = (
+        output_dir
+        / "videos/libero_spatial/task-000-pick-up-the-block"
+        / f"success-init-002-{persisted.identity.episode_id}.mp4"
+    )
+    summary = libero_eval.aggregate_records(
+        (persisted,), artifact_errors=(() if artifact_error is None else (artifact_error,))
+    )
+
+    assert artifact_error is None
+    assert persisted.success
+    assert persisted.attempts == 2
     assert holder.invalidations == 1
     assert environment.reset_states == [initial_state, initial_state]
     assert [request[inference.INFERENCE_SEED_KEY] for request in holder.client.requests] == [
         libero_eval.stable_replan_seed(42, identity, 0),
         libero_eval.stable_replan_seed(42, identity, 0),
     ]
+    assert videos == (expected_video,)
+    assert tuple(backend.frames_by_path) == (expected_video,)
+    assert len(audits) == 1
+    assert backend.frames_by_path[expected_video] == (
+        "accepted-retry-frame",
+        "accepted-retry-frame",
+    )
+    assert persisted.steps == 1
+    assert persisted.replans == 1
+    assert persisted.stall_source_frames == ()
+    assert "stall_source_frames" not in episode
+    assert audits[0]["episode_id"] == persisted.identity.episode_id
+    assert audits[0]["path"] == str(expected_video)
+    assert audits[0]["control_frame_count"] == 1
+    assert audits[0]["video_frame_count"] == audits[0]["encoded_frame_count"] == 2
+    assert audits[0]["artifact_padding_frame_count"] == 0
+    assert summary["artifact_error_count"] == 0
+    assert summary["acceptance_complete"] is True
 
 
 def test_episode_is_persisted_before_video_error_is_audited(tmp_path):
@@ -796,8 +977,8 @@ def test_zero_quantized_first_wait_encodes_overlay_padding_without_fabricating_c
     )
 
     assert artifact_error is None
-    assert audits[0].control_frame_count == 0
-    assert audits[0].video_frame_count == 0
+    assert audits[0].planned.control_frame_count == 0
+    assert audits[0].planned.video_frame_count == 0
     assert audits[0].artifact_padding_frame_count == 1
     assert audits[0].encoded_frame_count == 1
     assert encoded == [("wait-overlay",)]
@@ -969,29 +1150,6 @@ def test_selected_zero_step_failure_without_request_frame_is_an_artifact_error(t
     assert errors == [artifact_error]
 
 
-def test_discarded_infrastructure_attempt_cannot_leak_transient_frames_into_retry_record():
-    discarded = libero_eval.AttemptResult(
-        success=False,
-        steps=0,
-        replans=0,
-        failure_kind="policy",
-        stall_source_frames=((0, "discarded-frame"),),
-    )
-
-    def attempt(attempt_number):
-        if attempt_number == 1:
-            assert discarded.stall_source_frames == ((0, "discarded-frame"),)
-            raise libero_eval.InfrastructureFailure("network", "retry this attempt")
-        return libero_eval.AttemptResult(success=True, steps=1, replans=1)
-
-    record = libero_eval.run_episode_with_retries(_identity(), attempt, eval_seed=42)
-
-    assert record.success
-    assert record.attempts == 2
-    assert record.stall_source_frames == ()
-    assert "stall_source_frames" not in record.to_dict()
-
-
 def test_async_latency_without_underflow_adds_no_frames_but_partial_stall_uses_async_label():
     request = timing.InferenceRequest(0, 0, 300_000_000)
     renderer_calls = []
@@ -1056,6 +1214,7 @@ def test_duration_only_mismatch_logs_warning_without_artifact_error(monkeypatch,
             pass
 
     monkeypatch.setattr(libero_main.imageio, "get_reader", lambda path: Reader())
+    monkeypatch.setattr(libero_main, "_draw_video_overlay", lambda frame, lines: frame)
     attempt = libero_eval.AttemptResult(
         success=True,
         steps=2,
