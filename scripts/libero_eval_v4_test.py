@@ -516,6 +516,26 @@ class _WaitFailureWorker(FakeWorker):
         raise ConnectionError("blocked request transport failed")
 
 
+class _InvalidSubmitTimestampWorker(FakeWorker):
+    def submit(self, request):
+        job = super().submit(request)
+        job.submitted_monotonic_ns = None
+        return job
+
+
+def test_post_submit_validation_failure_cancels_the_owned_job():
+    clock = ManualClock()
+    worker = _InvalidSubmitTimestampWorker(clock, [_ScriptedCall(0, _rtc_response())])
+
+    result = _run(clock, worker, FakeEnvironment(done_after_real_steps=1))
+
+    assert result.failure_kind == "policy"
+    assert "submit timestamp" in result.error
+    assert worker.reset_calls == 2
+    assert worker.ready_calls == [1, 2]
+    assert worker._pending is None
+
+
 def test_blocking_wait_failure_keeps_pending_owned_until_reset_acknowledgement():
     clock = ManualClock()
     worker = _WaitFailureWorker(clock, [_ScriptedCall(100 * NS_PER_MS, _rtc_response())])
@@ -526,6 +546,42 @@ def test_blocking_wait_failure_keeps_pending_owned_until_reset_acknowledgement()
 
     assert worker.reset_calls == 2
     assert worker.ready_calls == [1, 2]
+
+
+class _TakeActionFailureScheduler(_BackgroundScheduler):
+    def take_action(self, now_ns):
+        if self.phase == 1 and self.action_index == 1:
+            raise ValueError("active background policy failure")
+        return super().take_action(now_ns)
+
+
+def test_policy_failure_return_gate_abandons_and_acknowledges_active_background_job():
+    clock = ManualClock()
+    worker = FakeWorker(
+        clock,
+        [
+            _ScriptedCall(0, {"ok": True}),
+            _ScriptedCall(500 * NS_PER_MS, {"ok": True}),
+        ],
+    )
+
+    result = _run(
+        clock,
+        worker,
+        FakeEnvironment(done_after_real_steps=20),
+        args=_args(execution_mode="baseline_rtc"),
+        scheduler=_TakeActionFailureScheduler(),
+    )
+
+    assert result.failure_kind == "policy"
+    assert "active background policy failure" in result.error
+    assert [event.disposition for event in result.inference_requests] == [
+        "activated",
+        "abandoned",
+    ]
+    assert worker.reset_calls == 2
+    assert worker.ready_calls == [1, 2]
+    assert worker._pending is None
 
 
 def test_infrastructure_exhaustion_resets_and_acknowledges_every_attempt():
