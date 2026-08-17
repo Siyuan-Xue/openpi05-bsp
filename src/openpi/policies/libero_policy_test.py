@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 
+from openpi import transforms
 from openpi.policies import libero_policy
 from openpi.training import bsp as training_bsp
 
@@ -78,3 +79,39 @@ def test_bsp_libero_outputs_reject_parameters_that_overflow_the_float32_sidecar(
 
     with pytest.raises(ValueError, match="finite float32"):
         libero_policy.BspLiberoOutputs()({"actions": target})
+
+
+def test_composed_output_transforms_capture_parameters_after_quantile_unnormalize():
+    unnormalized = _valid_bsp_output().astype(np.float64)
+    q01 = np.linspace(-2.0, 1.5, 8, dtype=np.float64)
+    q99 = q01 + np.linspace(2.0, 5.5, 8, dtype=np.float64)
+    stats = transforms.NormStats(
+        mean=np.zeros(8, dtype=np.float64),
+        std=np.ones(8, dtype=np.float64),
+        q01=q01,
+        q99=q99,
+    )
+    normalized = np.zeros((16, 32), dtype=np.float64)
+    normalized[:, :8] = (unnormalized[:, :8] - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
+    output_transform = transforms.compose(
+        (
+            transforms.Unnormalize({"actions": stats}, use_quantiles=True),
+            libero_policy.BspLiberoOutputs(),
+        )
+    )
+
+    output = output_transform({"actions": normalized})
+
+    np.testing.assert_allclose(
+        output["bsp"]["parameters"],
+        unnormalized[:, :8].astype(np.float32),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    assert not np.allclose(output["bsp"]["parameters"], normalized[:, :8])
+    np.testing.assert_allclose(
+        output["actions"],
+        training_bsp.decode_actions(unnormalized[:, :8]),
+        rtol=1e-6,
+        atol=1e-6,
+    )

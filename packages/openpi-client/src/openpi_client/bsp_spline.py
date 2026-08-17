@@ -183,11 +183,12 @@ class BspPrefetchDecision:
 
 
 class BspActionPlan:
-    """Own one active curve and its activation clock, but no transport or clock source."""
+    """Own one active curve and a nondecreasing caller-supplied clock, but no transport."""
 
     def __init__(self) -> None:
         self._spline = None  # type: Optional[BspSpline]
         self._activation_time_ns = None  # type: Optional[int]
+        self._high_water_now_ns = None  # type: Optional[int]
 
     @property
     def spline(self) -> Optional[BspSpline]:
@@ -198,50 +199,71 @@ class BspActionPlan:
         return self._activation_time_ns
 
     def install(self, bsp_mapping: Mapping, *, activation_time_ns: int) -> BspSpline:
-        """Validate then immediately replace the curve and reset its clock."""
+        """Validate then replace the curve at or after every previously observed timestamp."""
         validated_activation = _require_nonnegative_ns(activation_time_ns, name="activation_time_ns")
         candidate = BspSpline.from_response(bsp_mapping)
+        self._require_at_or_after_high_water(validated_activation, name="activation_time_ns")
         self._spline = candidate
         self._activation_time_ns = validated_activation
+        self._high_water_now_ns = validated_activation
         return candidate
 
     def sample(self, now_ns: int) -> BspPlanSample:
         """Sample at wall-clock time, clamping only below the spline's lower bound."""
         validated_now = _require_nonnegative_ns(now_ns, name="now_ns")
         spline, activation_time_ns = self._require_active()
+        self._require_observation_time(validated_now, activation_time_ns)
         spline_time = self._spline_time(validated_now, spline, activation_time_ns)
         if spline_time > spline.t_max:
-            return BspPlanSample(action=None, spline_time=spline_time, underflow=True)
-        evaluation_time = max(spline_time, spline.t_min)
-        return BspPlanSample(
-            action=spline.evaluate(evaluation_time),
-            spline_time=evaluation_time,
-            underflow=False,
-        )
+            result = BspPlanSample(action=None, spline_time=spline_time, underflow=True)
+        else:
+            evaluation_time = max(spline_time, spline.t_min)
+            result = BspPlanSample(
+                action=spline.evaluate(evaluation_time),
+                spline_time=evaluation_time,
+                underflow=False,
+            )
+        self._high_water_now_ns = validated_now
+        return result
 
     def remaining_time_ns(self, now_ns: int) -> int:
         """Return wall-clock nanoseconds until the closed right endpoint."""
         validated_now = _require_nonnegative_ns(now_ns, name="now_ns")
         spline, activation_time_ns = self._require_active()
-        return self._remaining_time_ns(validated_now, spline, activation_time_ns)
+        self._require_observation_time(validated_now, activation_time_ns)
+        result = self._remaining_time_ns(validated_now, spline, activation_time_ns)
+        self._high_water_now_ns = validated_now
+        return result
 
     def prefetch_decision(self, now_ns: int, *, lead_time_ns: int) -> BspPrefetchDecision:
         """Decide whether a caller-supplied calibrated lead time has been reached."""
         validated_now = _require_nonnegative_ns(now_ns, name="now_ns")
         validated_lead = _require_nonnegative_ns(lead_time_ns, name="lead_time_ns")
         spline, activation_time_ns = self._require_active()
+        self._require_observation_time(validated_now, activation_time_ns)
         spline_time = self._spline_time(validated_now, spline, activation_time_ns)
         remaining_time_ns = self._remaining_time_ns(validated_now, spline, activation_time_ns)
-        return BspPrefetchDecision(
+        result = BspPrefetchDecision(
             remaining_time_ns=remaining_time_ns,
             should_prefetch=remaining_time_ns <= validated_lead,
             underflow=spline_time > spline.t_max,
         )
+        self._high_water_now_ns = validated_now
+        return result
 
     def _require_active(self):
         if self._spline is None or self._activation_time_ns is None:
             raise RuntimeError("BSP action plan has no installed curve")
         return self._spline, self._activation_time_ns
+
+    def _require_observation_time(self, now_ns: int, activation_time_ns: int) -> None:
+        if now_ns < activation_time_ns:
+            raise ValueError("now_ns must not precede activation_time_ns")
+        self._require_at_or_after_high_water(now_ns, name="now_ns")
+
+    def _require_at_or_after_high_water(self, value_ns: int, *, name: str) -> None:
+        if self._high_water_now_ns is not None and value_ns < self._high_water_now_ns:
+            raise ValueError("{} must not precede the observed high-water now_ns".format(name))
 
     @staticmethod
     def _spline_time(now_ns: int, spline: BspSpline, activation_time_ns: int) -> float:

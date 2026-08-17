@@ -296,6 +296,87 @@ def test_plan_rejects_monotonic_clock_regression_before_activation():
         plan.prefetch_decision(99, lead_time_ns=0)
 
 
+def test_plan_rejects_sample_rewind_after_a_later_sample_and_allows_equality():
+    activation_time_ns = 1_000_000_000
+    plan = bsp_spline.BspActionPlan()
+    plan.install(_response(), activation_time_ns=activation_time_ns)
+
+    first = plan.sample(activation_time_ns + 200_000_000)
+    equal = plan.sample(activation_time_ns + 200_000_000)
+
+    np.testing.assert_array_equal(equal.action, first.action)
+    with pytest.raises(ValueError, match="high-water"):
+        plan.sample(activation_time_ns + 100_000_000)
+
+
+def test_plan_rejects_cross_method_rewind_without_reverting_prefetch_state():
+    activation_time_ns = 2_000_000_000
+    plan = bsp_spline.BspActionPlan()
+    plan.install(_constant_response(1.0), activation_time_ns=activation_time_ns)
+
+    assert plan.remaining_time_ns(activation_time_ns + 300_000_000) == 600_000_000
+    with pytest.raises(ValueError, match="high-water"):
+        plan.prefetch_decision(activation_time_ns + 200_000_000, lead_time_ns=600_000_000)
+
+    equal = plan.prefetch_decision(activation_time_ns + 300_000_000, lead_time_ns=600_000_000)
+    later = plan.prefetch_decision(activation_time_ns + 400_000_000, lead_time_ns=500_000_000)
+    assert equal.should_prefetch
+    assert later.should_prefetch
+    with pytest.raises(ValueError, match="high-water"):
+        plan.remaining_time_ns(activation_time_ns + 399_999_999)
+    assert not plan.sample(activation_time_ns + 400_000_000).underflow
+
+
+def test_plan_rejects_install_before_high_water_and_allows_immediate_swap_at_high_water():
+    activation_time_ns = 3_000_000_000
+    current_time_ns = activation_time_ns + 200_000_000
+    plan = bsp_spline.BspActionPlan()
+    plan.install(_constant_response(5.0), activation_time_ns=activation_time_ns)
+    plan.sample(current_time_ns)
+
+    with pytest.raises(ValueError, match="high-water"):
+        plan.install(_constant_response(7.0), activation_time_ns=current_time_ns - 1)
+
+    assert plan.activation_time_ns == activation_time_ns
+    np.testing.assert_array_equal(plan.sample(current_time_ns).action, np.full(7, 5.0, dtype=np.float32))
+
+    plan.install(_constant_response(7.0), activation_time_ns=current_time_ns)
+    swapped = plan.sample(current_time_ns)
+    assert plan.activation_time_ns == current_time_ns
+    assert swapped.spline_time == 0.0
+    np.testing.assert_array_equal(swapped.action, np.full(7, 7.0, dtype=np.float32))
+
+
+def test_invalid_install_preserves_plan_and_high_water_transactionally():
+    activation_time_ns = 4_000_000_000
+    current_time_ns = activation_time_ns + 300_000_000
+    plan = bsp_spline.BspActionPlan()
+    plan.install(_constant_response(9.0), activation_time_ns=activation_time_ns)
+    plan.sample(current_time_ns)
+    malformed = _constant_response(11.0)
+    malformed["degree"] = 2
+
+    with pytest.raises(ValueError, match="degree"):
+        plan.install(malformed, activation_time_ns=current_time_ns + 100_000_000)
+
+    assert plan.activation_time_ns == activation_time_ns
+    np.testing.assert_array_equal(plan.sample(current_time_ns).action, np.full(7, 9.0, dtype=np.float32))
+    with pytest.raises(ValueError, match="high-water"):
+        plan.sample(current_time_ns - 1)
+
+
+def test_invalid_prefetch_does_not_advance_high_water():
+    activation_time_ns = 5_000_000_000
+    plan = bsp_spline.BspActionPlan()
+    plan.install(_constant_response(3.0), activation_time_ns=activation_time_ns)
+    plan.sample(activation_time_ns + 100_000_000)
+
+    with pytest.raises(ValueError, match="lead_time_ns"):
+        plan.prefetch_decision(activation_time_ns + 300_000_000, lead_time_ns=True)
+
+    assert not plan.sample(activation_time_ns + 200_000_000).underflow
+
+
 def test_invalid_install_leaves_the_active_curve_and_clock_unchanged():
     plan = bsp_spline.BspActionPlan()
     plan.install(_constant_response(5.0), activation_time_ns=100)
