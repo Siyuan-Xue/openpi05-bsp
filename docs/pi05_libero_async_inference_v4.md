@@ -139,7 +139,9 @@ run-fatal，即使已有 primary error 也必须同时保留 cleanup failure。
 
 ## schema-v4 产物与报告隔离
 
-每个新且为空的 output directory 只由 v4 writer 原子写入：
+每个 v4 run 独占一个新且为空的 output directory。`ArtifactWriterV4` 以原子替换写入其中的
+JSON/JSONL 结构化产物；MP4 路径由 `VideoSelectorV4` 预留，随后由编码器直接写入并通过
+`video_audit.jsonl` 复核：
 
 - `manifest.json`：冻结 mode、capability/metadata、checkpoint/runtime/cache identity 与校准原始样本；
 - `episodes.jsonl`：episode/retry 状态和 request、latency、activation、underflow、stall 时序；
