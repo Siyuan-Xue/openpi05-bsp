@@ -13,6 +13,10 @@ scripts/serve_policy.py       <----> openpi-client + examples/libero/main.py
 完整路径、EGL 和评测协议见 [服务器 runbook](pi05_libero_bsp_phase1_server.md)；本页只说明
 通信边界。
 
+schema-v4 的四模式异步推理、权威算法映射、动态 latency calibration 与服务器验证交接见
+[pi0.5 LIBERO 异步推理与 schema v4](pi05_libero_async_inference_v4.md)。v4 使用独立入口与产物，
+不会改变本页描述的旧 evaluator/schema-v3 语义。
+
 ## `openpi-client` 是什么
 
 `packages/openpi-client` 是轻量 Python 包，不含模型权重或 JAX。它保留：

@@ -13,6 +13,7 @@ prevents this example from drifting into a second operations guide.
 | File | Role |
 |---|---|
 | `main.py` | Four-suite evaluator, deterministic seeds, retry classification, and per-episode artifacts |
+| `main_v4.py` | Schema-v4 four-mode evaluator with calibrated single-owner asynchronous inference |
 | `requirements.in` | Direct simulator dependencies |
 | `requirements.txt` | Locked Python 3.8 installation input |
 
@@ -49,3 +50,10 @@ The paired reporter compares baseline and BSP only at `0 / 1000 / 2000 / 5000 / 
 dataset, code, cache, normalization, runtime, and seed identity from each manifest rather than inferring identity from
 directory names. Formal comparisons accept schema v3 only; schema-v2 outputs
 remain immutable archive inputs and are never mixed or auto-upgraded.
+
+## Async inference schema v4
+
+The v4 entry point and artifacts are separate from the v3 workflow above. Its four frozen execution modes, protocol
+and calibration rules, authoritative BSP/RTC references, and post-push server verification handoff are documented in
+[the schema-v4 async inference guide](../../docs/pi05_libero_async_inference_v4.md). Use
+`examples/libero/main_v4.py` with its `ArgsV4` options; do not route v4 outputs through the legacy reporter.
