@@ -6,6 +6,7 @@ unexecuted on this checkout.  Task 5 verification is server-only.
 
 import dataclasses
 import json
+from pathlib import Path
 
 import pytest
 
@@ -41,16 +42,22 @@ def _checkpoint_identity(*, bsp=False):
     )
 
 
-def _calibration(mode_name):
+def _calibration(
+    mode_name,
+    *,
+    suite="libero_spatial",
+    task_id=0,
+    init_state_index=0,
+):
     identity = _checkpoint_identity(bsp=mode_name == "bsp_spline_async")
     return control.LatencyCalibrationV1.create(
         execution_mode=mode_name,
         checkpoint_identity_fingerprint=identity.fingerprint,
         server_metadata_fingerprint=_SHA,
         canonical_observation_identity=control.CalibrationObservationIdentityV1(
-            suite="libero_spatial",
-            task_id=0,
-            init_state_index=0,
+            suite=suite,
+            task_id=task_id,
+            init_state_index=init_state_index,
             init_state_fingerprint="3" * 64,
             request_fingerprint="4" * 64,
         ),
@@ -303,6 +310,31 @@ def test_manifest_binds_family_protocol_cache_and_async_calibration_identity():
             make_manifest()
 
 
+@pytest.mark.parametrize("mode_name", ("baseline_rtc", "bsp_spline_async"))
+@pytest.mark.parametrize(
+    ("identity_field", "mismatched_value"),
+    (
+        ("suite", "libero_object"),
+        ("task_id", 1),
+        ("init_state_index", 1),
+    ),
+)
+def test_async_manifest_binds_calibration_to_first_selected_rollout(
+    mode_name,
+    identity_field,
+    mismatched_value,
+):
+    calibration = _calibration(
+        mode_name,
+        **{identity_field: mismatched_value},
+    )
+    with pytest.raises(ValueError, match="canonical observation"):
+        dataclasses.replace(
+            _manifest(mode_name),
+            latency_calibration=calibration,
+        )
+
+
 def test_episode_record_round_trip_has_exact_fields_and_revalidates_stable_seeds():
     identity = _identity()
     attempt = _attempt(identity)
@@ -403,6 +435,44 @@ def test_retry_discards_failed_attempt_metrics_and_restarts_final_attempt_ids_an
     assert record.infrastructure_history == (
         {"attempt": 1, "kind": "network", "error": "disconnect"},
     )
+
+
+def test_retry_propagates_policy_failure_instead_of_fabricating_an_empty_attempt():
+    failure = evaluation.PolicyFailure("failed after recording inference timing")
+    calls = []
+
+    def attempt(attempt_number):
+        calls.append(attempt_number)
+        raise failure
+
+    with pytest.raises(evaluation.PolicyFailure) as caught:
+        evaluation.run_episode_with_retries_v4(
+            _identity(),
+            attempt,
+            eval_seed=42,
+            execution_mode="baseline_sync_n5",
+        )
+    assert caught.value is failure
+    assert calls == [1]
+
+
+def test_retry_preserves_a_returned_policy_failure_attempt_and_its_final_timing():
+    identity = _identity()
+    failed_attempt = _attempt(identity, success=False)
+
+    record = evaluation.run_episode_with_retries_v4(
+        identity,
+        lambda _attempt_number: failed_attempt,
+        eval_seed=42,
+        execution_mode="baseline_sync_n5",
+    )
+
+    assert record.status == "policy_failure"
+    assert record.inference_requests == failed_attempt.inference_requests
+    assert record.inference_latencies == failed_attempt.inference_latencies
+    assert record.plan_activations == failed_attempt.plan_activations
+    assert record.action_underflows == failed_attempt.action_underflows
+    assert record.control_stalls == failed_attempt.control_stalls
 
 
 def test_infrastructure_exhaustion_is_denominator_ineligible_with_empty_metrics():
@@ -551,6 +621,92 @@ def test_aggregate_excludes_infrastructure_and_writer_emits_only_v4_artifacts(tm
     assert (tmp_path / "video_audit.jsonl").read_text() == ""
     assert not (tmp_path / "tasks.csv").exists()
     assert not (tmp_path / "suites.csv").exists()
+
+
+def test_each_v4_jsonl_append_leaves_old_bytes_unchanged_on_serialization_or_replace_failure(
+    tmp_path,
+    monkeypatch,
+):
+    record = evaluation.EpisodeRecordV4.from_attempt(
+        _identity(),
+        42,
+        1,
+        execution_mode="baseline_sync_n5",
+        result=_attempt(),
+    )
+    planned = timing.build_video_timing_audit_v4(
+        control_frame_count=record.steps,
+        requests=record.inference_requests,
+        latencies=record.inference_latencies,
+        activations=record.plan_activations,
+        underflows=record.action_underflows,
+        stalls=record.control_stalls,
+        include_stalls=True,
+    )
+    audit = evaluation.build_video_artifact_audit_v4(
+        episode=record,
+        path="videos/example.mp4",
+        planned=planned,
+        video_show_inference_waits=True,
+        encoded_fps=40,
+        encoded_frame_count=planned.video_frame_count,
+        encoded_duration_s=planned.expected_duration_ns / 1_000_000_000,
+    )
+    artifact_error = evaluation.ArtifactErrorV4(
+        episode_id=record.episode_id,
+        artifact_type="video",
+        path="videos/example.mp4",
+        error="encode failed",
+    )
+    writer = evaluation.ArtifactWriterV4(tmp_path)
+    operations = (
+        (
+            writer.episodes_path,
+            writer.append_episode,
+            record,
+            evaluation.EpisodeRecordV4,
+        ),
+        (
+            writer.video_audit_path,
+            writer.append_video_audit,
+            audit,
+            evaluation.VideoArtifactAuditV4,
+        ),
+        (
+            writer.artifact_errors_path,
+            writer.append_artifact_error,
+            artifact_error,
+            evaluation.ArtifactErrorV4,
+        ),
+    )
+    original_bytes = b'{"existing": 1}\n'
+
+    for path, append, payload, payload_type in operations:
+        path.write_bytes(original_bytes)
+        with monkeypatch.context() as scoped:
+            scoped.setattr(
+                payload_type,
+                "to_dict",
+                lambda _self: {"unserializable": object()},
+            )
+            with pytest.raises(TypeError):
+                append(payload)
+        assert path.read_bytes() == original_bytes
+
+    original_replace = Path.replace
+    for path, append, payload, _payload_type in operations:
+        path.write_bytes(original_bytes)
+
+        def fail_target_replace(source, target, *, expected_path=path):
+            if Path(target) == expected_path:
+                raise OSError("injected atomic replace failure")
+            return original_replace(source, target)
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(Path, "replace", fail_target_replace)
+            with pytest.raises(OSError, match="injected atomic replace failure"):
+                append(payload)
+        assert path.read_bytes() == original_bytes
 
 
 def test_video_selector_claims_only_the_first_success_and_counted_failure(tmp_path):

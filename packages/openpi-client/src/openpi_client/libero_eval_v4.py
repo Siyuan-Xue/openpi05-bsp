@@ -11,6 +11,7 @@ from collections.abc import Callable
 from collections.abc import Mapping
 from collections.abc import Sequence
 import dataclasses
+import json
 import math
 from pathlib import Path
 import re
@@ -469,8 +470,8 @@ class EvaluationManifestV4:
         )
         if not _json_values_match(self.bsp_parameters, dict(BSP_PARAMETERS)):
             raise ValueError("bsp_parameters must match the frozen LIBERO BSP identity")
+        calibration = self.latency_calibration
         if mode.asynchronous:
-            calibration = self.latency_calibration
             if not isinstance(calibration, _control.LatencyCalibrationV1):
                 raise ValueError("asynchronous modes require LatencyCalibrationV1")
             calibration.to_dict()
@@ -492,6 +493,22 @@ class EvaluationManifestV4:
         )
         if not task_ids or task_ids != tuple(sorted(set(task_ids))):
             raise ValueError("task_ids must be non-empty, unique, and sorted")
+        if mode.asynchronous:
+            if not isinstance(calibration, _control.LatencyCalibrationV1):
+                raise ValueError("asynchronous modes require LatencyCalibrationV1")
+            canonical = calibration.canonical_observation_identity
+            if canonical.suite != suites[0]:
+                raise ValueError(
+                    "calibration canonical observation suite must match suites[0]"
+                )
+            if canonical.task_id != task_ids[0]:
+                raise ValueError(
+                    "calibration canonical observation task_id must match task_ids[0]"
+                )
+            if canonical.init_state_index != 0:
+                raise ValueError(
+                    "calibration canonical observation init_state_index must be zero"
+                )
         _require_integer(self.trials_per_task, name="trials_per_task", minimum=1)
         _require_nonnegative_integer(self.num_steps_wait, name="num_steps_wait")
         if set(self.max_steps_by_suite) != set(suites):
@@ -1088,16 +1105,6 @@ def run_episode_with_retries_v4(
     for attempt_number in range(1, infrastructure_retries + 2):
         try:
             result = attempt(attempt_number)
-        except PolicyFailure as error:
-            result = AttemptResultV4(
-                execution_mode=execution_mode,
-                success=False,
-                steps=0,
-                replans=0,
-                episode_duration_ns=0,
-                failure_kind="policy",
-                error=str(error),
-            )
         except InfrastructureFailure as error:
             history.append(
                 {"attempt": attempt_number, "kind": error.kind, "error": str(error)}
@@ -1505,6 +1512,17 @@ class VideoSelectorV4:
         )
 
 
+def _atomic_append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
+    encoded_line = (
+        json.dumps(payload, sort_keys=True, allow_nan=False) + "\n"
+    ).encode("utf-8")
+    existing = path.read_bytes() if path.exists() else b""
+    if existing and not existing.endswith(b"\n"):
+        raise ValueError("existing JSONL artifact must end with a complete newline")
+    combined = (existing + encoded_line).decode("utf-8")
+    libero_artifacts.atomic_text(path, combined)
+
+
 class ArtifactWriterV4:
     """Persist schema-v4 artifacts without invoking any schema-v3 producer."""
 
@@ -1535,17 +1553,17 @@ class ArtifactWriterV4:
     def append_episode(self, record: EpisodeRecordV4) -> None:
         if not isinstance(record, EpisodeRecordV4):
             raise ValueError("record must be EpisodeRecordV4")
-        libero_artifacts.append_jsonl(self.episodes_path, record.to_dict())
+        _atomic_append_jsonl(self.episodes_path, record.to_dict())
 
     def append_video_audit(self, audit: VideoArtifactAuditV4) -> None:
         if not isinstance(audit, VideoArtifactAuditV4):
             raise ValueError("audit must be VideoArtifactAuditV4")
-        libero_artifacts.append_jsonl(self.video_audit_path, audit.to_dict())
+        _atomic_append_jsonl(self.video_audit_path, audit.to_dict())
 
     def append_artifact_error(self, error: ArtifactErrorV4) -> None:
         if not isinstance(error, ArtifactErrorV4):
             raise ValueError("error must be ArtifactErrorV4")
-        libero_artifacts.append_jsonl(self.artifact_errors_path, error.to_dict())
+        _atomic_append_jsonl(self.artifact_errors_path, error.to_dict())
 
     def write_summary(
         self,
