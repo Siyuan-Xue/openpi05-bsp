@@ -137,6 +137,22 @@ def test_bootstrap_pops_both_envelopes_forces_n5_and_captures_before_output_tran
     assert np.all(result["actions"] == seen["output"][0][:, :7] + 1000)
 
 
+def test_schema_only_bootstrap_can_be_repeated_as_the_baseline_sync_n5_protocol(monkeypatch):
+    policy_instance, seen = _fake_policy()
+    policy_instance._sample_kwargs = {"num_steps": 99}
+    monkeypatch.setattr(policy._model.Observation, "from_dict", staticmethod(lambda inputs: object()))
+    request = {"raw": np.asarray([3.0]), inference.RTC_REQUEST_KEY: {"schema_version": 1}}
+
+    first = policy_instance.infer(request)
+    second = policy_instance.infer(request)
+
+    assert [kwargs for _, kwargs in seen["legacy"]] == [{"num_steps": 5}, {"num_steps": 5}]
+    assert not seen["rtc"]
+    assert first["rtc"]["model_actions"].shape == (16, 32)
+    assert second["rtc"]["model_actions"].shape == (16, 32)
+    assert request[inference.RTC_REQUEST_KEY] == {"schema_version": 1}
+
+
 def test_guided_request_routes_fixed_sampler_with_prepared_target_mask_and_noise(monkeypatch):
     policy_instance, seen = _fake_policy()
     policy_instance._sample_kwargs = {"num_steps": 71}
@@ -189,10 +205,13 @@ def test_rtc_request_rejects_bsp_unknown_wrong_shape_or_missing_hook(
 def test_guided_request_rejects_unrelated_sampler_kwargs(monkeypatch):
     policy_instance, _ = _fake_policy()
     policy_instance._sample_kwargs = {"num_steps": 5, "temperature": 0.4}
+    initial_rng = policy_instance._rng
     monkeypatch.setattr(policy._model.Observation, "from_dict", staticmethod(lambda inputs: object()))
 
     with pytest.raises(ValueError, match="sampler kwargs"):
         policy_instance.infer(_guided_observation())
+
+    _assert_key_equal(policy_instance._rng, initial_rng)
 
 
 class _FakeModel:

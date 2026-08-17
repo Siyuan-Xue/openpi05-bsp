@@ -114,45 +114,27 @@ class Policy(BasePolicy):
         # pop_inference_seed copies the top-level mapping so the caller is not mutated.
         inputs, inference_seed = _inference.pop_inference_seed(obs)
         inputs, rtc_context = _inference.pop_rtc_context(inputs)
+        rtc_sample_call = None
         if rtc_context is not None:
             self._validate_rtc_capability()
+            rtc_sample_call = self._prepare_rtc_sample_call(rtc_context, noise=noise)
         # Make a tree copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, inputs)
         inputs = self._input_transform(inputs)
         inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
         self._rng, sample_rng = _select_jax_inference_rng(self._rng, inference_seed)
 
-        # Prepare kwargs for sample_actions
-        sample_kwargs = dict(self._sample_kwargs)
-        if noise is not None:
-            noise = jnp.asarray(noise)
-
-            if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
-                noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
-            sample_kwargs["noise"] = noise
-
-        sample_actions = self._sample_actions
-        if rtc_context is not None:
-            unsupported_kwargs = set(sample_kwargs) - {"num_steps", "noise"}
-            if unsupported_kwargs:
-                names = ", ".join(sorted(unsupported_kwargs))
-                raise ValueError(f"RTC does not support configured sampler kwargs: {names}")
-            if rtc_context.is_bootstrap:
-                sample_kwargs["num_steps"] = _pi0.RTC_NUM_STEPS
-            else:
-                assert rtc_context.previous_model_actions is not None
-                assert rtc_context.s is not None
-                assert rtc_context.d is not None
-                target, weights = _pi0.make_rtc_target_and_weights(
-                    rtc_context.previous_model_actions,
-                    s=rtc_context.s,
-                    d=rtc_context.d,
-                )
-                sample_kwargs.pop("num_steps", None)
-                sample_kwargs["target"] = target[None, ...]
-                sample_kwargs["weights"] = weights
-                assert self._sample_actions_rtc is not None
-                sample_actions = self._sample_actions_rtc
+        if rtc_sample_call is None:
+            # Preserve the legacy callable and kwargs preparation path exactly.
+            sample_actions = self._sample_actions
+            sample_kwargs = dict(self._sample_kwargs)
+            if noise is not None:
+                noise = jnp.asarray(noise)
+                if noise.ndim == 2:
+                    noise = noise[None, ...]
+                sample_kwargs["noise"] = noise
+        else:
+            sample_actions, sample_kwargs = rtc_sample_call
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
@@ -194,6 +176,37 @@ class Policy(BasePolicy):
             raise ValueError("RTC requests require model action shape (16, 32)")
         if getattr(self, "_sample_actions_rtc", None) is None:
             raise ValueError("RTC requests require a model RTC sampling hook")
+
+    def _prepare_rtc_sample_call(self, rtc_context, *, noise):
+        """Validate RTC-only kwargs and targets before advancing stateful RNG."""
+        sample_kwargs = dict(self._sample_kwargs)
+        if noise is not None:
+            noise = jnp.asarray(noise)
+            if noise.ndim == 2:
+                noise = noise[None, ...]
+            sample_kwargs["noise"] = noise
+
+        unsupported_kwargs = set(sample_kwargs) - {"num_steps", "noise"}
+        if unsupported_kwargs:
+            names = ", ".join(sorted(unsupported_kwargs))
+            raise ValueError(f"RTC does not support configured sampler kwargs: {names}")
+        if rtc_context.is_bootstrap:
+            sample_kwargs["num_steps"] = _pi0.RTC_NUM_STEPS
+            return self._sample_actions, sample_kwargs
+
+        assert rtc_context.previous_model_actions is not None
+        assert rtc_context.s is not None
+        assert rtc_context.d is not None
+        target, weights = _pi0.make_rtc_target_and_weights(
+            rtc_context.previous_model_actions,
+            s=rtc_context.s,
+            d=rtc_context.d,
+        )
+        sample_kwargs.pop("num_steps", None)
+        sample_kwargs["target"] = target[None, ...]
+        sample_kwargs["weights"] = weights
+        assert self._sample_actions_rtc is not None
+        return self._sample_actions_rtc, sample_kwargs
 
     @property
     def metadata(self) -> dict[str, Any]:
