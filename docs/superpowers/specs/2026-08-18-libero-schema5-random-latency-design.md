@@ -1,7 +1,7 @@
 # LIBERO schema-v5 配对随机延迟异步实验设计
 
-日期：2026-08-18  
-基线：`main@3861651ca0f63895926c491dd21dda2194e643a7`  
+日期：2026-08-18
+基线：`main@3861651ca0f63895926c491dd21dda2194e643a7`
 保护 tag：`pre-random-latency-schema4-3861651`
 
 ## 1. 目标与结论边界
