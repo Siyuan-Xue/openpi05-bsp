@@ -36,19 +36,23 @@ empty output directory. Formal commands omit `--args.code-sha`: the evaluator
 records the clean checkout HEAD automatically. Selected videos are audited in
 `video_audit.jsonl`.
 
-## Schema v4 async latency experiment
+## Schema v5 paired random-latency experiment
 
-The four-mode evaluator is `examples/libero/main_v4.py`. It keeps the schema-v3
-20 Hz/40 FPS artifact guarantees while adding baseline RTC, continuous BSP
-scheduling, a single-owner asynchronous WebSocket worker, and auditable
-synthetic result-availability latency. The v4 video overlay is one persistent
-`Cumulative inference wait: X.XX s` line with no solid background, and selected
-videos are streamed to the encoder one frame at a time.
+The three-mode evaluator is `examples/libero/main_v5.py`. It compares plain
+baseline async, continuity-guided baseline RTC, and continuous BSP async under
+the same deterministic paired `Normal(300 ms, 60 ms)` request targets. The
+fixed theoretical scheduling budget is 400 ms (eight 20 Hz ticks); empirical
+calibration remains audit-only. Fixed latency targets and synchronous modes are
+not exposed by the schema-v5 CLI.
 
-Do not mix v3 and v4 artifacts or compare runs with different synthetic latency
-targets. The complete capacity-scan, formal-run, server-gate, and interpretation
-contract is in
-[`docs/pi05_libero_latency_experiment_v4.md`](../../docs/pi05_libero_latency_experiment_v4.md).
+The v5 video overlay is one persistent `Cumulative inference wait: X.XX s`
+line with no solid background. Only real action-underflow stalls freeze video;
+hidden async latency does not. Selected videos are streamed to the encoder one
+frame at a time.
+
+Do not mix v3 and v5 artifacts. The complete sampling, three-mode report,
+server-gate, formal-run approval boundary, and interpretation contract is in
+[`docs/pi05_libero_latency_experiment_v5.md`](../../docs/pi05_libero_latency_experiment_v5.md).
 
 ## With Docker (recommended)
 
