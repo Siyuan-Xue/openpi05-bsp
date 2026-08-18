@@ -778,21 +778,16 @@ def test_failed_and_abandoned_requests_have_exactly_the_allowed_relations():
     )
 
 
-def test_reason_alone_selects_overlay_and_mixed_stalls_quantize_cumulatively():
+def test_wait_overlay_is_one_persistent_cumulative_line_and_stalls_quantize_cumulatively():
     stalls = (
         _stall(0, 0, 0, 12_500_000, reason="synchronous_inference"),
         _stall(1, 1, 20_000_000, 12_500_000, reason="async_action_underflow"),
         _stall(2, 2, 40_000_000, 12_500_000, reason="synchronous_inference"),
     )
 
-    assert timing.stall_overlay_lines_v5(stalls[0]) == (
-        "Synchronous inference",
-        "Control stalled: 0.01 s",
-    )
-    assert timing.stall_overlay_lines_v5(stalls[1]) == (
-        "Waiting for policy actions",
-        "Control stalled: 0.01 s",
-    )
+    assert timing.cumulative_wait_overlay_line_v5(0) == ("Cumulative inference wait: 0.00 s",)
+    assert timing.cumulative_wait_overlay_line_v5(12_500_000) == ("Cumulative inference wait: 0.01 s",)
+    assert timing.cumulative_wait_overlay_line_v5(37_500_000) == ("Cumulative inference wait: 0.04 s",)
     assert timing.quantize_stall_frames_v5(stalls) == (0, 1, 0)
 
     audit = timing.build_video_timing_audit_v5(

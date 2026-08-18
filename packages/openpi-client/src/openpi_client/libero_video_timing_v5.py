@@ -977,15 +977,11 @@ def validate_video_frequencies_v5(*, control_hz: int = CONTROL_HZ, video_fps: in
     return video // control
 
 
-def stall_overlay_lines_v5(stall: ControlStallV5) -> Tuple[str, str]:
-    """Choose presentation text solely from the measured stall reason."""
-    if not isinstance(stall, ControlStallV5):
-        raise TypeError("stall must be a ControlStallV5 record")
-    stall._validate()
-    label = (
-        "Synchronous inference" if stall.reason == STALL_REASON_SYNCHRONOUS_INFERENCE else "Waiting for policy actions"
-    )
-    return label, "Control stalled: {:.2f} s".format(stall.duration_ns / NANOSECONDS_PER_SECOND)
+def cumulative_wait_overlay_line_v5(cumulative_wait_ns: int) -> Tuple[str]:
+    """Return the single persistent schema-v5 wait annotation."""
+    wait_ns = _require_nonnegative_integer(cumulative_wait_ns, name="cumulative_wait_ns")
+    centiseconds = (wait_ns + 5_000_000) // 10_000_000
+    return ("Cumulative inference wait: {}.{:02d} s".format(centiseconds // 100, centiseconds % 100),)
 
 
 def expand_control_frames_v5(

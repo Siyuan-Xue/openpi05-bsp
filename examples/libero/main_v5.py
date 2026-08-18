@@ -1226,13 +1226,6 @@ def _run_attempt_v5(
         raise
 
 
-def _cumulative_wait_line_v5(cumulative_wait_ns: int) -> Tuple[str, ...]:
-    if isinstance(cumulative_wait_ns, bool) or not isinstance(cumulative_wait_ns, int) or cumulative_wait_ns < 0:
-        raise ValueError("cumulative_wait_ns must be a nonnegative integer")
-    centiseconds = (cumulative_wait_ns + 5_000_000) // 10_000_000
-    return (f"Cumulative inference wait: {centiseconds // 100}.{centiseconds % 100:02d} s",)
-
-
 def _draw_cumulative_wait_overlay_v5(frame: Any, lines: Tuple[str, ...]) -> Any:
     """Draw one persistent line without covering the frame with a solid box."""
     if not isinstance(lines, tuple) or len(lines) != 1 or not isinstance(lines[0], str):
@@ -1308,7 +1301,7 @@ def _iter_video_frames_v5(
                     )
                     yield _timing.render_overlay_v5(
                         source,
-                        _cumulative_wait_line_v5(displayed_wait_ns),
+                        _timing.cumulative_wait_overlay_line_v5(displayed_wait_ns),
                         renderer=renderer,
                     )
                 cumulative_wait_ns += stall.duration_ns
@@ -1316,7 +1309,7 @@ def _iter_video_frames_v5(
             if include_stalls:
                 yield _timing.render_overlay_v5(
                     frame,
-                    _cumulative_wait_line_v5(cumulative_wait_ns),
+                    _timing.cumulative_wait_overlay_line_v5(cumulative_wait_ns),
                     renderer=renderer,
                 )
             else:
@@ -1335,7 +1328,7 @@ def _iter_video_frames_v5(
                 )
                 yield _timing.render_overlay_v5(
                     source_by_step[frame_count],
-                    _cumulative_wait_line_v5(displayed_wait_ns),
+                    _timing.cumulative_wait_overlay_line_v5(displayed_wait_ns),
                     renderer=renderer,
                 )
 
@@ -1414,7 +1407,7 @@ def _persist_episode_artifacts_v5(
                 if video_show_inference_waits:
                     source = _timing.render_overlay_v5(
                         source,
-                        _cumulative_wait_line_v5(0),
+                        _timing.cumulative_wait_overlay_line_v5(0),
                         renderer=_draw_cumulative_wait_overlay_v5,
                     )
                 stream.append_data(np.asarray(source))
