@@ -1,4 +1,4 @@
-"""Strict schema-v4 timing events and deterministic LIBERO video timing.
+"""Strict schema-v5 timing events and deterministic LIBERO video timing.
 
 The controller owns event measurement.  This module owns only immutable event
 records, fail-closed cross-event validation, and integer video accounting.  It
@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from collections.abc import Sequence
 import copy
 import dataclasses
+import math
 from types import MappingProxyType
 from typing import Any
 from typing import Dict
@@ -21,6 +22,8 @@ from typing import Optional
 from typing import Tuple
 from typing import Type
 from typing import TypeVar
+
+from openpi_client import latency_sampling
 
 
 CONTROL_HZ = 20
@@ -35,23 +38,18 @@ _DISPATCHES = frozenset(("blocking_initial", "blocking_replan", "background"))
 _TRIGGERS = frozenset(
     (
         "initial_plan",
-        "baseline_chunk_exhausted",
+        "baseline_async_launch",
         "rtc_launch",
-        "bsp_curve_exhausted",
         "bsp_prefetch",
     )
 )
 _DISPOSITIONS = frozenset(("activated", "failed", "abandoned"))
 _LATENCY_OUTCOMES = frozenset(("success", "policy_failure"))
 _ACTIVATIONS = frozenset(("initial", "blocking_replace", "immediate_swap"))
-_STALL_REASONS = frozenset(
-    (STALL_REASON_SYNCHRONOUS_INFERENCE, STALL_REASON_ASYNC_ACTION_UNDERFLOW)
-)
-_EXECUTION_MODES = frozenset(
-    ("baseline_sync_n5", "baseline_rtc", "bsp_spline_sync", "bsp_spline_async")
-)
-_NATIVE_MODES = frozenset(("baseline_sync_n5", "baseline_rtc"))
-_ASYNC_MODES = frozenset(("baseline_rtc", "bsp_spline_async"))
+_STALL_REASONS = frozenset((STALL_REASON_SYNCHRONOUS_INFERENCE, STALL_REASON_ASYNC_ACTION_UNDERFLOW))
+_EXECUTION_MODES = frozenset(("baseline_async", "baseline_rtc", "bsp_spline_async"))
+_NATIVE_MODES = frozenset(("baseline_async", "baseline_rtc"))
+_ASYNC_MODES = _EXECUTION_MODES
 
 _REQUEST_FIELDS = frozenset(
     (
@@ -64,6 +62,8 @@ _REQUEST_FIELDS = frozenset(
         "trigger",
         "scheduler_context",
         "disposition",
+        "latency_sample_key",
+        "sampled_target_latency_ns",
     )
 )
 _LATENCY_FIELDS = frozenset(
@@ -76,6 +76,18 @@ _LATENCY_FIELDS = frozenset(
         "raw_inference_latency_ns",
         "synthetic_delay_ns",
         "effective_inference_latency_ns",
+        "sampled_target_latency_ns",
+    )
+)
+_SEAM_FIELDS = frozenset(
+    (
+        "clock",
+        "plan_id",
+        "request_id",
+        "control_step",
+        "arm_l2_jump",
+        "arm_max_abs_jump",
+        "gripper_abs_jump",
     )
 )
 _ACTIVATION_FIELDS = frozenset(
@@ -89,12 +101,8 @@ _ACTIVATION_FIELDS = frozenset(
         "activation_context",
     )
 )
-_UNDERFLOW_FIELDS = frozenset(
-    ("clock", "request_id", "control_step", "started_offset_ns", "duration_ns")
-)
-_STALL_FIELDS = frozenset(
-    ("clock", "request_id", "control_step", "started_offset_ns", "duration_ns", "reason")
-)
+_UNDERFLOW_FIELDS = frozenset(("clock", "request_id", "control_step", "started_offset_ns", "duration_ns"))
+_STALL_FIELDS = frozenset(("clock", "request_id", "control_step", "started_offset_ns", "duration_ns", "reason"))
 _AUDIT_FIELDS = frozenset(
     (
         "control_hz",
@@ -184,11 +192,11 @@ def _context_copy(value: Any, *, label: str) -> Dict[str, Any]:
 
 
 def _validate_scheduler_context(trigger: str, context: Mapping[str, Any]) -> None:
-    if trigger in ("initial_plan", "baseline_chunk_exhausted", "bsp_curve_exhausted"):
+    if trigger == "initial_plan":
         if context:
             raise ValueError("{} scheduler context must be empty".format(trigger))
         return
-    if trigger == "rtc_launch":
+    if trigger in ("baseline_async_launch", "rtc_launch"):
         if set(context) != {"s", "d"}:
             raise ValueError("RTC scheduler context must contain exactly s and d")
         s = _require_integer(context["s"], name="RTC s", minimum=8, maximum=16)
@@ -198,12 +206,8 @@ def _validate_scheduler_context(trigger: str, context: Mapping[str, Any]) -> Non
         return
     if trigger == "bsp_prefetch":
         if set(context) != {"remaining_plan_ns", "budget_ns"}:
-            raise ValueError(
-                "BSP prefetch context must contain exactly remaining_plan_ns and budget_ns"
-            )
-        remaining = _require_nonnegative_integer(
-            context["remaining_plan_ns"], name="remaining_plan_ns"
-        )
+            raise ValueError("BSP prefetch context must contain exactly remaining_plan_ns and budget_ns")
+        remaining = _require_nonnegative_integer(context["remaining_plan_ns"], name="remaining_plan_ns")
         budget = _require_nonnegative_integer(context["budget_ns"], name="budget_ns")
         if remaining > budget:
             raise ValueError("BSP prefetch requires remaining_plan_ns <= budget_ns")
@@ -220,13 +224,11 @@ def _validate_activation_context(context: Mapping[str, Any]) -> None:
         if elapsed != 0:
             raise ValueError("BSP activation curve_elapsed_ns must be zero")
         return
-    raise ValueError(
-        "activation_context must contain exactly action_cursor or curve_elapsed_ns"
-    )
+    raise ValueError("activation_context must contain exactly action_cursor or curve_elapsed_ns")
 
 
 @dataclasses.dataclass(frozen=True)
-class RequestEventV4:
+class RequestEventV5:
     request_id: int
     observation_control_step: int
     submitted_offset_ns: int
@@ -235,6 +237,8 @@ class RequestEventV4:
     trigger: str
     scheduler_context: Mapping[str, int]
     disposition: str
+    latency_sample_key: latency_sampling.LatencySampleKeyV1
+    sampled_target_latency_ns: int
 
     def __post_init__(self) -> None:
         context = _context_copy(self.scheduler_context, label="scheduler_context")
@@ -243,25 +247,28 @@ class RequestEventV4:
 
     def _validate(self) -> None:
         _require_nonnegative_integer(self.request_id, name="request_id")
-        _require_nonnegative_integer(
-            self.observation_control_step, name="observation_control_step"
-        )
+        _require_nonnegative_integer(self.observation_control_step, name="observation_control_step")
         _require_nonnegative_integer(self.submitted_offset_ns, name="submitted_offset_ns")
         _require_integer(self.flow_seed, name="flow_seed", minimum=0, maximum=2**32 - 1)
         _require_enum(self.dispatch, _DISPATCHES, name="request dispatch")
         _require_enum(self.trigger, _TRIGGERS, name="request trigger")
         _require_enum(self.disposition, _DISPOSITIONS, name="request disposition")
+        if not isinstance(self.latency_sample_key, latency_sampling.LatencySampleKeyV1):
+            raise ValueError("latency_sample_key must be a LatencySampleKeyV1")
+        if self.latency_sample_key.request_ordinal != self.request_id:
+            raise ValueError("latency sample request_ordinal must equal request_id")
+        _require_nonnegative_integer(
+            self.sampled_target_latency_ns,
+            name="sampled_target_latency_ns",
+        )
         expected_dispatch = {
             "initial_plan": "blocking_initial",
-            "baseline_chunk_exhausted": "blocking_replan",
+            "baseline_async_launch": "background",
             "rtc_launch": "background",
-            "bsp_curve_exhausted": "blocking_replan",
             "bsp_prefetch": "background",
         }[self.trigger]
         if self.dispatch != expected_dispatch:
-            raise ValueError(
-                "request trigger {} requires dispatch {}".format(self.trigger, expected_dispatch)
-            )
+            raise ValueError("request trigger {} requires dispatch {}".format(self.trigger, expected_dispatch))
         _validate_scheduler_context(self.trigger, self.scheduler_context)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -276,10 +283,12 @@ class RequestEventV4:
             "trigger": self.trigger,
             "scheduler_context": dict(self.scheduler_context),
             "disposition": self.disposition,
+            "latency_sample_key": self.latency_sample_key.to_dict(),
+            "sampled_target_latency_ns": self.sampled_target_latency_ns,
         }
 
     @classmethod
-    def from_dict(cls, value: Any) -> "RequestEventV4":
+    def from_dict(cls, value: Any) -> "RequestEventV5":
         payload = _require_exact_fields(value, _REQUEST_FIELDS, label="request event")
         _validate_clock(payload, label="request event")
         return cls(
@@ -289,15 +298,15 @@ class RequestEventV4:
             flow_seed=payload["flow_seed"],
             dispatch=payload["dispatch"],
             trigger=payload["trigger"],
-            scheduler_context=_require_json_object(
-                payload["scheduler_context"], label="scheduler_context"
-            ),
+            scheduler_context=_require_json_object(payload["scheduler_context"], label="scheduler_context"),
             disposition=payload["disposition"],
+            latency_sample_key=latency_sampling.LatencySampleKeyV1.from_dict(payload["latency_sample_key"]),
+            sampled_target_latency_ns=payload["sampled_target_latency_ns"],
         )
 
 
 @dataclasses.dataclass(frozen=True)
-class LatencyEventV4:
+class LatencyEventV5:
     request_id: int
     completed_offset_ns: int
     duration_ns: int
@@ -305,6 +314,7 @@ class LatencyEventV4:
     raw_inference_latency_ns: Optional[int] = None
     synthetic_delay_ns: Optional[int] = None
     effective_inference_latency_ns: Optional[int] = None
+    sampled_target_latency_ns: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.raw_inference_latency_ns is None:
@@ -313,6 +323,8 @@ class LatencyEventV4:
             object.__setattr__(self, "synthetic_delay_ns", 0)
         if self.effective_inference_latency_ns is None:
             object.__setattr__(self, "effective_inference_latency_ns", self.duration_ns)
+        if self.sampled_target_latency_ns is None:
+            object.__setattr__(self, "sampled_target_latency_ns", self.duration_ns)
         self._validate()
 
     def _validate(self) -> None:
@@ -331,6 +343,10 @@ class LatencyEventV4:
             self.effective_inference_latency_ns,
             name="effective_inference_latency_ns",
         )
+        sampled_ns = _require_nonnegative_integer(
+            self.sampled_target_latency_ns,
+            name="sampled_target_latency_ns",
+        )
         _require_enum(self.outcome, _LATENCY_OUTCOMES, name="latency outcome")
         if raw_ns + synthetic_ns != effective_ns:
             raise ValueError("raw plus synthetic latency must equal effective latency")
@@ -338,6 +354,8 @@ class LatencyEventV4:
             raise ValueError("duration_ns must equal effective_inference_latency_ns")
         if self.duration_ns > self.completed_offset_ns:
             raise ValueError("latency duration cannot begin before the episode origin")
+        if effective_ns != max(raw_ns, sampled_ns):
+            raise ValueError("effective latency must equal max(raw latency, sampled target)")
 
     def to_dict(self) -> Dict[str, Any]:
         self._validate()
@@ -350,10 +368,11 @@ class LatencyEventV4:
             "raw_inference_latency_ns": self.raw_inference_latency_ns,
             "synthetic_delay_ns": self.synthetic_delay_ns,
             "effective_inference_latency_ns": self.effective_inference_latency_ns,
+            "sampled_target_latency_ns": self.sampled_target_latency_ns,
         }
 
     @classmethod
-    def from_dict(cls, value: Any) -> "LatencyEventV4":
+    def from_dict(cls, value: Any) -> "LatencyEventV5":
         payload = _require_exact_fields(value, _LATENCY_FIELDS, label="latency event")
         _validate_clock(payload, label="latency event")
         return cls(
@@ -364,11 +383,86 @@ class LatencyEventV4:
             raw_inference_latency_ns=payload["raw_inference_latency_ns"],
             synthetic_delay_ns=payload["synthetic_delay_ns"],
             effective_inference_latency_ns=payload["effective_inference_latency_ns"],
+            sampled_target_latency_ns=payload["sampled_target_latency_ns"],
         )
 
 
 @dataclasses.dataclass(frozen=True)
-class PlanActivationV4:
+class ActionSeamV5:
+    plan_id: int
+    request_id: int
+    control_step: int
+    arm_l2_jump: float
+    arm_max_abs_jump: float
+    gripper_abs_jump: float
+
+    def __post_init__(self) -> None:
+        self._validate()
+
+    def _validate(self) -> None:
+        for name in ("plan_id", "request_id", "control_step"):
+            _require_nonnegative_integer(getattr(self, name), name=name)
+        for name in ("arm_l2_jump", "arm_max_abs_jump", "gripper_abs_jump"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError("{} must be numeric".format(name))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError("{} must be finite and nonnegative".format(name))
+
+    @classmethod
+    def from_actions(
+        cls,
+        *,
+        plan_id: int,
+        request_id: int,
+        control_step: int,
+        previous_action: Sequence[float],
+        activated_action: Sequence[float],
+    ) -> "ActionSeamV5":
+        if len(previous_action) < 7 or len(activated_action) < 7:
+            raise ValueError("seam actions must contain six arm values and one gripper value")
+        previous = tuple(float(value) for value in previous_action[:7])
+        activated = tuple(float(value) for value in activated_action[:7])
+        if any(not math.isfinite(value) for value in previous + activated):
+            raise ValueError("seam actions must be finite")
+        arm_deltas = tuple(activated[index] - previous[index] for index in range(6))
+        return cls(
+            plan_id=plan_id,
+            request_id=request_id,
+            control_step=control_step,
+            arm_l2_jump=math.sqrt(sum(value * value for value in arm_deltas)),
+            arm_max_abs_jump=max(abs(value) for value in arm_deltas),
+            gripper_abs_jump=abs(activated[6] - previous[6]),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        self._validate()
+        return {
+            "clock": EPISODE_MONOTONIC_CLOCK,
+            "plan_id": self.plan_id,
+            "request_id": self.request_id,
+            "control_step": self.control_step,
+            "arm_l2_jump": float(self.arm_l2_jump),
+            "arm_max_abs_jump": float(self.arm_max_abs_jump),
+            "gripper_abs_jump": float(self.gripper_abs_jump),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "ActionSeamV5":
+        payload = _require_exact_fields(value, _SEAM_FIELDS, label="action seam")
+        _validate_clock(payload, label="action seam")
+        return cls(
+            plan_id=payload["plan_id"],
+            request_id=payload["request_id"],
+            control_step=payload["control_step"],
+            arm_l2_jump=payload["arm_l2_jump"],
+            arm_max_abs_jump=payload["arm_max_abs_jump"],
+            gripper_abs_jump=payload["gripper_abs_jump"],
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class PlanActivationV5:
     plan_id: int
     request_id: int
     control_step: int
@@ -402,7 +496,7 @@ class PlanActivationV4:
         }
 
     @classmethod
-    def from_dict(cls, value: Any) -> "PlanActivationV4":
+    def from_dict(cls, value: Any) -> "PlanActivationV5":
         payload = _require_exact_fields(value, _ACTIVATION_FIELDS, label="plan activation")
         _validate_clock(payload, label="plan activation")
         return cls(
@@ -411,14 +505,12 @@ class PlanActivationV4:
             control_step=payload["control_step"],
             activated_offset_ns=payload["activated_offset_ns"],
             activation=payload["activation"],
-            activation_context=_require_json_object(
-                payload["activation_context"], label="activation_context"
-            ),
+            activation_context=_require_json_object(payload["activation_context"], label="activation_context"),
         )
 
 
 @dataclasses.dataclass(frozen=True)
-class ActionUnderflowV4:
+class ActionUnderflowV5:
     request_id: int
     control_step: int
     started_offset_ns: int
@@ -444,7 +536,7 @@ class ActionUnderflowV4:
         }
 
     @classmethod
-    def from_dict(cls, value: Any) -> "ActionUnderflowV4":
+    def from_dict(cls, value: Any) -> "ActionUnderflowV5":
         payload = _require_exact_fields(value, _UNDERFLOW_FIELDS, label="action underflow")
         _validate_clock(payload, label="action underflow")
         return cls(
@@ -456,7 +548,7 @@ class ActionUnderflowV4:
 
 
 @dataclasses.dataclass(frozen=True)
-class ControlStallV4:
+class ControlStallV5:
     request_id: int
     control_step: int
     started_offset_ns: int
@@ -485,7 +577,7 @@ class ControlStallV4:
         }
 
     @classmethod
-    def from_dict(cls, value: Any) -> "ControlStallV4":
+    def from_dict(cls, value: Any) -> "ControlStallV5":
         payload = _require_exact_fields(value, _STALL_FIELDS, label="control stall")
         _validate_clock(payload, label="control stall")
         return cls(
@@ -497,9 +589,7 @@ class ControlStallV4:
         )
 
 
-def _records_tuple(
-    values: Sequence[_Record], record_type: Type[_Record], *, label: str
-) -> Tuple[_Record, ...]:
+def _records_tuple(values: Sequence[_Record], record_type: Type[_Record], *, label: str) -> Tuple[_Record, ...]:
     if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
         raise ValueError("{} must be a sequence".format(label))
     records = tuple(values)
@@ -511,7 +601,7 @@ def _records_tuple(
 
 
 def _stable_flow_seeds(
-    requests: Sequence[RequestEventV4],
+    requests: Sequence[RequestEventV5],
     *,
     eval_seed: int,
     identity: Any,
@@ -522,32 +612,31 @@ def _stable_flow_seeds(
     try:
         from openpi_client.libero_eval import stable_replan_seed
 
-        return tuple(
-            stable_replan_seed(eval_seed, identity, request.request_id) for request in requests
-        )
+        return tuple(stable_replan_seed(eval_seed, identity, request.request_id) for request in requests)
     except (AttributeError, TypeError, ValueError) as error:
         raise ValueError("identity is invalid for stable flow-seed derivation") from error
 
 
-def validate_timing_events_v4(
+def validate_timing_events_v5(
     *,
-    requests: Sequence[RequestEventV4],
-    latencies: Sequence[LatencyEventV4],
-    activations: Sequence[PlanActivationV4],
-    underflows: Sequence[ActionUnderflowV4],
-    stalls: Sequence[ControlStallV4],
+    requests: Sequence[RequestEventV5],
+    latencies: Sequence[LatencyEventV5],
+    activations: Sequence[PlanActivationV5],
+    underflows: Sequence[ActionUnderflowV5],
+    stalls: Sequence[ControlStallV5],
     steps: int,
     episode_duration_ns: int,
     execution_mode: str,
     eval_seed: int,
     identity: Any,
     expected_bsp_prefetch_budget_ns: Optional[int] = None,
+    verify_sampled_targets: bool = False,
 ) -> Tuple[
-    Tuple[RequestEventV4, ...],
-    Tuple[LatencyEventV4, ...],
-    Tuple[PlanActivationV4, ...],
-    Tuple[ActionUnderflowV4, ...],
-    Tuple[ControlStallV4, ...],
+    Tuple[RequestEventV5, ...],
+    Tuple[LatencyEventV5, ...],
+    Tuple[PlanActivationV5, ...],
+    Tuple[ActionUnderflowV5, ...],
+    Tuple[ControlStallV5, ...],
 ]:
     """Validate one final-attempt event graph.
 
@@ -557,16 +646,16 @@ def validate_timing_events_v4(
     Raises:
         ValueError: If a record, mode relation, seed, order, or interval is invalid.
     """
-    request_records = _records_tuple(requests, RequestEventV4, label="requests")
-    latency_records = _records_tuple(latencies, LatencyEventV4, label="latencies")
-    activation_records = _records_tuple(activations, PlanActivationV4, label="activations")
-    underflow_records = _records_tuple(underflows, ActionUnderflowV4, label="underflows")
-    stall_records = _records_tuple(stalls, ControlStallV4, label="stalls")
+    request_records = _records_tuple(requests, RequestEventV5, label="requests")
+    latency_records = _records_tuple(latencies, LatencyEventV5, label="latencies")
+    activation_records = _records_tuple(activations, PlanActivationV5, label="activations")
+    underflow_records = _records_tuple(underflows, ActionUnderflowV5, label="underflows")
+    stall_records = _records_tuple(stalls, ControlStallV5, label="stalls")
     step_count = _require_nonnegative_integer(steps, name="steps")
-    duration = _require_nonnegative_integer(
-        episode_duration_ns, name="episode_duration_ns"
-    )
+    duration = _require_nonnegative_integer(episode_duration_ns, name="episode_duration_ns")
     _require_enum(execution_mode, _EXECUTION_MODES, name="execution mode")
+    if type(verify_sampled_targets) is not bool:
+        raise ValueError("verify_sampled_targets must be boolean")
     if not request_records:
         raise ValueError("timing event graph must contain an initial request")
 
@@ -576,9 +665,8 @@ def validate_timing_events_v4(
         identity=identity,
     )
     expected_later_request = {
-        "baseline_sync_n5": ("blocking_replan", "baseline_chunk_exhausted"),
+        "baseline_async": ("background", "baseline_async_launch"),
         "baseline_rtc": ("background", "rtc_launch"),
-        "bsp_spline_sync": ("blocking_replan", "bsp_curve_exhausted"),
         "bsp_spline_async": ("background", "bsp_prefetch"),
     }[execution_mode]
     if execution_mode == "bsp_spline_async":
@@ -608,6 +696,20 @@ def validate_timing_events_v4(
             raise ValueError("request submission is past episode_duration_ns")
         if request.flow_seed != expected_seed:
             raise ValueError("request flow_seed does not match its stable logical request id")
+        expected_sample_key = latency_sampling.LatencySampleKeyV1(
+            namespace="formal",
+            seed=eval_seed,
+            suite=identity.suite,
+            task_id=identity.task_id,
+            trial_index=identity.init_state_index,
+            request_ordinal=request.request_id,
+        )
+        if request.latency_sample_key != expected_sample_key:
+            raise ValueError("request latency sample key does not match its episode identity")
+        if verify_sampled_targets:
+            expected_target = latency_sampling.NormalLatencySamplerV1().sample_target_ns(expected_sample_key)
+            if request.sampled_target_latency_ns != expected_target:
+                raise ValueError("request sampled target does not match the frozen schema-v5 sampler")
         if expected_id == 0:
             if (
                 request.dispatch != "blocking_initial"
@@ -628,7 +730,7 @@ def validate_timing_events_v4(
         raise ValueError("all BSP prefetch requests must record one calibrated budget")
 
     requests_by_id = {request.request_id: request for request in request_records}
-    latencies_by_id: Dict[int, LatencyEventV4] = {}
+    latencies_by_id: Dict[int, LatencyEventV5] = {}
     previous_latency_id = -1
     previous_completion = -1
     for latency in latency_records:
@@ -662,18 +764,17 @@ def validate_timing_events_v4(
             raise ValueError("failed request must have a policy_failure latency")
         if request.disposition == "failed" and index != len(request_records) - 1:
             raise ValueError("a policy failure must terminate the request sequence")
+        if latency.sampled_target_latency_ns != request.sampled_target_latency_ns:
+            raise ValueError("request and latency sampled targets must match")
 
-    activations_by_request: Dict[int, PlanActivationV4] = {}
+    activations_by_request: Dict[int, PlanActivationV5] = {}
     previous_activation_offset = -1
     previous_activation_step = -1
     previous_activation_request = -1
     for expected_plan_id, activation in enumerate(activation_records):
         if activation.plan_id != expected_plan_id:
             raise ValueError("plan ids must be contiguous from zero")
-        if (
-            activation.request_id not in requests_by_id
-            or activation.request_id in activations_by_request
-        ):
+        if activation.request_id not in requests_by_id or activation.request_id in activations_by_request:
             raise ValueError("activation must belong to exactly one serialized request")
         if activation.request_id <= previous_activation_request:
             raise ValueError("activations must follow request order")
@@ -686,10 +787,7 @@ def validate_timing_events_v4(
         request = requests_by_id[activation.request_id]
         if activation.control_step < request.observation_control_step:
             raise ValueError("activation control_step cannot precede its observation step")
-        if (
-            request.dispatch == "blocking_replan"
-            and activation.control_step != request.observation_control_step
-        ):
+        if request.dispatch == "blocking_replan" and activation.control_step != request.observation_control_step:
             raise ValueError("blocking replan must activate at its observation control step")
         latency = latencies_by_id.get(activation.request_id)
         if latency is None or latency.outcome != "success":
@@ -709,9 +807,9 @@ def validate_timing_events_v4(
             if set(activation.activation_context) != {"action_cursor"}:
                 raise ValueError("native activation requires action_cursor context")
             cursor = activation.activation_context["action_cursor"]
-            if activation.request_id == 0 or execution_mode == "baseline_sync_n5":
+            if activation.request_id == 0:
                 if cursor != 0:
-                    raise ValueError("initial and synchronous native plans activate at cursor zero")
+                    raise ValueError("initial native plans activate at cursor zero")
             else:
                 expected_cursor = activation.control_step - request.observation_control_step
                 if cursor != expected_cursor or not 0 <= cursor <= 15:
@@ -731,9 +829,7 @@ def validate_timing_events_v4(
             raise ValueError("failed or abandoned request cannot activate a plan")
     first_activation = activations_by_request.get(0)
     if first_activation is not None and (
-        first_activation.plan_id != 0
-        or first_activation.control_step != 0
-        or first_activation.activation != "initial"
+        first_activation.plan_id != 0 or first_activation.control_step != 0 or first_activation.activation != "initial"
     ):
         raise ValueError("successful first request must install initial plan zero at step zero")
     for request_index in range(1, len(request_records)):
@@ -741,12 +837,11 @@ def validate_timing_events_v4(
         previous_activation = activations_by_request.get(previous_request.request_id)
         if (
             previous_activation is not None
-            and request_records[request_index].submitted_offset_ns
-            < previous_activation.activated_offset_ns
+            and request_records[request_index].submitted_offset_ns < previous_activation.activated_offset_ns
         ):
             raise ValueError("a request cannot be submitted before the prior plan activates")
 
-    underflows_by_request: Dict[int, ActionUnderflowV4] = {}
+    underflows_by_request: Dict[int, ActionUnderflowV5] = {}
     previous_underflow_end = -1
     previous_underflow_step = -1
     for underflow in underflow_records:
@@ -784,7 +879,7 @@ def validate_timing_events_v4(
         previous_underflow_end = underflow_end
         previous_underflow_step = underflow.control_step
 
-    stalls_by_request: Dict[int, ControlStallV4] = {}
+    stalls_by_request: Dict[int, ControlStallV5] = {}
     previous_stall_end = -1
     previous_stall_step = -1
     for stall in stall_records:
@@ -812,25 +907,16 @@ def validate_timing_events_v4(
             latency = latencies_by_id.get(stall.request_id)
             if request.dispatch not in ("blocking_initial", "blocking_replan") or latency is None:
                 raise ValueError("synchronous stall must belong to a completed blocking request")
-            if (
-                stall.started_offset_ns < request.submitted_offset_ns
-                or stall_end > latency.completed_offset_ns
-            ):
+            if stall.started_offset_ns < request.submitted_offset_ns or stall_end > latency.completed_offset_ns:
                 raise ValueError("synchronous stall must lie within its request interval")
             if stall.control_step != request.observation_control_step:
                 raise ValueError("blocking stall control_step must match its request step")
-            full_interval_required = (
-                request.dispatch == "blocking_initial"
-                or request.trigger == "bsp_curve_exhausted"
-            )
+            full_interval_required = request.dispatch == "blocking_initial"
             if full_interval_required and (
-                stall.started_offset_ns != request.submitted_offset_ns
-                or stall.duration_ns != latency.duration_ns
+                stall.started_offset_ns != request.submitted_offset_ns or stall.duration_ns != latency.duration_ns
             ):
-                raise ValueError("initial and BSP exhaustion stalls must equal the full request")
-            if not full_interval_required and (
-                stall.duration_ns == 0 or stall_end != latency.completed_offset_ns
-            ):
+                raise ValueError("initial stalls must equal the full request")
+            if not full_interval_required and (stall.duration_ns == 0 or stall_end != latency.completed_offset_ns):
                 raise ValueError("later baseline synchronous stall must be an exact positive suffix")
         stalls_by_request[stall.request_id] = stall
         previous_stall_end = stall_end
@@ -841,9 +927,6 @@ def validate_timing_events_v4(
         if request.dispatch == "blocking_initial":
             if stall is None or stall.reason != STALL_REASON_SYNCHRONOUS_INFERENCE:
                 raise ValueError("initial request must have a full synchronous stall")
-        elif request.trigger == "bsp_curve_exhausted":
-            if stall is None or stall.reason != STALL_REASON_SYNCHRONOUS_INFERENCE:
-                raise ValueError("BSP exhaustion request must have a full synchronous stall")
         elif request.dispatch == "background":
             underflow = underflows_by_request.get(request.request_id)
             if (underflow is None) != (stall is None):
@@ -862,48 +945,66 @@ def validate_timing_events_v4(
     )
 
 
-def validate_video_frequencies_v4(
-    *, control_hz: int = CONTROL_HZ, video_fps: int = DEFAULT_VIDEO_FPS
-) -> int:
+def validate_action_seams_v5(
+    *,
+    seams: Sequence[ActionSeamV5],
+    activations: Sequence[PlanActivationV5],
+) -> Tuple[ActionSeamV5, ...]:
+    seam_records = _records_tuple(seams, ActionSeamV5, label="action seams")
+    activation_records = _records_tuple(
+        activations,
+        PlanActivationV5,
+        label="activations",
+    )
+    expected_activations = activation_records[1:]
+    if len(seam_records) != len(expected_activations):
+        raise ValueError("every non-initial plan activation requires one action seam")
+    for seam, activation in zip(seam_records, expected_activations):
+        if (seam.plan_id, seam.request_id, seam.control_step) != (
+            activation.plan_id,
+            activation.request_id,
+            activation.control_step,
+        ):
+            raise ValueError("action seam identity must match its plan activation")
+    return seam_records
+
+
+def validate_video_frequencies_v5(*, control_hz: int = CONTROL_HZ, video_fps: int = DEFAULT_VIDEO_FPS) -> int:
     control = _require_nonnegative_integer(control_hz, name="control_hz")
     video = _require_nonnegative_integer(video_fps, name="video_fps")
     if control != CONTROL_HZ or video != DEFAULT_VIDEO_FPS:
-        raise ValueError("schema-v4 LIBERO video timing requires exactly 20 Hz control and 40 fps")
+        raise ValueError("schema-v5 LIBERO video timing requires exactly 20 Hz control and 40 fps")
     return video // control
 
 
-def stall_overlay_lines_v4(stall: ControlStallV4) -> Tuple[str, str]:
+def stall_overlay_lines_v5(stall: ControlStallV5) -> Tuple[str, str]:
     """Choose presentation text solely from the measured stall reason."""
-    if not isinstance(stall, ControlStallV4):
-        raise TypeError("stall must be a ControlStallV4 record")
+    if not isinstance(stall, ControlStallV5):
+        raise TypeError("stall must be a ControlStallV5 record")
     stall._validate()
     label = (
-        "Synchronous inference"
-        if stall.reason == STALL_REASON_SYNCHRONOUS_INFERENCE
-        else "Waiting for policy actions"
+        "Synchronous inference" if stall.reason == STALL_REASON_SYNCHRONOUS_INFERENCE else "Waiting for policy actions"
     )
-    return label, "Control stalled: {:.2f} s".format(
-        stall.duration_ns / NANOSECONDS_PER_SECOND
-    )
+    return label, "Control stalled: {:.2f} s".format(stall.duration_ns / NANOSECONDS_PER_SECOND)
 
 
-def expand_control_frames_v4(
+def expand_control_frames_v5(
     control_frames: Iterable[_Frame],
     *,
     control_hz: int = CONTROL_HZ,
     video_fps: int = DEFAULT_VIDEO_FPS,
 ) -> Tuple[_Frame, ...]:
     """Hold every 20 Hz control frame exactly twice for 40 fps video."""
-    hold_count = validate_video_frequencies_v4(control_hz=control_hz, video_fps=video_fps)
+    hold_count = validate_video_frequencies_v5(control_hz=control_hz, video_fps=video_fps)
     return tuple(frame for frame in control_frames for _ in range(hold_count))
 
 
-def quantize_stall_frames_v4(
-    stalls: Sequence[ControlStallV4], *, video_fps: int = DEFAULT_VIDEO_FPS
+def quantize_stall_frames_v5(
+    stalls: Sequence[ControlStallV5], *, video_fps: int = DEFAULT_VIDEO_FPS
 ) -> Tuple[int, ...]:
     """Cumulatively quantize measured stalls, carrying fractional frames."""
-    validate_video_frequencies_v4(video_fps=video_fps)
-    stall_records = _records_tuple(stalls, ControlStallV4, label="stalls")
+    validate_video_frequencies_v5(video_fps=video_fps)
+    stall_records = _records_tuple(stalls, ControlStallV5, label="stalls")
     accumulated_ns = 0
     emitted_frames = 0
     event_frames: List[int] = []
@@ -923,7 +1024,7 @@ def quantize_stall_frames_v4(
     return tuple(event_frames)
 
 
-def render_overlay_v4(
+def render_overlay_v5(
     frame: _Frame,
     lines: Sequence[str],
     *,
@@ -939,7 +1040,7 @@ def render_overlay_v4(
 
 
 @dataclasses.dataclass(frozen=True)
-class VideoTimingAuditV4:
+class VideoTimingAuditV5:
     control_hz: int
     video_fps: int
     control_frame_count: int
@@ -973,13 +1074,11 @@ class VideoTimingAuditV4:
         ):
             raise ValueError("included_stall_frame_counts must be a sequence")
         object.__setattr__(self, "included_stall_reasons", tuple(self.included_stall_reasons))
-        object.__setattr__(
-            self, "included_stall_frame_counts", tuple(self.included_stall_frame_counts)
-        )
+        object.__setattr__(self, "included_stall_frame_counts", tuple(self.included_stall_frame_counts))
         self._validate()
 
     def _validate(self) -> None:
-        validate_video_frequencies_v4(control_hz=self.control_hz, video_fps=self.video_fps)
+        validate_video_frequencies_v5(control_hz=self.control_hz, video_fps=self.video_fps)
         nonnegative_fields = (
             "control_frame_count",
             "held_frame_count",
@@ -1034,22 +1133,17 @@ class VideoTimingAuditV4:
         elif self.included_control_stall_ns != self.measured_control_stall_ns:
             raise ValueError("included stall duration must equal all measured stall duration")
         if self.included_stall_count and self.underflow_count != sum(
-            reason == STALL_REASON_ASYNC_ACTION_UNDERFLOW
-            for reason in self.included_stall_reasons
+            reason == STALL_REASON_ASYNC_ACTION_UNDERFLOW for reason in self.included_stall_reasons
         ):
             raise ValueError("included async stall reasons must match underflow_count")
         if self.stall_frame_count != sum(self.included_stall_frame_counts):
             raise ValueError("stall_frame_count must equal included per-stall frames")
-        cumulative_stall_frame_count = (
-            self.included_control_stall_ns * self.video_fps // NANOSECONDS_PER_SECOND
-        )
+        cumulative_stall_frame_count = self.included_control_stall_ns * self.video_fps // NANOSECONDS_PER_SECOND
         if self.stall_frame_count != cumulative_stall_frame_count:
             raise ValueError("stall_frame_count must equal cumulative stall quantization")
         if self.video_frame_count != self.held_frame_count + self.stall_frame_count:
             raise ValueError("video_frame_count must equal held plus stall frames")
-        expected_control_duration = (
-            self.control_frame_count * NANOSECONDS_PER_SECOND // self.control_hz
-        )
+        expected_control_duration = self.control_frame_count * NANOSECONDS_PER_SECOND // self.control_hz
         if self.control_duration_ns != expected_control_duration:
             raise ValueError("control_duration_ns is inconsistent with control frames")
         expected_video_duration = self.video_frame_count * NANOSECONDS_PER_SECOND // self.video_fps
@@ -1088,7 +1182,7 @@ class VideoTimingAuditV4:
         }
 
     @classmethod
-    def from_dict(cls, value: Any) -> "VideoTimingAuditV4":
+    def from_dict(cls, value: Any) -> "VideoTimingAuditV5":
         payload = _require_exact_fields(value, _AUDIT_FIELDS, label="video timing audit")
         if not isinstance(payload["included_stall_reasons"], list):
             raise ValueError("included_stall_reasons must be a JSON list")
@@ -1120,18 +1214,18 @@ class VideoTimingAuditV4:
         )
 
 
-def build_video_timing_audit_v4(
+def build_video_timing_audit_v5(
     *,
     control_frame_count: int,
-    requests: Sequence[RequestEventV4],
-    latencies: Sequence[LatencyEventV4],
-    activations: Sequence[PlanActivationV4],
-    underflows: Sequence[ActionUnderflowV4],
-    stalls: Sequence[ControlStallV4],
+    requests: Sequence[RequestEventV5],
+    latencies: Sequence[LatencyEventV5],
+    activations: Sequence[PlanActivationV5],
+    underflows: Sequence[ActionUnderflowV5],
+    stalls: Sequence[ControlStallV5],
     include_stalls: bool,
     control_hz: int = CONTROL_HZ,
     video_fps: int = DEFAULT_VIDEO_FPS,
-) -> VideoTimingAuditV4:
+) -> VideoTimingAuditV5:
     """Build exact accounting while keeping measured and included stalls distinct.
 
     Returns:
@@ -1140,22 +1234,18 @@ def build_video_timing_audit_v4(
     Raises:
         ValueError: If counts, event types, frequencies, or inclusion state are invalid.
     """
-    frame_count = _require_nonnegative_integer(
-        control_frame_count, name="control_frame_count"
-    )
-    hold_count = validate_video_frequencies_v4(control_hz=control_hz, video_fps=video_fps)
+    frame_count = _require_nonnegative_integer(control_frame_count, name="control_frame_count")
+    hold_count = validate_video_frequencies_v5(control_hz=control_hz, video_fps=video_fps)
     if not isinstance(include_stalls, bool):
         raise ValueError("include_stalls must be boolean")
-    request_records = _records_tuple(requests, RequestEventV4, label="requests")
-    latency_records = _records_tuple(latencies, LatencyEventV4, label="latencies")
-    activation_records = _records_tuple(activations, PlanActivationV4, label="activations")
-    underflow_records = _records_tuple(underflows, ActionUnderflowV4, label="underflows")
-    stall_records = _records_tuple(stalls, ControlStallV4, label="stalls")
+    request_records = _records_tuple(requests, RequestEventV5, label="requests")
+    latency_records = _records_tuple(latencies, LatencyEventV5, label="latencies")
+    activation_records = _records_tuple(activations, PlanActivationV5, label="activations")
+    underflow_records = _records_tuple(underflows, ActionUnderflowV5, label="underflows")
+    stall_records = _records_tuple(stalls, ControlStallV5, label="stalls")
 
     included_stalls = stall_records if include_stalls else ()
-    included_frame_counts = quantize_stall_frames_v4(
-        included_stalls, video_fps=video_fps
-    )
+    included_frame_counts = quantize_stall_frames_v5(included_stalls, video_fps=video_fps)
     held_frame_count = frame_count * hold_count
     stall_frame_count = sum(included_frame_counts)
     video_frame_count = held_frame_count + stall_frame_count
@@ -1164,7 +1254,7 @@ def build_video_timing_audit_v4(
     included_stall_ns = sum(stall.duration_ns for stall in included_stalls)
     video_duration_ns = video_frame_count * NANOSECONDS_PER_SECOND // video_fps
     expected_duration_ns = control_duration_ns + included_stall_ns
-    return VideoTimingAuditV4(
+    return VideoTimingAuditV5(
         control_hz=control_hz,
         video_fps=video_fps,
         control_frame_count=frame_count,
@@ -1190,4 +1280,4 @@ def build_video_timing_audit_v4(
     )
 
 
-build_video_audit_v4 = build_video_timing_audit_v4
+build_video_audit_v5 = build_video_timing_audit_v5

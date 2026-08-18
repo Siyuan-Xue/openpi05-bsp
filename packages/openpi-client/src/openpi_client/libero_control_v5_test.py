@@ -7,7 +7,8 @@ import pytest
 
 from openpi_client import async_inference
 from openpi_client import inference
-from openpi_client import libero_control_v4 as control
+from openpi_client import latency_sampling
+from openpi_client import libero_control_v5 as control
 from openpi_client import msgpack_numpy
 
 
@@ -36,7 +37,11 @@ def _native_metadata(extra=None):
             "action_representation": "native",
             "model_action_horizon": 16,
             "model_action_dim": 32,
-            "supported_protocols": ["baseline_h16_n5_v1", "baseline_rtc_h16_v1"],
+            "supported_protocols": [
+                "baseline_h16_n5_v1",
+                "baseline_async_h16_v1",
+                "baseline_rtc_h16_v1",
+            ],
         },
     }
     if extra is not None:
@@ -121,13 +126,10 @@ def _observation_identity(request):
 def _calibration(mode_name, p95_ns, *, request=None):
     if request is None:
         request = {"state": np.zeros(8, dtype=np.float32)}
-    mode = control.EXECUTION_MODES[mode_name]
     measurements = [p95_ns] * 20
     return control.LatencyCalibrationV1.create(
         execution_mode=mode_name,
-        checkpoint_identity_fingerprint=_checkpoint_identity(
-            bsp=mode_name == "bsp_spline_async"
-        ).fingerprint,
+        checkpoint_identity_fingerprint=_checkpoint_identity(bsp=mode_name == "bsp_spline_async").fingerprint,
         server_metadata_fingerprint=_OTHER_SHA,
         canonical_observation_identity=_observation_identity(request),
         seed_namespace="openpi-libero-calibration-v1/{}/{}".format(
@@ -159,19 +161,25 @@ class _CalibrationWorker:
         self.ready_generations = []
         self._generation = 0
         self._failed = False
+        self.latency_sample_keys = []
+        self._sampler = latency_sampling.NormalLatencySamplerV1()
 
     def connect(self, timeout=None):
         return self.connection
 
-    def submit(self, observation):
+    def submit(self, observation, *, latency_sample_key):
         request = copy.deepcopy(observation)
         index = len(self.requests)
         self.requests.append(request)
+        self.latency_sample_keys.append(latency_sample_key)
+        sampled_target_latency_ns = self._sampler.sample_target_ns(latency_sample_key)
         job = async_inference.InferenceJob(
             request_id=index,
             generation=self._generation,
             payload=b"payload",
             submitted_monotonic_ns=index * 1_000_000_000,
+            latency_sample_key=latency_sample_key,
+            sampled_target_latency_ns=sampled_target_latency_ns,
         )
         self.jobs.append(job)
         return job
@@ -186,17 +194,21 @@ class _CalibrationWorker:
                 completed_monotonic_ns=job.submitted_monotonic_ns + 1,
                 connection=self.connection,
             )
-        request = self.requests[index]
-        if self.mode_name == "baseline_rtc":
+        if self.mode_name in ("baseline_async", "baseline_rtc"):
             result = _rtc_response(float(index))
         else:
             result = _bsp_response(value=float(index))
         duration = self.durations[index % len(self.durations)]
+        effective = max(duration, job.sampled_target_latency_ns)
         return async_inference.InferenceOutcome(
             job=job,
             result=result,
-            completed_monotonic_ns=job.submitted_monotonic_ns + duration,
+            completed_monotonic_ns=job.submitted_monotonic_ns + effective,
             connection=self.connection,
+            sampled_target_latency_ns=job.sampled_target_latency_ns,
+            raw_inference_latency_ns=duration,
+            synthetic_delay_ns=effective - duration,
+            effective_inference_latency_ns=effective,
         )
 
     def reset_generation(self):
@@ -269,17 +281,20 @@ def test_pacer_waits_through_early_wakeups_and_rejects_starts_before_due_time():
 
 def test_frozen_execution_modes_emit_only_the_exact_protocol_parameters():
     assert tuple(control.EXECUTION_MODES) == (
-        "baseline_sync_n5",
+        "baseline_async",
         "baseline_rtc",
-        "bsp_spline_sync",
         "bsp_spline_async",
     )
-    assert control.EXECUTION_MODES["baseline_sync_n5"].to_parameters_dict() == {
+    assert control.EXECUTION_MODES["baseline_async"].to_parameters_dict() == {
         "action_representation": "native",
-        "dispatch": "synchronous",
+        "dispatch": "asynchronous_after_initial",
         "model_action_horizon": 16,
-        "execution_horizon": 8,
+        "model_action_dim": 32,
+        "minimum_launch_cursor": 8,
+        "forecast_delay_ticks": 8,
         "num_inference_steps": 5,
+        "continuity_guidance": False,
+        "activation_policy": "immediate_skip_elapsed_prefix",
     }
     assert control.EXECUTION_MODES["baseline_rtc"].to_parameters_dict() == {
         "action_representation": "native",
@@ -289,18 +304,9 @@ def test_frozen_execution_modes_emit_only_the_exact_protocol_parameters():
         "minimum_launch_cursor": 8,
         "num_inference_steps": 5,
         "guidance_beta": 5,
-        "delay_history_size": 10,
+        "forecast_delay_ticks": 8,
+        "continuity_guidance": True,
         "activation_policy": "immediate",
-    }
-    assert control.EXECUTION_MODES["bsp_spline_sync"].to_parameters_dict() == {
-        "action_representation": "bsp",
-        "dispatch": "synchronous",
-        "parameter_shape": [16, 8],
-        "origin_hz": 10,
-        "degree": 3,
-        "speedup": 1,
-        "alignment": "disabled_delta_eff",
-        "activation_policy": "blocking_replace",
     }
     assert control.EXECUTION_MODES["bsp_spline_async"].to_parameters_dict() == {
         "action_representation": "bsp",
@@ -320,9 +326,8 @@ def test_frozen_execution_modes_emit_only_the_exact_protocol_parameters():
 @pytest.mark.parametrize(
     ("mode_name", "metadata"),
     [
-        ("baseline_sync_n5", _native_metadata()),
+        ("baseline_async", _native_metadata()),
         ("baseline_rtc", _native_metadata()),
-        ("bsp_spline_sync", _bsp_metadata()),
         ("bsp_spline_async", _bsp_metadata()),
     ],
 )
@@ -355,66 +360,34 @@ def test_server_metadata_rejects_nonexact_or_unrelated_capabilities(mutation):
         control.validate_server_metadata(control.EXECUTION_MODES["baseline_rtc"], metadata)
 
 
-def test_baseline_sync_validates_every_rtc_sidecar_and_executes_only_rows_zero_through_seven():
-    scheduler = control.make_scheduler_v4(control.EXECUTION_MODES["baseline_sync_n5"], None)
-    initial = scheduler.maybe_request(0, at_due=True, request_in_flight=False)
-
-    assert initial.dispatch == "blocking_initial"
-    assert initial.trigger == "initial_plan"
-    assert dict(initial.scheduler_context) == {}
-    assert initial.request_overlay == {inference.RTC_REQUEST_KEY: {"schema_version": 1}}
-    activation = scheduler.install_response(initial, _rtc_response(), now_ns=10, control_step=0)
-    assert activation.activation == "initial"
-    assert dict(activation.activation_context) == {"action_cursor": 0}
-
-    actions = [scheduler.take_action(10 + index) for index in range(8)]
-    for index, decision in enumerate(actions):
-        assert not decision.underflow
-        np.testing.assert_array_equal(
-            decision.action,
-            np.arange(16 * 7, dtype=np.float32).reshape(16, 7)[index],
-        )
-    replan = scheduler.maybe_request(18, at_due=False, request_in_flight=False)
-    assert replan.dispatch == "blocking_replan"
-    assert replan.trigger == "baseline_chunk_exhausted"
-    assert replan.request_overlay == {inference.RTC_REQUEST_KEY: {"schema_version": 1}}
-    with pytest.raises(ValueError, match="rtc"):
-        scheduler.install_response(
-            replan,
-            {"actions": np.zeros((16, 7), dtype=np.float32)},
-            now_ns=19,
-            control_step=8,
-        )
-
-
 @pytest.mark.parametrize(
     "factory",
     [
-        lambda: control.RequestIntentV4(
+        lambda: control.RequestIntentV5(
             dispatch="background",
             trigger="initial_plan",
             scheduler_context={},
             request_overlay={},
         ),
-        lambda: control.RequestIntentV4(
+        lambda: control.RequestIntentV5(
             dispatch="blocking_replan",
             trigger="rtc_launch",
             scheduler_context={"s": 8, "d": 8},
             request_overlay={},
         ),
-        lambda: control.RequestIntentV4(
+        lambda: control.RequestIntentV5(
             dispatch="background",
             trigger="rtc_launch",
             scheduler_context={"s": 8, "d": 8, "extra": 0},
             request_overlay={},
         ),
-        lambda: control.RequestIntentV4(
+        lambda: control.RequestIntentV5(
             dispatch="background",
             trigger="rtc_launch",
             scheduler_context={"s": 9, "d": 8},
             request_overlay={},
         ),
-        lambda: control.RequestIntentV4(
+        lambda: control.RequestIntentV5(
             dispatch="background",
             trigger="bsp_prefetch",
             scheduler_context={"remaining_plan_ns": 51, "budget_ns": 50},
@@ -439,11 +412,14 @@ def test_request_intents_reject_dispatch_trigger_and_exact_context_mismatches(fa
 )
 def test_activation_decisions_require_one_exact_native_or_bsp_context(context):
     with pytest.raises(ValueError):
-        control.ActivationDecisionV4(activation="initial", activation_context=context)
+        control.ActivationDecisionV5(activation="initial", activation_context=context)
 
 
 def test_scheduler_install_requires_the_exact_pending_transition_object():
-    scheduler = control.make_scheduler_v4(control.EXECUTION_MODES["baseline_sync_n5"], None)
+    scheduler = control.make_scheduler_v5(
+        control.EXECUTION_MODES["baseline_async"],
+        _schema5_calibration("baseline_async"),
+    )
     pending = scheduler.maybe_request(0, at_due=True, request_in_flight=False)
     fabricated = dataclasses.replace(pending)
 
@@ -455,9 +431,9 @@ def test_scheduler_install_requires_the_exact_pending_transition_object():
 
 
 def test_rtc_adapter_uses_plan_launch_gates_q_install_and_nonadvancing_underflow():
-    scheduler = control.make_scheduler_v4(
+    scheduler = control.make_scheduler_v5(
         control.EXECUTION_MODES["baseline_rtc"],
-        _calibration("baseline_rtc", 400_000_000),
+        _schema5_calibration("baseline_rtc"),
     )
     bootstrap = scheduler.maybe_request(0, at_due=True, request_in_flight=False)
     assert bootstrap.dispatch == "blocking_initial"
@@ -490,42 +466,40 @@ def test_rtc_adapter_uses_plan_launch_gates_q_install_and_nonadvancing_underflow
 
 
 def test_bsp_async_launches_on_budget_equality_and_immediately_restarts_curve_clock():
-    scheduler = control.make_scheduler_v4(
+    scheduler = control.make_scheduler_v5(
         control.EXECUTION_MODES["bsp_spline_async"],
-        _calibration("bsp_spline_async", 100_000_000),
+        _schema5_calibration("bsp_spline_async"),
     )
     initial = scheduler.maybe_request(0, at_due=True, request_in_flight=False)
     scheduler.install_response(initial, _bsp_response(), now_ns=0, control_step=0)
 
-    assert scheduler.maybe_request(
-        799_999_999, at_due=False, request_in_flight=False
-    ) is None
-    prefetch = scheduler.maybe_request(800_000_000, at_due=True, request_in_flight=False)
+    assert scheduler.maybe_request(499_999_999, at_due=False, request_in_flight=False) is None
+    prefetch = scheduler.maybe_request(500_000_000, at_due=True, request_in_flight=False)
     assert prefetch.dispatch == "background"
     assert prefetch.trigger == "bsp_prefetch"
     assert dict(prefetch.scheduler_context) == {
-        "remaining_plan_ns": 100_000_000,
-        "budget_ns": 100_000_000,
+        "remaining_plan_ns": 400_000_000,
+        "budget_ns": 400_000_000,
     }
 
     activation = scheduler.install_response(
         prefetch,
         _bsp_response(value=7),
-        now_ns=825_000_000,
-        control_step=17,
+        now_ns=525_000_000,
+        control_step=11,
     )
     assert activation.activation == "immediate_swap"
     assert dict(activation.activation_context) == {"curve_elapsed_ns": 0}
     np.testing.assert_array_equal(
-        scheduler.take_action(825_000_000).action,
+        scheduler.take_action(525_000_000).action,
         np.full(7, 7, dtype=np.float32),
     )
 
 
 def test_bsp_async_rejects_budget_equal_to_a_new_curves_usable_duration():
-    scheduler = control.make_scheduler_v4(
+    scheduler = control.make_scheduler_v5(
         control.EXECUTION_MODES["bsp_spline_async"],
-        _calibration("bsp_spline_async", 400_000_000),
+        _schema5_calibration("bsp_spline_async"),
     )
     initial = scheduler.maybe_request(0, at_due=True, request_in_flight=False)
 
@@ -537,9 +511,9 @@ def test_bsp_async_rejects_budget_equal_to_a_new_curves_usable_duration():
             control_step=0,
         )
 
-    later = control.make_scheduler_v4(
+    later = control.make_scheduler_v5(
         control.EXECUTION_MODES["bsp_spline_async"],
-        _calibration("bsp_spline_async", 400_000_000),
+        _schema5_calibration("bsp_spline_async"),
     )
     first = later.maybe_request(0, at_due=True, request_in_flight=False)
     later.install_response(first, _bsp_response(value=3), now_ns=0, control_step=0)
@@ -557,25 +531,6 @@ def test_bsp_async_rejects_budget_equal_to_a_new_curves_usable_duration():
     )
 
 
-def test_bsp_sync_blocks_only_after_the_closed_right_endpoint_is_no_longer_executable():
-    scheduler = control.make_scheduler_v4(control.EXECUTION_MODES["bsp_spline_sync"], None)
-    initial = scheduler.maybe_request(0, at_due=True, request_in_flight=False)
-    scheduler.install_response(initial, _bsp_response(), now_ns=0, control_step=0)
-
-    endpoint = scheduler.take_action(900_000_000)
-    assert not endpoint.underflow
-    assert scheduler.maybe_request(900_000_000, at_due=True, request_in_flight=False) is None
-    assert scheduler.take_action(900_000_001).underflow
-    assert scheduler.maybe_request(
-        900_000_001,
-        at_due=False,
-        request_in_flight=False,
-    ) is None
-    replan = scheduler.maybe_request(900_000_001, at_due=True, request_in_flight=False)
-    assert replan.dispatch == "blocking_replan"
-    assert replan.trigger == "bsp_curve_exhausted"
-
-
 @pytest.mark.parametrize(
     "response",
     [
@@ -589,7 +544,10 @@ def test_bsp_sync_blocks_only_after_the_closed_right_endpoint_is_no_longer_execu
     ],
 )
 def test_bsp_scheduler_requires_a_complete_finite_float32_representable_dual_response(response):
-    scheduler = control.make_scheduler_v4(control.EXECUTION_MODES["bsp_spline_sync"], None)
+    scheduler = control.make_scheduler_v5(
+        control.EXECUTION_MODES["bsp_spline_async"],
+        _schema5_calibration("bsp_spline_async"),
+    )
     intent = scheduler.maybe_request(0, at_due=True, request_in_flight=False)
 
     with pytest.raises(ValueError, match="BSP|actions"):
@@ -627,39 +585,6 @@ def test_nearest_rank_p95_uses_only_exactly_twenty_nonnegative_integer_measureme
             control.nearest_rank_p95_ns(invalid)
 
 
-@pytest.mark.parametrize(
-    ("mode_name", "p95_ns", "delay_ticks", "budget_ns"),
-    [
-        ("baseline_rtc", 0, 0, None),
-        ("baseline_rtc", 50_000_000, 1, None),
-        ("baseline_rtc", 50_000_001, 2, None),
-        ("baseline_rtc", 400_000_000, 8, None),
-        ("bsp_spline_async", 0, None, 0),
-        ("bsp_spline_async", 50_000_000, None, 50_000_000),
-        ("bsp_spline_async", 50_000_001, None, 100_000_000),
-        ("bsp_spline_async", 400_000_000, None, 400_000_000),
-        ("bsp_spline_async", 400_000_001, None, 450_000_000),
-    ],
-)
-def test_calibration_derivation_uses_exact_ceiling_boundaries(
-    mode_name, p95_ns, delay_ticks, budget_ns
-):
-    calibration = _calibration(mode_name, p95_ns)
-
-    assert calibration.derived_delay_ticks == delay_ticks
-    assert calibration.derived_prefetch_budget_ns == budget_ns
-
-
-def test_rtc_calibration_rejects_a_p95_above_eight_control_ticks():
-    with pytest.raises(ValueError, match="eight"):
-        _calibration("baseline_rtc", 400_000_001)
-
-
-def test_rtc_850ms_stress_point_is_an_explicit_capacity_rejection():
-    with pytest.raises(ValueError, match="eight"):
-        _calibration("baseline_rtc", 850_000_000)
-
-
 def test_rtc_calibration_uses_one_untimed_bootstrap_then_five_plus_twenty_chained_guided_calls():
     request = {"state": np.arange(8, dtype=np.float32), "prompt": "pick"}
     durations = [999] + [1000 + index for index in range(25)]
@@ -685,12 +610,12 @@ def test_rtc_calibration_uses_one_untimed_bootstrap_then_five_plus_twenty_chaine
             envelope["previous_model_actions"],
             _rtc_response(float(index - 1))["rtc"]["model_actions"],
         )
-    assert calibration.bootstrap_request_fingerprint == control.canonical_fingerprint(
-        worker.requests[0]
-    )
-    assert list(calibration.warmup_latency_ns) == durations[1:6]
-    assert list(calibration.measurement_latency_ns) == durations[6:26]
-    assert calibration.p95_latency_ns == sorted(durations[6:26])[18]
+    assert calibration.bootstrap_request_fingerprint == control.canonical_fingerprint(worker.requests[0])
+    assert len(calibration.warmup_effective_inference_latency_ns) == 5
+    assert len(calibration.measurement_effective_inference_latency_ns) == 20
+    assert calibration.derived_delay_ticks == 8
+    assert calibration.scheduling_latency_budget_ns == 400_000_000
+    assert all(key.namespace.startswith("calibration/") for key in worker.latency_sample_keys)
 
 
 def test_bsp_calibration_discards_partial_samples_and_restarts_whole_sequence_after_infrastructure():
@@ -713,23 +638,13 @@ def test_bsp_calibration_discards_partial_samples_and_restarts_whole_sequence_af
     assert worker.reset_calls == 1
     assert worker.ready_generations == [1]
     assert len(worker.requests) == 4 + 25
-    assert len(calibration.warmup_latency_ns) == 5
-    assert len(calibration.measurement_latency_ns) == 20
+    assert len(calibration.warmup_effective_inference_latency_ns) == 5
+    assert len(calibration.measurement_effective_inference_latency_ns) == 20
 
 
-def test_calibration_uses_and_validates_effective_latency_breakdown():
-    class EffectiveLatencyWorker(_CalibrationWorker):
-        def wait(self, job, timeout=None):
-            outcome = super().wait(job, timeout=timeout)
-            return dataclasses.replace(
-                outcome,
-                raw_inference_latency_ns=80_000_000,
-                synthetic_delay_ns=220_000_000,
-                effective_inference_latency_ns=300_000_000,
-            )
-
+def test_calibration_records_raw_sampled_synthetic_and_effective_latency_breakdown():
     request = {"state": np.arange(4, dtype=np.float32)}
-    worker = EffectiveLatencyWorker("bsp_spline_async", [300_000_000] * 25)
+    worker = _CalibrationWorker("bsp_spline_async", [80_000_000] * 25)
 
     calibration = control.calibrate_async_mode(
         control.EXECUTION_MODES["bsp_spline_async"],
@@ -740,8 +655,17 @@ def test_calibration_uses_and_validates_effective_latency_breakdown():
         control.canonical_fingerprint(_bsp_metadata()),
     )
 
-    assert calibration.p95_latency_ns == 300_000_000
-    assert set(calibration.measurement_latency_ns) == {300_000_000}
+    assert set(calibration.measurement_raw_inference_latency_ns) == {80_000_000}
+    assert all(value > 0 for value in calibration.measurement_sampled_target_latency_ns)
+    assert all(
+        raw + synthetic == effective == max(raw, sampled)
+        for raw, sampled, synthetic, effective in zip(
+            calibration.measurement_raw_inference_latency_ns,
+            calibration.measurement_sampled_target_latency_ns,
+            calibration.measurement_synthetic_delay_ns,
+            calibration.measurement_effective_inference_latency_ns,
+        )
+    )
 
 
 def test_calibration_rejects_an_inconsistent_effective_latency_breakdown():
@@ -843,9 +767,7 @@ def test_canonical_encoding_has_literal_float_bytes_and_c_contiguous_ndarray_gol
     )
 
     assert control.canonical_json_bytes(value) == expected
-    assert control.canonical_fingerprint(value) == (
-        "0f8914286b06f6b96f42bf65fc4165f96fec7cca4a6b250e19d0279c5c4145f9"
-    )
+    assert control.canonical_fingerprint(value) == ("0f8914286b06f6b96f42bf65fc4165f96fec7cca4a6b250e19d0279c5c4145f9")
 
 
 @pytest.mark.parametrize(
@@ -859,9 +781,7 @@ def test_canonical_encoding_has_literal_float_bytes_and_c_contiguous_ndarray_gol
             "__ndarray__": {
                 "dtype": "<i2",
                 "shape": [2, 2],
-                "sha256": (
-                    "ea99f710d9d0b8ba192295c969a63ed7ce8fc5743da20d2057fa2b6d2c404bfb"
-                ),
+                "sha256": ("ea99f710d9d0b8ba192295c969a63ed7ce8fc5743da20d2057fa2b6d2c404bfb"),
             }
         },
         {"__ndarray__": "not-an-array-tag"},
@@ -902,20 +822,22 @@ def test_seed_namespace_phase_index_and_checkpoint_identity_are_fingerprint_inpu
     checkpoint = _checkpoint_identity()
 
     assert control.calibration_seed("namespace", "warmup", 0) == int("d099f188", 16)
-    assert control.calibration_seed("namespace", "warmup", 0) != control.calibration_seed(
-        "namespace", "measurement", 0
+    assert control.calibration_seed("namespace", "warmup", 0) != control.calibration_seed("namespace", "measurement", 0)
+    assert control.calibration_seed("namespace", "warmup", 0) != control.calibration_seed("namespace", "warmup", 1)
+    assert (
+        checkpoint.fingerprint
+        != dataclasses.replace(
+            checkpoint,
+            checkpoint="/different/1000",
+        ).fingerprint
     )
-    assert control.calibration_seed("namespace", "warmup", 0) != control.calibration_seed(
-        "namespace", "warmup", 1
+    assert (
+        checkpoint.fingerprint
+        != dataclasses.replace(
+            checkpoint,
+            norm_hash="3" * 64,
+        ).fingerprint
     )
-    assert checkpoint.fingerprint != dataclasses.replace(
-        checkpoint,
-        checkpoint="/different/1000",
-    ).fingerprint
-    assert checkpoint.fingerprint != dataclasses.replace(
-        checkpoint,
-        norm_hash="3" * 64,
-    ).fingerprint
 
 
 def test_calibration_seed_uses_the_shared_canonical_json_encoder(monkeypatch):
@@ -996,3 +918,112 @@ def test_calibration_rejects_metadata_change_in_an_unrelated_outer_field():
             _checkpoint_identity(),
             control.canonical_fingerprint(_native_metadata()),
         )
+
+
+def _schema5_calibration(mode_name, *, empirical_effective_ns=300_000_000):
+    checkpoint = _checkpoint_identity(bsp=mode_name == "bsp_spline_async")
+    return control.LatencyCalibrationV2.create(
+        execution_mode=mode_name,
+        checkpoint_identity_fingerprint=checkpoint.fingerprint,
+        server_metadata_fingerprint=_OTHER_SHA,
+        canonical_observation_identity=_observation_identity({"state": np.zeros(8, dtype=np.float32)}),
+        seed_namespace="openpi-libero-calibration-v2/{}/{}".format(
+            mode_name,
+            checkpoint.fingerprint,
+        ),
+        bootstrap_request_fingerprint=_SHA if mode_name == "baseline_rtc" else None,
+        warmup_request_fingerprints=[_SHA] * 5,
+        measurement_request_fingerprints=[_OTHER_SHA] * 20,
+        warmup_raw_inference_latency_ns=[80_000_000] * 5,
+        warmup_sampled_target_latency_ns=[300_000_000] * 5,
+        warmup_synthetic_delay_ns=[220_000_000] * 5,
+        warmup_effective_inference_latency_ns=[300_000_000] * 5,
+        measurement_raw_inference_latency_ns=[80_000_000] * 20,
+        measurement_sampled_target_latency_ns=[empirical_effective_ns] * 20,
+        measurement_synthetic_delay_ns=[empirical_effective_ns - 80_000_000] * 20,
+        measurement_effective_inference_latency_ns=[empirical_effective_ns] * 20,
+    )
+
+
+def test_schema5_exposes_exactly_three_random_latency_async_modes():
+    assert set(control.EXECUTION_MODES) == {
+        "baseline_async",
+        "baseline_rtc",
+        "bsp_spline_async",
+    }
+    assert control.EXECUTION_MODES["baseline_async"].policy_protocol == "baseline_async_h16_v1"
+
+
+def test_theoretical_budget_is_fixed_at_eight_ticks_when_empirical_p95_is_longer():
+    calibration = _schema5_calibration(
+        "baseline_rtc",
+        empirical_effective_ns=450_000_000,
+    )
+
+    assert calibration.theoretical_p95_latency_ns == 398_691_218
+    assert calibration.scheduling_latency_budget_ns == 400_000_000
+    assert calibration.derived_delay_ticks == 8
+    assert calibration.empirical_effective_p95_ns == 450_000_000
+    assert calibration.empirical_p95_exceeds_budget
+
+
+def test_baseline_async_and_rtc_launch_at_same_cursor_but_only_rtc_has_guidance():
+    raw = control.make_scheduler_v5(
+        control.EXECUTION_MODES["baseline_async"],
+        _schema5_calibration("baseline_async"),
+    )
+    guided = control.make_scheduler_v5(
+        control.EXECUTION_MODES["baseline_rtc"],
+        _schema5_calibration("baseline_rtc"),
+    )
+    raw_initial = raw.maybe_request(0, at_due=True, request_in_flight=False)
+    guided_initial = guided.maybe_request(0, at_due=True, request_in_flight=False)
+    raw.install_response(raw_initial, _rtc_response(), now_ns=0, control_step=0)
+    guided.install_response(guided_initial, _rtc_response(), now_ns=0, control_step=0)
+
+    for step in range(8):
+        assert not raw.take_action(step).underflow
+        assert not guided.take_action(step).underflow
+
+    raw_request = raw.maybe_request(8, at_due=True, request_in_flight=False)
+    guided_request = guided.maybe_request(8, at_due=True, request_in_flight=False)
+    assert raw_request.trigger == "baseline_async_launch"
+    assert guided_request.trigger == "rtc_launch"
+    assert (
+        dict(raw_request.scheduler_context)
+        == dict(guided_request.scheduler_context)
+        == {
+            "s": 8,
+            "d": 8,
+        }
+    )
+    assert raw_request.request_overlay == {inference.RTC_REQUEST_KEY: {"schema_version": inference.RTC_SCHEMA_VERSION}}
+    assert set(guided_request.request_overlay[inference.RTC_REQUEST_KEY]) == {
+        "schema_version",
+        "previous_model_actions",
+        "s",
+        "d",
+    }
+
+
+def test_baseline_async_install_skips_elapsed_prefix_and_underflow_does_not_advance():
+    scheduler = control.make_scheduler_v5(
+        control.EXECUTION_MODES["baseline_async"],
+        _schema5_calibration("baseline_async"),
+    )
+    initial = scheduler.maybe_request(0, at_due=True, request_in_flight=False)
+    scheduler.install_response(initial, _rtc_response(), now_ns=0, control_step=0)
+    for step in range(8):
+        scheduler.take_action(step)
+    background = scheduler.maybe_request(8, at_due=True, request_in_flight=False)
+    for step in range(8, 16):
+        scheduler.take_action(step)
+    assert scheduler.take_action(16).underflow
+    assert scheduler.take_action(17).underflow
+
+    response = _rtc_response(offset=1_000.0)
+    activation = scheduler.install_response(background, response, now_ns=18, control_step=16)
+    assert dict(activation.activation_context) == {"action_cursor": 8}
+    decision = scheduler.take_action(19)
+    assert not decision.underflow
+    np.testing.assert_array_equal(decision.action, response["actions"][8])

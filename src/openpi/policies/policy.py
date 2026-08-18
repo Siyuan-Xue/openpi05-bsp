@@ -41,12 +41,12 @@ def _inference_capabilities(
     model_action_dim: int,
     has_rtc_hook: bool,
 ) -> dict[str, Any]:
-    if (
-        action_representation == "native"
-        and (model_action_horizon, model_action_dim) == (16, 32)
-        and has_rtc_hook
-    ):
-        supported_protocols = ["baseline_h16_n5_v1", "baseline_rtc_h16_v1"]
+    if action_representation == "native" and (model_action_horizon, model_action_dim) == (16, 32) and has_rtc_hook:
+        supported_protocols = [
+            "baseline_h16_n5_v1",
+            "baseline_async_h16_v1",
+            "baseline_rtc_h16_v1",
+        ]
     elif action_representation == "bsp":
         supported_protocols = ["bsp_spline_h8_v1"]
     else:

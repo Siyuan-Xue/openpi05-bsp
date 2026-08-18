@@ -1,4 +1,4 @@
-"""Schema-v4 LIBERO artifact producer contracts.
+"""Schema-v5 LIBERO artifact producer contracts.
 
 These tests are authored before the implementation and intentionally remain
 unexecuted on this checkout.  Task 5 verification is server-only.
@@ -10,9 +10,10 @@ from pathlib import Path
 
 import pytest
 
-from openpi_client import libero_control_v4 as control
-from openpi_client import libero_eval_v4 as evaluation
-from openpi_client import libero_video_timing_v4 as timing
+from openpi_client import libero_control_v5 as control
+from openpi_client import libero_eval_v5 as evaluation
+from openpi_client import libero_video_timing_v5 as timing
+from openpi_client import latency_sampling
 
 
 _SHA = "a" * 64
@@ -50,7 +51,11 @@ def _calibration(
     init_state_index=0,
 ):
     identity = _checkpoint_identity(bsp=mode_name == "bsp_spline_async")
-    return control.LatencyCalibrationV1.create(
+    warmup_raw = [100_000_000] * 5
+    warmup_sampled = [300_000_000] * 5
+    measurement_raw = [100_000_000] * 20
+    measurement_sampled = [300_000_000] * 20
+    return control.LatencyCalibrationV2.create(
         execution_mode=mode_name,
         checkpoint_identity_fingerprint=identity.fingerprint,
         server_metadata_fingerprint=_SHA,
@@ -61,31 +66,45 @@ def _calibration(
             init_state_fingerprint="3" * 64,
             request_fingerprint="4" * 64,
         ),
-        seed_namespace="openpi-libero-calibration-v1/{}/{}".format(
-            mode_name, identity.fingerprint
-        ),
+        seed_namespace="openpi-libero-calibration-v2/{}/{}".format(mode_name, identity.fingerprint),
         bootstrap_request_fingerprint="5" * 64 if mode_name == "baseline_rtc" else None,
         warmup_request_fingerprints=["6" * 64] * 5,
         measurement_request_fingerprints=["7" * 64] * 20,
-        warmup_latency_ns=[1] * 5,
-        measurement_latency_ns=[25_000_000] * 20,
+        warmup_raw_inference_latency_ns=warmup_raw,
+        warmup_sampled_target_latency_ns=warmup_sampled,
+        warmup_synthetic_delay_ns=[200_000_000] * 5,
+        warmup_effective_inference_latency_ns=warmup_sampled,
+        measurement_raw_inference_latency_ns=measurement_raw,
+        measurement_sampled_target_latency_ns=measurement_sampled,
+        measurement_synthetic_delay_ns=[200_000_000] * 20,
+        measurement_effective_inference_latency_ns=measurement_sampled,
     )
 
 
-def _manifest(mode_name="baseline_sync_n5"):
+def _manifest(mode_name="baseline_async"):
     mode = control.EXECUTION_MODES[mode_name]
     bsp = mode.policy_variant == "bsp"
     checkpoint_identity = _checkpoint_identity(bsp=bsp)
-    calibration = _calibration(mode_name) if mode.asynchronous else None
-    return evaluation.EvaluationManifestV4(
-        schema_version=4,
+    calibration = _calibration(mode_name)
+    return evaluation.EvaluationManifestV5(
+        schema_version=5,
         dataset_fps=10,
         source_demo_control_hz=20,
         control_freq_hz=20,
         controller_period_ns=50_000_000,
         video_fps=40,
         video_show_inference_waits=True,
-        synthetic_latency_target_ms=300,
+        latency_distribution={
+            "distribution": "normal",
+            "mean_ns": 300_000_000,
+            "stddev_ns": 60_000_000,
+            "seed": 42,
+            "sampler_version": latency_sampling.SAMPLER_VERSION,
+            "negative_policy": latency_sampling.NEGATIVE_POLICY,
+        },
+        theoretical_p95_latency_ns=control.THEORETICAL_P95_LATENCY_NS,
+        scheduling_latency_budget_ns=control.SCHEDULING_LATENCY_BUDGET_NS,
+        scheduling_delay_ticks=control.SCHEDULING_DELAY_TICKS,
         execution_mode=mode_name,
         execution_parameters=mode.to_parameters_dict(),
         latency_calibration=calibration,
@@ -116,27 +135,39 @@ def _manifest(mode_name="baseline_sync_n5"):
     )
 
 
-def test_manifest_persists_the_frozen_synthetic_latency_condition():
+def test_manifest_persists_the_frozen_random_latency_condition():
     manifest = _manifest()
 
-    assert manifest.synthetic_latency_target_ms == 300
-    assert manifest.to_dict()["synthetic_latency_target_ms"] == 300
-    assert evaluation.EvaluationManifestV4.from_dict(manifest.to_dict()) == manifest
+    assert manifest.latency_distribution["mean_ns"] == 300_000_000
+    assert manifest.latency_distribution["stddev_ns"] == 60_000_000
+    assert manifest.scheduling_latency_budget_ns == 400_000_000
+    assert evaluation.EvaluationManifestV5.from_dict(manifest.to_dict()) == manifest
 
 
-@pytest.mark.parametrize("invalid", [True, -1, 1.5, 50, 900])
-def test_manifest_rejects_unsupported_synthetic_latency_conditions(invalid):
-    with pytest.raises(ValueError, match="synthetic_latency_target_ms"):
-        dataclasses.replace(_manifest(), synthetic_latency_target_ms=invalid)
+def test_manifest_rejects_mutated_random_latency_identity():
+    with pytest.raises(ValueError, match="latency_distribution"):
+        dataclasses.replace(
+            _manifest(),
+            latency_distribution=dict(_manifest().latency_distribution, mean_ns=350_000_000),
+        )
 
 
-def _initial_events(identity=None, *, execution_mode="baseline_sync_n5", outcome="success"):
+def _initial_events(identity=None, *, execution_mode="baseline_async", outcome="success"):
     if identity is None:
         identity = _identity()
     flow_seed = evaluation.stable_replan_seed(42, identity, 0)
     disposition = "activated" if outcome == "success" else "failed"
+    sample_key = latency_sampling.LatencySampleKeyV1(
+        namespace="formal",
+        seed=42,
+        suite=identity.suite,
+        task_id=identity.task_id,
+        trial_index=identity.init_state_index,
+        request_ordinal=0,
+    )
+    sampled_target = latency_sampling.NormalLatencySamplerV1().sample_target_ns(sample_key)
     requests = (
-        timing.RequestEventV4(
+        timing.RequestEventV5(
             request_id=0,
             observation_control_step=0,
             submitted_offset_ns=0,
@@ -145,28 +176,27 @@ def _initial_events(identity=None, *, execution_mode="baseline_sync_n5", outcome
             trigger="initial_plan",
             scheduler_context={},
             disposition=disposition,
+            latency_sample_key=sample_key,
+            sampled_target_latency_ns=sampled_target,
         ),
     )
     latencies = (
-        timing.LatencyEventV4(
+        timing.LatencyEventV5(
             request_id=0,
-            completed_offset_ns=25_000_000,
-            duration_ns=25_000_000,
+            completed_offset_ns=sampled_target,
+            duration_ns=sampled_target,
             outcome=outcome,
+            sampled_target_latency_ns=sampled_target,
         ),
     )
     if outcome == "success":
-        activation_context = (
-            {"action_cursor": 0}
-            if execution_mode.startswith("baseline")
-            else {"curve_elapsed_ns": 0}
-        )
+        activation_context = {"action_cursor": 0} if execution_mode.startswith("baseline") else {"curve_elapsed_ns": 0}
         activations = (
-            timing.PlanActivationV4(
+            timing.PlanActivationV5(
                 plan_id=0,
                 request_id=0,
                 control_step=0,
-                activated_offset_ns=25_000_000,
+                activated_offset_ns=sampled_target,
                 activation="initial",
                 activation_context=activation_context,
             ),
@@ -174,34 +204,35 @@ def _initial_events(identity=None, *, execution_mode="baseline_sync_n5", outcome
     else:
         activations = ()
     stalls = (
-        timing.ControlStallV4(
+        timing.ControlStallV5(
             request_id=0,
             control_step=0,
             started_offset_ns=0,
-            duration_ns=25_000_000,
+            duration_ns=sampled_target,
             reason="synchronous_inference",
         ),
     )
     return requests, latencies, activations, (), stalls
 
 
-def _attempt(identity=None, *, execution_mode="baseline_sync_n5", success=True):
+def _attempt(identity=None, *, execution_mode="baseline_async", success=True):
     events = _initial_events(
         identity,
         execution_mode=execution_mode,
         outcome="success" if success else "policy_failure",
     )
-    return evaluation.AttemptResultV4(
+    return evaluation.AttemptResultV5(
         execution_mode=execution_mode,
         success=success,
         steps=1 if success else 0,
         replans=1 if success else 0,
-        episode_duration_ns=75_000_000,
+        episode_duration_ns=events[1][0].duration_ns + 50_000_000,
         failure_kind=None if success else "policy",
         error=None if success else "malformed response",
         inference_requests=events[0],
         inference_latencies=events[1],
         plan_activations=events[2],
+        action_seams=(),
         action_underflows=events[3],
         control_stalls=events[4],
         replay_frames=("frame",) if success else (),
@@ -209,7 +240,7 @@ def _attempt(identity=None, *, execution_mode="baseline_sync_n5", success=True):
     )
 
 
-def test_manifest_has_exactly_the_34_frozen_v4_fields_for_every_mode():
+def test_manifest_has_exactly_the_frozen_v5_fields_for_every_mode():
     expected_fields = {
         "schema_version",
         "dataset_fps",
@@ -218,7 +249,10 @@ def test_manifest_has_exactly_the_34_frozen_v4_fields_for_every_mode():
         "controller_period_ns",
         "video_fps",
         "video_show_inference_waits",
-        "synthetic_latency_target_ms",
+        "latency_distribution",
+        "theoretical_p95_latency_ns",
+        "scheduling_latency_budget_ns",
+        "scheduling_delay_ticks",
         "execution_mode",
         "execution_parameters",
         "latency_calibration",
@@ -247,29 +281,27 @@ def test_manifest_has_exactly_the_34_frozen_v4_fields_for_every_mode():
         "inference_timeout_s",
         "infrastructure_retries",
     }
-    assert len(expected_fields) == 35
-    assert {field.name for field in dataclasses.fields(evaluation.EvaluationManifestV4)} == expected_fields
+    assert len(expected_fields) == 38
+    assert {field.name for field in dataclasses.fields(evaluation.EvaluationManifestV5)} == expected_fields
 
     for mode_name in control.EXECUTION_MODES:
         manifest = _manifest(mode_name)
         payload = manifest.to_dict()
         assert set(payload) == expected_fields
-        assert payload["execution_parameters"] == control.EXECUTION_MODES[
-            mode_name
-        ].to_parameters_dict()
-        assert evaluation.EvaluationManifestV4.from_dict(payload) == manifest
+        assert payload["execution_parameters"] == control.EXECUTION_MODES[mode_name].to_parameters_dict()
+        assert evaluation.EvaluationManifestV5.from_dict(payload) == manifest
         with pytest.raises(dataclasses.FrozenInstanceError):
             manifest.execution_mode = "other"
 
 
 def test_manifest_defensively_owns_nested_containers_and_rejects_exact_field_mutations():
-    execution_parameters = control.EXECUTION_MODES["bsp_spline_sync"].to_parameters_dict()
+    execution_parameters = control.EXECUTION_MODES["bsp_spline_async"].to_parameters_dict()
     bsp_parameters = dict(evaluation.BSP_PARAMETERS)
     suites = list(evaluation.SUPPORTED_SUITES)
     task_ids = list(range(10))
     max_steps = dict(evaluation.MAX_STEPS_BY_SUITE)
     manifest = dataclasses.replace(
-        _manifest("bsp_spline_sync"),
+        _manifest("bsp_spline_async"),
         execution_parameters=execution_parameters,
         bsp_parameters=bsp_parameters,
         suites=suites,
@@ -281,7 +313,7 @@ def test_manifest_defensively_owns_nested_containers_and_rejects_exact_field_mut
     suites.reverse()
     task_ids[0] = True
     max_steps["libero_spatial"] = 1
-    assert manifest.to_dict() == _manifest("bsp_spline_sync").to_dict()
+    assert manifest.to_dict() == _manifest("bsp_spline_async").to_dict()
 
     payload = _manifest().to_dict()
     mutations = []
@@ -295,12 +327,12 @@ def test_manifest_defensively_owns_nested_containers_and_rejects_exact_field_mut
     mutations.append(dict(payload, suites=tuple(payload["suites"])))
     mutations.append(dict(payload, execution_mode="unknown"))
     mutations.append(dict(payload, server_metadata_fingerprint="A" * 64))
-    bsp_payload = _manifest("bsp_spline_sync").to_dict()
+    bsp_payload = _manifest("bsp_spline_async").to_dict()
     bsp_payload["execution_parameters"]["parameter_shape"] = (16, 8)
     mutations.append(bsp_payload)
     for malformed in mutations:
         with pytest.raises(ValueError):
-            evaluation.EvaluationManifestV4.from_dict(malformed)
+            evaluation.EvaluationManifestV5.from_dict(malformed)
 
 
 def test_manifest_binds_family_protocol_cache_and_async_calibration_identity():
@@ -314,13 +346,9 @@ def test_manifest_binds_family_protocol_cache_and_async_calibration_identity():
 
     invalid = (
         lambda: dataclasses.replace(_manifest(), policy_protocol="baseline_rtc_h16_v1"),
-        lambda: dataclasses.replace(
-            _manifest(), latency_calibration=_calibration("baseline_rtc")
-        ),
-        lambda: dataclasses.replace(
-            _manifest("baseline_rtc"), server_metadata_fingerprint=_OTHER_SHA
-        ),
-        lambda: dataclasses.replace(_manifest("bsp_spline_sync"), bsp_cache_hash=None),
+        lambda: dataclasses.replace(_manifest(), latency_calibration=_calibration("baseline_rtc")),
+        lambda: dataclasses.replace(_manifest("baseline_rtc"), server_metadata_fingerprint=_OTHER_SHA),
+        lambda: dataclasses.replace(_manifest("bsp_spline_async"), bsp_cache_hash=None),
     )
     for make_manifest in invalid:
         with pytest.raises(ValueError):
@@ -355,11 +383,11 @@ def test_async_manifest_binds_calibration_to_first_selected_rollout(
 def test_episode_record_round_trip_has_exact_fields_and_revalidates_stable_seeds():
     identity = _identity()
     attempt = _attempt(identity)
-    record = evaluation.EpisodeRecordV4.from_attempt(
+    record = evaluation.EpisodeRecordV5.from_attempt(
         identity,
         42,
         1,
-        execution_mode="baseline_sync_n5",
+        execution_mode="baseline_async",
         result=attempt,
     )
     expected_fields = {
@@ -386,29 +414,35 @@ def test_episode_record_round_trip_has_exact_fields_and_revalidates_stable_seeds
         "inference_requests",
         "inference_latencies",
         "plan_activations",
+        "action_seams",
         "action_underflows",
         "control_stalls",
         "infrastructure_history",
     }
     assert set(record.to_dict()) == expected_fields
-    assert len(expected_fields) == 26
+    assert len(expected_fields) == 27
     assert record.replans == len(record.plan_activations) == 1
-    assert evaluation.EpisodeRecordV4.from_dict(record.to_dict()) == dataclasses.replace(
+    assert evaluation.EpisodeRecordV5.from_dict(record.to_dict()) == dataclasses.replace(
         record, replay_frames=(), stall_source_frames=()
     )
 
     wrong_seed = record.to_dict()
     wrong_seed["inference_requests"][0]["flow_seed"] += 1
     with pytest.raises(ValueError, match="seed"):
-        evaluation.EpisodeRecordV4.from_dict(wrong_seed)
+        evaluation.EpisodeRecordV5.from_dict(wrong_seed)
+
+    wrong_sample = record.to_dict()
+    wrong_sample["inference_requests"][0]["sampled_target_latency_ns"] += 1
+    with pytest.raises(ValueError, match="frozen schema-v5 sampler"):
+        evaluation.EpisodeRecordV5.from_dict(wrong_sample)
 
 
 def test_episode_record_rejects_missing_extra_bool_nonfinite_wrong_list_and_bad_status():
-    record = evaluation.EpisodeRecordV4.from_attempt(
+    record = evaluation.EpisodeRecordV5.from_attempt(
         _identity(),
         42,
         1,
-        execution_mode="baseline_sync_n5",
+        execution_mode="baseline_async",
         result=_attempt(),
     )
     payload = record.to_dict()
@@ -425,7 +459,7 @@ def test_episode_record_rejects_missing_extra_bool_nonfinite_wrong_list_and_bad_
     )
     for value in malformed:
         with pytest.raises(ValueError):
-            evaluation.EpisodeRecordV4.from_dict(value)
+            evaluation.EpisodeRecordV5.from_dict(value)
 
 
 def test_retry_discards_failed_attempt_metrics_and_restarts_final_attempt_ids_and_seeds():
@@ -440,19 +474,17 @@ def test_retry_discards_failed_attempt_metrics_and_restarts_final_attempt_ids_an
             raise evaluation.InfrastructureFailure("network", "disconnect")
         return _attempt(identity)
 
-    record = evaluation.run_episode_with_retries_v4(
+    record = evaluation.run_episode_with_retries_v5(
         identity,
         attempt,
         eval_seed=42,
-        execution_mode="baseline_sync_n5",
+        execution_mode="baseline_async",
     )
     assert calls == [1, 2]
     assert record.attempts == 2
     assert record.inference_requests[0].request_id == 0
     assert record.inference_requests[0].flow_seed == evaluation.stable_replan_seed(42, identity, 0)
-    assert record.infrastructure_history == (
-        {"attempt": 1, "kind": "network", "error": "disconnect"},
-    )
+    assert record.infrastructure_history == ({"attempt": 1, "kind": "network", "error": "disconnect"},)
 
 
 def test_retry_propagates_policy_failure_instead_of_fabricating_an_empty_attempt():
@@ -464,11 +496,11 @@ def test_retry_propagates_policy_failure_instead_of_fabricating_an_empty_attempt
         raise failure
 
     with pytest.raises(evaluation.PolicyFailure) as caught:
-        evaluation.run_episode_with_retries_v4(
+        evaluation.run_episode_with_retries_v5(
             _identity(),
             attempt,
             eval_seed=42,
-            execution_mode="baseline_sync_n5",
+            execution_mode="baseline_async",
         )
     assert caught.value is failure
     assert calls == [1]
@@ -478,11 +510,11 @@ def test_retry_preserves_a_returned_policy_failure_attempt_and_its_final_timing(
     identity = _identity()
     failed_attempt = _attempt(identity, success=False)
 
-    record = evaluation.run_episode_with_retries_v4(
+    record = evaluation.run_episode_with_retries_v5(
         identity,
         lambda _attempt_number: failed_attempt,
         eval_seed=42,
-        execution_mode="baseline_sync_n5",
+        execution_mode="baseline_async",
     )
 
     assert record.status == "policy_failure"
@@ -497,7 +529,7 @@ def test_infrastructure_exhaustion_is_denominator_ineligible_with_empty_metrics(
     def attempt(_attempt_number):
         raise evaluation.InfrastructureFailure("simulator", "reset failed")
 
-    record = evaluation.run_episode_with_retries_v4(
+    record = evaluation.run_episode_with_retries_v5(
         _identity(),
         attempt,
         eval_seed=42,
@@ -517,8 +549,20 @@ def test_infrastructure_exhaustion_is_denominator_ineligible_with_empty_metrics(
 
 def test_bsp_async_episode_validation_binds_prefetch_events_to_calibrated_budget():
     identity = _identity()
+    sample_keys = tuple(
+        latency_sampling.LatencySampleKeyV1(
+            namespace="formal",
+            seed=42,
+            suite=identity.suite,
+            task_id=identity.task_id,
+            trial_index=identity.init_state_index,
+            request_ordinal=request_id,
+        )
+        for request_id in range(2)
+    )
+    sample_targets = tuple(latency_sampling.NormalLatencySamplerV1().sample_target_ns(key) for key in sample_keys)
     requests = (
-        timing.RequestEventV4(
+        timing.RequestEventV5(
             0,
             0,
             0,
@@ -527,80 +571,103 @@ def test_bsp_async_episode_validation_binds_prefetch_events_to_calibrated_budget
             "initial_plan",
             {},
             "activated",
+            sample_keys[0],
+            sample_targets[0],
         ),
-        timing.RequestEventV4(
+        timing.RequestEventV5(
             1,
             1,
-            50_000_000,
+            sample_targets[0],
             evaluation.stable_replan_seed(42, identity, 1),
             "background",
             "bsp_prefetch",
-            {"remaining_plan_ns": 50_000_000, "budget_ns": 50_000_000},
+            {
+                "remaining_plan_ns": control.SCHEDULING_LATENCY_BUDGET_NS,
+                "budget_ns": control.SCHEDULING_LATENCY_BUDGET_NS,
+            },
             "activated",
+            sample_keys[1],
+            sample_targets[1],
         ),
     )
-    result = evaluation.AttemptResultV4(
+    result = evaluation.AttemptResultV5(
         execution_mode="bsp_spline_async",
         success=True,
         steps=2,
         replans=2,
-        episode_duration_ns=100_000_000,
+        episode_duration_ns=sum(sample_targets) + 50_000_000,
         inference_requests=requests,
         inference_latencies=(
-            timing.LatencyEventV4(0, 25_000_000, 25_000_000, "success"),
-            timing.LatencyEventV4(1, 75_000_000, 25_000_000, "success"),
+            timing.LatencyEventV5(0, sample_targets[0], sample_targets[0], "success"),
+            timing.LatencyEventV5(
+                1,
+                sum(sample_targets),
+                sample_targets[1],
+                "success",
+            ),
         ),
         plan_activations=(
-            timing.PlanActivationV4(
-                0, 0, 0, 25_000_000, "initial", {"curve_elapsed_ns": 0}
-            ),
-            timing.PlanActivationV4(
-                1, 1, 1, 75_000_000, "immediate_swap", {"curve_elapsed_ns": 0}
-            ),
-        ),
-        control_stalls=(
-            timing.ControlStallV4(
-                0, 0, 0, 25_000_000, "synchronous_inference"
+            timing.PlanActivationV5(0, 0, 0, sample_targets[0], "initial", {"curve_elapsed_ns": 0}),
+            timing.PlanActivationV5(
+                1,
+                1,
+                1,
+                sum(sample_targets),
+                "immediate_swap",
+                {"curve_elapsed_ns": 0},
             ),
         ),
+        action_seams=(
+            timing.ActionSeamV5(
+                1,
+                1,
+                1,
+                0.25,
+                0.2,
+                1.0,
+            ),
+        ),
+        control_stalls=(timing.ControlStallV5(0, 0, 0, sample_targets[0], "synchronous_inference"),),
     )
-    record = evaluation.EpisodeRecordV4.from_attempt(
+    record = evaluation.EpisodeRecordV5.from_attempt(
         identity,
         42,
         1,
         execution_mode="bsp_spline_async",
         result=result,
-        expected_bsp_prefetch_budget_ns=50_000_000,
+        expected_bsp_prefetch_budget_ns=control.SCHEDULING_LATENCY_BUDGET_NS,
     )
-    assert evaluation.EpisodeRecordV4.from_dict(
-        record.to_dict(), expected_bsp_prefetch_budget_ns=50_000_000
-    ).to_dict() == record.to_dict()
+    assert (
+        evaluation.EpisodeRecordV5.from_dict(
+            record.to_dict(),
+            expected_bsp_prefetch_budget_ns=control.SCHEDULING_LATENCY_BUDGET_NS,
+        ).to_dict()
+        == record.to_dict()
+    )
     with pytest.raises(ValueError, match="budget"):
-        evaluation.EpisodeRecordV4.from_dict(
-            record.to_dict(), expected_bsp_prefetch_budget_ns=100_000_000
-        )
+        evaluation.EpisodeRecordV5.from_dict(record.to_dict(), expected_bsp_prefetch_budget_ns=100_000_000)
 
 
-def test_aggregate_excludes_infrastructure_and_writer_emits_only_v4_artifacts(tmp_path):
-    success = evaluation.EpisodeRecordV4.from_attempt(
+def test_aggregate_excludes_infrastructure_and_writer_emits_only_v5_artifacts(tmp_path):
+    success = evaluation.EpisodeRecordV5.from_attempt(
         _identity(0),
         42,
         1,
-        execution_mode="baseline_sync_n5",
+        execution_mode="baseline_async",
         result=_attempt(_identity(0)),
     )
-    failed = evaluation.EpisodeRecordV4.from_attempt(
+    failed = evaluation.EpisodeRecordV5.from_attempt(
         _identity(1),
         42,
         1,
-        execution_mode="baseline_sync_n5",
+        execution_mode="baseline_async",
         result=_attempt(_identity(1), success=False),
     )
-    incomplete = evaluation.EpisodeRecordV4.infrastructure_incomplete(
+    incomplete = evaluation.EpisodeRecordV5.infrastructure_incomplete(
         _identity(2),
         42,
         3,
-        execution_mode="baseline_sync_n5",
+        execution_mode="baseline_async",
         kind="network",
         error="offline",
         infrastructure_history=(
@@ -609,30 +676,30 @@ def test_aggregate_excludes_infrastructure_and_writer_emits_only_v4_artifacts(tm
             {"attempt": 3, "kind": "network", "error": "offline"},
         ),
     )
-    artifact_error = evaluation.ArtifactErrorV4(
+    artifact_error = evaluation.ArtifactErrorV5(
         episode_id=success.episode_id,
         artifact_type="video",
         path="videos/example.mp4",
         error="encode failed",
     )
     records = (success, failed, incomplete)
-    summary = evaluation.aggregate_records_v4(records, artifact_errors=(artifact_error,))
+    summary = evaluation.aggregate_records_v5(records, artifact_errors=(artifact_error,))
     assert summary["requested_episodes"] == 3
     assert summary["eligible_episodes"] == 2
     assert summary["successes"] == 1
     assert summary["incomplete_infrastructure_count"] == 1
     assert summary["artifact_error_count"] == 1
     assert not summary["acceptance_complete"]
-    assert evaluation.ArtifactErrorV4.from_dict(artifact_error.to_dict()) == artifact_error
+    assert evaluation.ArtifactErrorV5.from_dict(artifact_error.to_dict()) == artifact_error
 
-    writer = evaluation.ArtifactWriterV4(tmp_path)
+    writer = evaluation.ArtifactWriterV5(tmp_path)
     writer.write_manifest(_manifest())
     for record in records:
         writer.append_episode(record)
     writer.append_artifact_error(artifact_error)
     persisted_summary = writer.write_summary(records, artifact_errors=(artifact_error,))
     assert persisted_summary == summary
-    assert json.loads((tmp_path / "manifest.json").read_text())["schema_version"] == 4
+    assert json.loads((tmp_path / "manifest.json").read_text())["schema_version"] == 5
     assert len((tmp_path / "episodes.jsonl").read_text().splitlines()) == 3
     assert json.loads((tmp_path / "artifact_errors.jsonl").read_text())["artifact_type"] == "video"
     assert json.loads((tmp_path / "summary.json").read_text()) == summary
@@ -641,18 +708,18 @@ def test_aggregate_excludes_infrastructure_and_writer_emits_only_v4_artifacts(tm
     assert not (tmp_path / "suites.csv").exists()
 
 
-def test_each_v4_jsonl_append_leaves_old_bytes_unchanged_on_serialization_or_replace_failure(
+def test_each_v5_jsonl_append_leaves_old_bytes_unchanged_on_serialization_or_replace_failure(
     tmp_path,
     monkeypatch,
 ):
-    record = evaluation.EpisodeRecordV4.from_attempt(
+    record = evaluation.EpisodeRecordV5.from_attempt(
         _identity(),
         42,
         1,
-        execution_mode="baseline_sync_n5",
+        execution_mode="baseline_async",
         result=_attempt(),
     )
-    planned = timing.build_video_timing_audit_v4(
+    planned = timing.build_video_timing_audit_v5(
         control_frame_count=record.steps,
         requests=record.inference_requests,
         latencies=record.inference_latencies,
@@ -661,7 +728,7 @@ def test_each_v4_jsonl_append_leaves_old_bytes_unchanged_on_serialization_or_rep
         stalls=record.control_stalls,
         include_stalls=True,
     )
-    audit = evaluation.build_video_artifact_audit_v4(
+    audit = evaluation.build_video_artifact_audit_v5(
         episode=record,
         path="videos/example.mp4",
         planned=planned,
@@ -670,31 +737,31 @@ def test_each_v4_jsonl_append_leaves_old_bytes_unchanged_on_serialization_or_rep
         encoded_frame_count=planned.video_frame_count,
         encoded_duration_s=planned.expected_duration_ns / 1_000_000_000,
     )
-    artifact_error = evaluation.ArtifactErrorV4(
+    artifact_error = evaluation.ArtifactErrorV5(
         episode_id=record.episode_id,
         artifact_type="video",
         path="videos/example.mp4",
         error="encode failed",
     )
-    writer = evaluation.ArtifactWriterV4(tmp_path)
+    writer = evaluation.ArtifactWriterV5(tmp_path)
     operations = (
         (
             writer.episodes_path,
             writer.append_episode,
             record,
-            evaluation.EpisodeRecordV4,
+            evaluation.EpisodeRecordV5,
         ),
         (
             writer.video_audit_path,
             writer.append_video_audit,
             audit,
-            evaluation.VideoArtifactAuditV4,
+            evaluation.VideoArtifactAuditV5,
         ),
         (
             writer.artifact_errors_path,
             writer.append_artifact_error,
             artifact_error,
-            evaluation.ArtifactErrorV4,
+            evaluation.ArtifactErrorV5,
         ),
     )
     original_bytes = b'{"existing": 1}\n'
@@ -728,21 +795,21 @@ def test_each_v4_jsonl_append_leaves_old_bytes_unchanged_on_serialization_or_rep
 
 
 def test_video_selector_claims_only_the_first_success_and_counted_failure(tmp_path):
-    success = evaluation.EpisodeRecordV4.from_attempt(
+    success = evaluation.EpisodeRecordV5.from_attempt(
         _identity(0),
         42,
         1,
-        execution_mode="baseline_sync_n5",
+        execution_mode="baseline_async",
         result=_attempt(_identity(0)),
     )
-    failure = evaluation.EpisodeRecordV4.from_attempt(
+    failure = evaluation.EpisodeRecordV5.from_attempt(
         _identity(1),
         42,
         1,
-        execution_mode="baseline_sync_n5",
+        execution_mode="baseline_async",
         result=_attempt(_identity(1), success=False),
     )
-    selector = evaluation.VideoSelectorV4(tmp_path)
+    selector = evaluation.VideoSelectorV5(tmp_path)
     assert selector.claim(success).name.startswith("success-")
     assert selector.claim(success) is None
     assert selector.claim(failure).name.startswith("failure-")

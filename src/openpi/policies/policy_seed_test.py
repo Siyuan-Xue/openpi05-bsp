@@ -1,11 +1,13 @@
+# ruff: noqa: SLF001 -- policy contract tests intentionally exercise private seams.
+
 import pathlib
 import types
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 from openpi_client import inference
+import pytest
 
 from openpi import transforms
 from openpi.policies import policy
@@ -72,7 +74,7 @@ def _fake_policy(*, action_representation="native", model_horizon=16, model_dim=
     def rtc_sampler(rng, observation, **kwargs):
         del observation
         seen["rtc"].append((rng, kwargs))
-        return (jnp.arange(16 * 32, dtype=jnp.float32).reshape(1, 16, 32) + 5000)
+        return jnp.arange(16 * 32, dtype=jnp.float32).reshape(1, 16, 32) + 5000
 
     policy_instance._output_transform = output_transform
     policy_instance._sample_actions = legacy_sampler
@@ -331,7 +333,11 @@ def test_policy_computes_exact_reserved_capability_metadata_and_rejects_collisio
             "action_representation": "native",
             "model_action_horizon": 16,
             "model_action_dim": 32,
-            "supported_protocols": ["baseline_h16_n5_v1", "baseline_rtc_h16_v1"],
+            "supported_protocols": [
+                "baseline_h16_n5_v1",
+                "baseline_async_h16_v1",
+                "baseline_rtc_h16_v1",
+            ],
         },
     }
     assert bsp.metadata == {

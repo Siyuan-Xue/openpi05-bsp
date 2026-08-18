@@ -11,6 +11,15 @@ SAMPLER_VERSION = "sha256_box_muller_v1"
 NEGATIVE_POLICY = "deterministic_resample"
 DEFAULT_MEAN_NS = 300_000_000
 DEFAULT_STDDEV_NS = 60_000_000
+DEFAULT_SEED = 42
+SAMPLE_KEY_FIELDS = (
+    "namespace",
+    "seed",
+    "suite",
+    "task_id",
+    "trial_index",
+    "request_ordinal",
+)
 
 
 def _require_nonnegative_integer(value, *, label):
@@ -67,6 +76,15 @@ class LatencySampleKeyV1:
             self.trial_index,
             self.request_ordinal,
         )
+
+    def to_dict(self):
+        return dict(zip(SAMPLE_KEY_FIELDS, self.canonical_values()))
+
+    @classmethod
+    def from_dict(cls, value):
+        if type(value) is not dict or set(value) != set(SAMPLE_KEY_FIELDS):
+            raise ValueError("latency sample key must be an exact JSON object")
+        return cls(**value)
 
 
 class NormalLatencySamplerV1:

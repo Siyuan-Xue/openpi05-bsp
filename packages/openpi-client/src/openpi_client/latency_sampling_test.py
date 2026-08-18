@@ -64,6 +64,21 @@ def test_negative_normal_draw_is_deterministically_resampled():
     assert sampler.sample_target_ns(key) == 76
 
 
+def test_sample_key_round_trips_as_an_exact_json_object():
+    key = latency_sampling.LatencySampleKeyV1(
+        namespace="formal",
+        seed=42,
+        suite="libero_goal",
+        task_id=7,
+        trial_index=49,
+        request_ordinal=12,
+    )
+
+    assert latency_sampling.LatencySampleKeyV1.from_dict(key.to_dict()) == key
+    with pytest.raises(ValueError, match="exact JSON object"):
+        latency_sampling.LatencySampleKeyV1.from_dict(dict(key.to_dict(), extra=True))
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

@@ -1,4 +1,4 @@
-"""Strict schema-v4 timing and video accounting contracts.
+"""Strict schema-v5 timing and video accounting contracts.
 
 These tests are intentionally dependency-free.  Per the integration plan they
 are authored before production code, but are not executed on this checkout.
@@ -11,7 +11,8 @@ import operator
 import pytest
 
 from openpi_client import libero_eval
-from openpi_client import libero_video_timing_v4 as timing
+from openpi_client import libero_video_timing_v5 as timing
+from openpi_client import latency_sampling
 
 
 _EVAL_SEED = 42
@@ -26,6 +27,17 @@ _IDENTITY = libero_eval.EpisodeIdentity(
 
 def _flow_seed(request_id):
     return libero_eval.stable_replan_seed(_EVAL_SEED, _IDENTITY, request_id)
+
+
+def _sample_key(request_id):
+    return latency_sampling.LatencySampleKeyV1(
+        namespace="formal",
+        seed=42,
+        suite=_IDENTITY.suite,
+        task_id=_IDENTITY.task_id,
+        trial_index=_IDENTITY.init_state_index,
+        request_ordinal=request_id,
+    )
 
 
 def _assert_raises(exception_type, callback):
@@ -52,7 +64,7 @@ def _request(
         flow_seed = _flow_seed(request_id)
     if scheduler_context is None:
         scheduler_context = {"s": 8, "d": 8}
-    return timing.RequestEventV4(
+    return timing.RequestEventV5(
         request_id=request_id,
         observation_control_step=observation_control_step,
         submitted_offset_ns=submitted_offset_ns,
@@ -61,6 +73,8 @@ def _request(
         trigger=trigger,
         scheduler_context=scheduler_context,
         disposition=disposition,
+        latency_sample_key=_sample_key(request_id),
+        sampled_target_latency_ns=0,
     )
 
 
@@ -77,16 +91,50 @@ def _initial_request(*, disposition="activated"):
 
 
 def _latency(request_id, completed_offset_ns, duration_ns, *, outcome="success"):
-    return timing.LatencyEventV4(
+    return timing.LatencyEventV5(
         request_id=request_id,
         completed_offset_ns=completed_offset_ns,
         duration_ns=duration_ns,
         outcome=outcome,
+        sampled_target_latency_ns=0,
     )
 
 
+def test_request_and_latency_records_expose_paired_sample_identity_and_target():
+    request = dataclasses.replace(_initial_request(), sampled_target_latency_ns=300_000_000)
+    latency = timing.LatencyEventV5(
+        request_id=0,
+        completed_offset_ns=300_000_000,
+        duration_ns=300_000_000,
+        outcome="success",
+        raw_inference_latency_ns=80_000_000,
+        synthetic_delay_ns=220_000_000,
+        effective_inference_latency_ns=300_000_000,
+        sampled_target_latency_ns=300_000_000,
+    )
+
+    assert request.to_dict()["latency_sample_key"] == _sample_key(0).to_dict()
+    assert request.to_dict()["sampled_target_latency_ns"] == 300_000_000
+    assert latency.to_dict()["sampled_target_latency_ns"] == 300_000_000
+
+
+def test_action_seam_records_exact_arm_and_gripper_jumps():
+    seam = timing.ActionSeamV5.from_actions(
+        plan_id=1,
+        request_id=1,
+        control_step=8,
+        previous_action=(0.0, 1.0, 2.0, 3.0, 4.0, 5.0, -1.0),
+        activated_action=(1.0, 1.0, 2.0, 3.0, 4.0, 5.0, 1.0),
+    )
+
+    assert seam.arm_l2_jump == pytest.approx(1.0)
+    assert seam.arm_max_abs_jump == pytest.approx(1.0)
+    assert seam.gripper_abs_jump == pytest.approx(2.0)
+    assert timing.ActionSeamV5.from_dict(seam.to_dict()) == seam
+
+
 def test_latency_event_records_raw_synthetic_and_effective_durations_separately():
-    event = timing.LatencyEventV4(
+    event = timing.LatencyEventV5(
         request_id=3,
         completed_offset_ns=400_000_000,
         duration_ns=300_000_000,
@@ -100,12 +148,12 @@ def test_latency_event_records_raw_synthetic_and_effective_durations_separately(
     assert payload["raw_inference_latency_ns"] == 80_000_000
     assert payload["synthetic_delay_ns"] == 220_000_000
     assert payload["effective_inference_latency_ns"] == 300_000_000
-    assert timing.LatencyEventV4.from_dict(payload) == event
+    assert timing.LatencyEventV5.from_dict(payload) == event
 
 
 def test_latency_event_rejects_breakdowns_that_do_not_sum_to_effective_latency():
     with pytest.raises(ValueError, match="raw.*synthetic.*effective"):
-        timing.LatencyEventV4(
+        timing.LatencyEventV5(
             request_id=3,
             completed_offset_ns=400_000_000,
             duration_ns=300_000_000,
@@ -117,7 +165,7 @@ def test_latency_event_rejects_breakdowns_that_do_not_sum_to_effective_latency()
 
 
 def _native_activation(plan_id, request_id, control_step, activated_offset_ns, *, activation):
-    return timing.PlanActivationV4(
+    return timing.PlanActivationV5(
         plan_id=plan_id,
         request_id=request_id,
         control_step=control_step,
@@ -128,7 +176,7 @@ def _native_activation(plan_id, request_id, control_step, activated_offset_ns, *
 
 
 def _stall(request_id, control_step, started_offset_ns, duration_ns, *, reason):
-    return timing.ControlStallV4(
+    return timing.ControlStallV5(
         request_id=request_id,
         control_step=control_step,
         started_offset_ns=started_offset_ns,
@@ -154,7 +202,7 @@ def _mixed_async_timeline():
         _native_activation(2, 2, 16, 935_000_000, activation="immediate_swap"),
     )
     underflows = (
-        timing.ActionUnderflowV4(
+        timing.ActionUnderflowV5(
             request_id=2,
             control_step=16,
             started_offset_ns=900_000_000,
@@ -182,6 +230,8 @@ def test_event_records_round_trip_exact_fields_and_defensively_copy_contexts():
         "trigger": "rtc_launch",
         "scheduler_context": {"s": 8, "d": 8},
         "disposition": "activated",
+        "latency_sample_key": _sample_key(3).to_dict(),
+        "sampled_target_latency_ns": 0,
     }
     _assert_raises(TypeError, lambda: operator.setitem(request.scheduler_context, "s", 9))
     _assert_raises(dataclasses.FrozenInstanceError, lambda: setattr(request, "request_id", 4))
@@ -190,7 +240,7 @@ def test_event_records_round_trip_exact_fields_and_defensively_copy_contexts():
         request,
         _latency(3, 90, 50),
         _native_activation(1, 3, 4, 91, activation="immediate_swap"),
-        timing.ActionUnderflowV4(3, 4, 75, 16),
+        timing.ActionUnderflowV5(3, 4, 75, 16),
         _stall(3, 4, 75, 16, reason="async_action_underflow"),
     )
     for record in records:
@@ -202,7 +252,7 @@ def test_every_event_rejects_missing_extra_bool_nonfinite_and_wrong_json_contain
         _initial_request(),
         _latency(0, 125, 125),
         _native_activation(0, 0, 0, 125, activation="initial"),
-        timing.ActionUnderflowV4(0, 0, 100, 25),
+        timing.ActionUnderflowV5(0, 0, 100, 25),
         _stall(0, 0, 100, 25, reason="async_action_underflow"),
     )
     integer_fields = (
@@ -226,16 +276,16 @@ def test_every_event_rejects_missing_extra_bool_nonfinite_and_wrong_json_contain
 
     malformed_context = _initial_request().to_dict()
     malformed_context["scheduler_context"] = []
-    _assert_raises(ValueError, lambda: timing.RequestEventV4.from_dict(malformed_context))
+    _assert_raises(ValueError, lambda: timing.RequestEventV5.from_dict(malformed_context))
     malformed_activation_context = records[2].to_dict()
     malformed_activation_context["activation_context"] = []
     _assert_raises(
         ValueError,
-        lambda: timing.PlanActivationV4.from_dict(malformed_activation_context),
+        lambda: timing.PlanActivationV5.from_dict(malformed_activation_context),
     )
     wrong_clock = records[1].to_dict()
     wrong_clock["clock"] = "wall_clock"
-    _assert_raises(ValueError, lambda: timing.LatencyEventV4.from_dict(wrong_clock))
+    _assert_raises(ValueError, lambda: timing.LatencyEventV5.from_dict(wrong_clock))
 
 
 def test_request_context_and_enum_validation_is_exact_and_trigger_aware():
@@ -265,7 +315,7 @@ def test_request_context_and_enum_validation_is_exact_and_trigger_aware():
     invalid_payloads.append(wrong_bsp_context)
 
     for payload in invalid_payloads:
-        _assert_raises(ValueError, lambda payload=payload: timing.RequestEventV4.from_dict(payload))
+        _assert_raises(ValueError, lambda payload=payload: timing.RequestEventV5.from_dict(payload))
 
     latency = _latency(0, 1, 1).to_dict()
     latency["outcome"] = "transport_error"
@@ -274,16 +324,16 @@ def test_request_context_and_enum_validation_is_exact_and_trigger_aware():
     stall = _stall(0, 0, 0, 1, reason="synchronous_inference").to_dict()
     stall["reason"] = "network"
     for record_type, payload in (
-        (timing.LatencyEventV4, latency),
-        (timing.PlanActivationV4, activation),
-        (timing.ControlStallV4, stall),
+        (timing.LatencyEventV5, latency),
+        (timing.PlanActivationV5, activation),
+        (timing.ControlStallV5, stall),
     ):
         _assert_raises(ValueError, lambda record_type=record_type, payload=payload: record_type.from_dict(payload))
 
 
 def test_cross_event_validation_accepts_initial_sync_background_overlap_and_later_underflow():
     events = _mixed_async_timeline()
-    normalized = timing.validate_timing_events_v4(
+    normalized = timing.validate_timing_events_v5(
         requests=events[0],
         latencies=events[1],
         activations=events[2],
@@ -319,13 +369,19 @@ def test_cross_event_validation_rejects_id_orphan_order_interval_and_seed_mutati
             "identity": _IDENTITY,
         }
         values.update(changes)
-        timing.validate_timing_events_v4(**values)
+        timing.validate_timing_events_v5(**values)
 
-    gapped_requests = (requests[0], dataclasses.replace(requests[1], request_id=2), requests[2])
-    orphan_latency = latencies + (_latency(9, 950_000_000, 1),)
-    orphan_activation = activations + (
-        _native_activation(3, 9, 17, 950_000_000, activation="immediate_swap"),
+    gapped_requests = (
+        requests[0],
+        dataclasses.replace(
+            requests[1],
+            request_id=2,
+            latency_sample_key=_sample_key(2),
+        ),
+        requests[2],
     )
+    orphan_latency = latencies + (_latency(9, 950_000_000, 1),)
+    orphan_activation = activations + (_native_activation(3, 9, 17, 950_000_000, activation="immediate_swap"),)
     early_activation = (
         activations[0],
         dataclasses.replace(activations[1], activated_offset_ns=379_999_999),
@@ -388,7 +444,7 @@ def test_cross_event_validation_has_no_caller_supplied_seed_bypass():
 
     _assert_raises(
         TypeError,
-        lambda: timing.validate_timing_events_v4(
+        lambda: timing.validate_timing_events_v5(
             requests=forged_requests,
             latencies=latencies,
             activations=activations,
@@ -408,7 +464,7 @@ def test_mode_aware_validation_rejects_invalid_rtc_and_bsp_contexts():
     requests, latencies, activations, underflows, stalls = _mixed_async_timeline()
     rtc_payload = requests[1].to_dict()
     rtc_payload["scheduler_context"] = {"s": 8, "d": 9}
-    _assert_raises(ValueError, lambda: timing.RequestEventV4.from_dict(rtc_payload))
+    _assert_raises(ValueError, lambda: timing.RequestEventV5.from_dict(rtc_payload))
 
     bsp_requests = (
         _initial_request(),
@@ -423,23 +479,26 @@ def test_mode_aware_validation_rejects_invalid_rtc_and_bsp_contexts():
     )
     bsp_latencies = (_latency(0, 100, 100), _latency(1, 175, 25))
     bsp_activations = (
-        timing.PlanActivationV4(0, 0, 0, 100, "initial", {"curve_elapsed_ns": 0}),
-        timing.PlanActivationV4(1, 1, 1, 175, "immediate_swap", {"curve_elapsed_ns": 0}),
+        timing.PlanActivationV5(0, 0, 0, 100, "initial", {"curve_elapsed_ns": 0}),
+        timing.PlanActivationV5(1, 1, 1, 175, "immediate_swap", {"curve_elapsed_ns": 0}),
     )
     bsp_stalls = (_stall(0, 0, 0, 100, reason="synchronous_inference"),)
-    assert timing.validate_timing_events_v4(
-        requests=bsp_requests,
-        latencies=bsp_latencies,
-        activations=bsp_activations,
-        underflows=(),
-        stalls=bsp_stalls,
-        steps=2,
-        episode_duration_ns=200,
-        execution_mode="bsp_spline_async",
-        eval_seed=_EVAL_SEED,
-        identity=_IDENTITY,
-        expected_bsp_prefetch_budget_ns=50,
-    )[0] == bsp_requests
+    assert (
+        timing.validate_timing_events_v5(
+            requests=bsp_requests,
+            latencies=bsp_latencies,
+            activations=bsp_activations,
+            underflows=(),
+            stalls=bsp_stalls,
+            steps=2,
+            episode_duration_ns=200,
+            execution_mode="bsp_spline_async",
+            eval_seed=_EVAL_SEED,
+            identity=_IDENTITY,
+            expected_bsp_prefetch_budget_ns=50,
+        )[0]
+        == bsp_requests
+    )
 
     wrong_budget = dataclasses.replace(
         bsp_requests[1],
@@ -447,7 +506,7 @@ def test_mode_aware_validation_rejects_invalid_rtc_and_bsp_contexts():
     )
     _assert_raises(
         ValueError,
-        lambda: timing.validate_timing_events_v4(
+        lambda: timing.validate_timing_events_v5(
             requests=(bsp_requests[0], wrong_budget),
             latencies=bsp_latencies,
             activations=bsp_activations,
@@ -464,7 +523,7 @@ def test_mode_aware_validation_rejects_invalid_rtc_and_bsp_contexts():
 
     _assert_raises(
         ValueError,
-        lambda: timing.validate_timing_events_v4(
+        lambda: timing.validate_timing_events_v5(
             requests=bsp_requests,
             latencies=bsp_latencies,
             activations=bsp_activations,
@@ -479,11 +538,11 @@ def test_mode_aware_validation_rejects_invalid_rtc_and_bsp_contexts():
     )
     _assert_raises(
         ValueError,
-        lambda: timing.validate_timing_events_v4(
+        lambda: timing.validate_timing_events_v5(
             requests=(_initial_request(),),
             latencies=(_latency(0, 100, 100),),
             activations=(
-                timing.PlanActivationV4(
+                timing.PlanActivationV5(
                     0,
                     0,
                     0,
@@ -501,11 +560,11 @@ def test_mode_aware_validation_rejects_invalid_rtc_and_bsp_contexts():
             identity=_IDENTITY,
         ),
     )
-    timing.validate_timing_events_v4(
+    timing.validate_timing_events_v5(
         requests=(_initial_request(),),
         latencies=(_latency(0, 100, 100),),
         activations=(
-            timing.PlanActivationV4(
+            timing.PlanActivationV5(
                 0,
                 0,
                 0,
@@ -526,11 +585,11 @@ def test_mode_aware_validation_rejects_invalid_rtc_and_bsp_contexts():
     for invalid_budget in (True, -1):
         _assert_raises(
             ValueError,
-            lambda invalid_budget=invalid_budget: timing.validate_timing_events_v4(
+            lambda invalid_budget=invalid_budget: timing.validate_timing_events_v5(
                 requests=(_initial_request(),),
                 latencies=(_latency(0, 100, 100),),
                 activations=(
-                    timing.PlanActivationV4(
+                    timing.PlanActivationV5(
                         0,
                         0,
                         0,
@@ -551,7 +610,7 @@ def test_mode_aware_validation_rejects_invalid_rtc_and_bsp_contexts():
         )
     _assert_raises(
         ValueError,
-        lambda: timing.validate_timing_events_v4(
+        lambda: timing.validate_timing_events_v5(
             requests=(_initial_request(),),
             latencies=(_latency(0, 100, 100),),
             activations=(_native_activation(0, 0, 0, 100, activation="initial"),),
@@ -576,7 +635,7 @@ def test_cross_event_chronology_binds_submissions_activation_steps_and_blocking_
     )
     _assert_raises(
         ValueError,
-        lambda: timing.validate_timing_events_v4(
+        lambda: timing.validate_timing_events_v5(
             requests=requests,
             latencies=latencies,
             activations=delayed_prior_activation,
@@ -602,12 +661,12 @@ def test_cross_event_chronology_binds_submissions_activation_steps_and_blocking_
         ),
     )
     bsp_activations = (
-        timing.PlanActivationV4(0, 0, 0, 100, "initial", {"curve_elapsed_ns": 0}),
-        timing.PlanActivationV4(1, 1, 1, 175, "immediate_swap", {"curve_elapsed_ns": 0}),
+        timing.PlanActivationV5(0, 0, 0, 100, "initial", {"curve_elapsed_ns": 0}),
+        timing.PlanActivationV5(1, 1, 1, 175, "immediate_swap", {"curve_elapsed_ns": 0}),
     )
     _assert_raises(
         ValueError,
-        lambda: timing.validate_timing_events_v4(
+        lambda: timing.validate_timing_events_v5(
             requests=bsp_requests,
             latencies=(_latency(0, 100, 100), _latency(1, 175, 25)),
             activations=bsp_activations,
@@ -622,99 +681,13 @@ def test_cross_event_chronology_binds_submissions_activation_steps_and_blocking_
         ),
     )
 
-    sync_requests = (
-        _initial_request(),
-        _request(
-            1,
-            150,
-            observation_control_step=1,
-            dispatch="blocking_replan",
-            trigger="baseline_chunk_exhausted",
-            scheduler_context={},
-        ),
-    )
-    sync_latencies = (_latency(0, 100, 100), _latency(1, 200, 50))
-    sync_activations = (
-        _native_activation(0, 0, 0, 100, activation="initial"),
-        _native_activation(1, 1, 2, 200, activation="blocking_replace"),
-    )
-    sync_stalls = (
-        _stall(0, 0, 0, 100, reason="synchronous_inference"),
-        _stall(1, 1, 175, 25, reason="synchronous_inference"),
-    )
-    _assert_raises(
-        ValueError,
-        lambda: timing.validate_timing_events_v4(
-            requests=sync_requests,
-            latencies=sync_latencies,
-            activations=sync_activations,
-            underflows=(),
-            stalls=sync_stalls,
-            steps=2,
-            episode_duration_ns=200,
-            execution_mode="baseline_sync_n5",
-            eval_seed=_EVAL_SEED,
-            identity=_IDENTITY,
-        ),
-    )
-    _assert_raises(
-        ValueError,
-        lambda: timing.validate_timing_events_v4(
-            requests=sync_requests,
-            latencies=sync_latencies,
-            activations=sync_activations,
-            underflows=(),
-            stalls=(sync_stalls[0], dataclasses.replace(sync_stalls[1], control_step=2)),
-            steps=2,
-            episode_duration_ns=200,
-            execution_mode="baseline_sync_n5",
-            eval_seed=_EVAL_SEED,
-            identity=_IDENTITY,
-        ),
-    )
-
-    failed_request = dataclasses.replace(sync_requests[1], disposition="failed")
-    failed_latency = _latency(1, 200, 50, outcome="policy_failure")
-    _assert_raises(
-        ValueError,
-        lambda: timing.validate_timing_events_v4(
-            requests=(sync_requests[0], failed_request),
-            latencies=(sync_latencies[0], failed_latency),
-            activations=(sync_activations[0],),
-            underflows=(),
-            stalls=(sync_stalls[0], dataclasses.replace(sync_stalls[1], control_step=2)),
-            steps=2,
-            episode_duration_ns=200,
-            execution_mode="baseline_sync_n5",
-            eval_seed=_EVAL_SEED,
-            identity=_IDENTITY,
-        ),
-    )
-
-    wrong_initial_step = dataclasses.replace(sync_stalls[0], control_step=1)
-    _assert_raises(
-        ValueError,
-        lambda: timing.validate_timing_events_v4(
-            requests=(sync_requests[0],),
-            latencies=(sync_latencies[0],),
-            activations=(sync_activations[0],),
-            underflows=(),
-            stalls=(wrong_initial_step,),
-            steps=1,
-            episode_duration_ns=100,
-            execution_mode="baseline_sync_n5",
-            eval_seed=_EVAL_SEED,
-            identity=_IDENTITY,
-        ),
-    )
-
 
 def test_background_policy_failure_underflow_cannot_precede_observation_step():
     failed_request = dataclasses.replace(
         _request(1, 150, observation_control_step=2),
         disposition="failed",
     )
-    underflow = timing.ActionUnderflowV4(1, 1, 175, 25)
+    underflow = timing.ActionUnderflowV5(1, 1, 175, 25)
     stalls = (
         _stall(0, 0, 0, 100, reason="synchronous_inference"),
         _stall(1, 1, 175, 25, reason="async_action_underflow"),
@@ -722,7 +695,7 @@ def test_background_policy_failure_underflow_cannot_precede_observation_step():
 
     _assert_raises(
         ValueError,
-        lambda: timing.validate_timing_events_v4(
+        lambda: timing.validate_timing_events_v5(
             requests=(_initial_request(), failed_request),
             latencies=(
                 _latency(0, 100, 100),
@@ -750,13 +723,13 @@ def test_zero_duration_events_touch_at_endpoints_and_accept_control_step_equal_t
         _native_activation(0, 0, 0, 0, activation="initial"),
         _native_activation(1, 1, 1, 0, activation="immediate_swap"),
     )
-    underflows = (timing.ActionUnderflowV4(1, 1, 0, 0),)
+    underflows = (timing.ActionUnderflowV5(1, 1, 0, 0),)
     stalls = (
         _stall(0, 0, 0, 0, reason="synchronous_inference"),
         _stall(1, 1, 0, 0, reason="async_action_underflow"),
     )
 
-    assert timing.validate_timing_events_v4(
+    assert timing.validate_timing_events_v5(
         requests=requests,
         latencies=latencies,
         activations=activations,
@@ -774,7 +747,7 @@ def test_failed_and_abandoned_requests_have_exactly_the_allowed_relations():
     failed_request = dataclasses.replace(_initial_request(), disposition="failed")
     failed_latency = _latency(0, 25, 25, outcome="policy_failure")
     failed_stall = _stall(0, 0, 0, 25, reason="synchronous_inference")
-    timing.validate_timing_events_v4(
+    timing.validate_timing_events_v5(
         requests=(failed_request,),
         latencies=(failed_latency,),
         activations=(),
@@ -782,7 +755,7 @@ def test_failed_and_abandoned_requests_have_exactly_the_allowed_relations():
         stalls=(failed_stall,),
         steps=0,
         episode_duration_ns=25,
-        execution_mode="baseline_sync_n5",
+        execution_mode="baseline_async",
         eval_seed=_EVAL_SEED,
         identity=_IDENTITY,
     )
@@ -791,7 +764,7 @@ def test_failed_and_abandoned_requests_have_exactly_the_allowed_relations():
         _request(1, 150, observation_control_step=1),
         disposition="abandoned",
     )
-    timing.validate_timing_events_v4(
+    timing.validate_timing_events_v5(
         requests=(_initial_request(), abandoned_request),
         latencies=(_latency(0, 100, 100),),
         activations=(_native_activation(0, 0, 0, 100, activation="initial"),),
@@ -812,22 +785,22 @@ def test_reason_alone_selects_overlay_and_mixed_stalls_quantize_cumulatively():
         _stall(2, 2, 40_000_000, 12_500_000, reason="synchronous_inference"),
     )
 
-    assert timing.stall_overlay_lines_v4(stalls[0]) == (
+    assert timing.stall_overlay_lines_v5(stalls[0]) == (
         "Synchronous inference",
         "Control stalled: 0.01 s",
     )
-    assert timing.stall_overlay_lines_v4(stalls[1]) == (
+    assert timing.stall_overlay_lines_v5(stalls[1]) == (
         "Waiting for policy actions",
         "Control stalled: 0.01 s",
     )
-    assert timing.quantize_stall_frames_v4(stalls) == (0, 1, 0)
+    assert timing.quantize_stall_frames_v5(stalls) == (0, 1, 0)
 
-    audit = timing.build_video_timing_audit_v4(
+    audit = timing.build_video_timing_audit_v5(
         control_frame_count=0,
         requests=(),
         latencies=(),
         activations=(),
-        underflows=(timing.ActionUnderflowV4(1, 1, 20_000_000, 12_500_000),),
+        underflows=(timing.ActionUnderflowV5(1, 1, 20_000_000, 12_500_000),),
         stalls=stalls,
         include_stalls=True,
     )
@@ -836,13 +809,13 @@ def test_reason_alone_selects_overlay_and_mixed_stalls_quantize_cumulatively():
 
 
 def test_control_frames_are_held_twice_and_fifty_ms_underflow_adds_two_frames():
-    assert timing.expand_control_frames_v4(("a", "b")) == ("a", "a", "b", "b")
+    assert timing.expand_control_frames_v5(("a", "b")) == ("a", "a", "b", "b")
     request = _request(1, 0)
     latency = _latency(1, 75_000_000, 75_000_000)
-    underflow = timing.ActionUnderflowV4(1, 2, 25_000_000, 50_000_000)
+    underflow = timing.ActionUnderflowV5(1, 2, 25_000_000, 50_000_000)
     stall = _stall(1, 2, 25_000_000, 50_000_000, reason="async_action_underflow")
 
-    audit = timing.build_video_timing_audit_v4(
+    audit = timing.build_video_timing_audit_v5(
         control_frame_count=2,
         requests=(request,),
         latencies=(latency,),
@@ -862,10 +835,10 @@ def test_control_frames_are_held_twice_and_fifty_ms_underflow_adds_two_frames():
 def test_audit_distinguishes_measured_stalls_from_included_overlay_stalls():
     request = _request(1, 0)
     latency = _latency(1, 50_000_000, 50_000_000)
-    underflow = timing.ActionUnderflowV4(1, 1, 0, 50_000_000)
+    underflow = timing.ActionUnderflowV5(1, 1, 0, 50_000_000)
     stall = _stall(1, 1, 0, 50_000_000, reason="async_action_underflow")
 
-    audit = timing.build_video_timing_audit_v4(
+    audit = timing.build_video_timing_audit_v5(
         control_frame_count=3,
         requests=(request,),
         latencies=(latency,),
@@ -899,11 +872,11 @@ def test_audit_distinguishes_measured_stalls_from_included_overlay_stalls():
         "expected_duration_ns": 150_000_000,
         "duration_deviation_ns": 0,
     }
-    assert timing.VideoTimingAuditV4.from_dict(audit.to_dict()) == audit
+    assert timing.VideoTimingAuditV5.from_dict(audit.to_dict()) == audit
 
 
 def test_background_request_latency_without_stall_adds_no_video_frames():
-    audit = timing.build_video_audit_v4(
+    audit = timing.build_video_audit_v5(
         control_frame_count=1,
         requests=(_request(1, 0),),
         latencies=(_latency(1, 500_000_000, 500_000_000),),
@@ -918,7 +891,7 @@ def test_background_request_latency_without_stall_adds_no_video_frames():
 
 
 def test_video_audit_from_dict_rejects_exact_field_and_derived_value_mutations():
-    audit = timing.build_video_timing_audit_v4(
+    audit = timing.build_video_timing_audit_v5(
         control_frame_count=1,
         requests=(),
         latencies=(),
@@ -947,16 +920,16 @@ def test_video_audit_from_dict_rejects_exact_field_and_derived_value_mutations()
         impossible_counts,
         impossible_total,
     ):
-        _assert_raises(ValueError, lambda malformed=malformed: timing.VideoTimingAuditV4.from_dict(malformed))
+        _assert_raises(ValueError, lambda malformed=malformed: timing.VideoTimingAuditV5.from_dict(malformed))
 
 
 def test_video_audit_from_dict_defensively_copies_included_lists():
-    audit = timing.build_video_timing_audit_v4(
+    audit = timing.build_video_timing_audit_v5(
         control_frame_count=1,
         requests=(_request(1, 0),),
         latencies=(_latency(1, 50_000_000, 50_000_000),),
         activations=(),
-        underflows=(timing.ActionUnderflowV4(1, 1, 0, 50_000_000),),
+        underflows=(timing.ActionUnderflowV5(1, 1, 0, 50_000_000),),
         stalls=(_stall(1, 1, 0, 50_000_000, reason="async_action_underflow"),),
         include_stalls=True,
     )
@@ -979,9 +952,9 @@ def test_video_audit_from_dict_defensively_copies_included_lists():
         wrong_underflow_reason_count,
         coherent_quantization_tamper,
     ):
-        _assert_raises(ValueError, lambda malformed=malformed: timing.VideoTimingAuditV4.from_dict(malformed))
+        _assert_raises(ValueError, lambda malformed=malformed: timing.VideoTimingAuditV5.from_dict(malformed))
 
-    restored = timing.VideoTimingAuditV4.from_dict(payload)
+    restored = timing.VideoTimingAuditV5.from_dict(payload)
     payload["included_stall_reasons"][0] = "synchronous_inference"
     payload["included_stall_frame_counts"][0] = 99
     assert restored.included_stall_reasons == ("async_action_underflow",)

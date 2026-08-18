@@ -73,9 +73,7 @@ class RtcActionChunk:
         if not isinstance(rtc_sidecar, Mapping):
             raise ValueError("RTC response rtc sidecar must be a mapping")
         if set(rtc_sidecar) != {"schema_version", "model_actions"}:
-            raise ValueError(
-                "RTC response sidecar must contain exactly schema_version and model_actions"
-            )
+            raise ValueError("RTC response sidecar must contain exactly schema_version and model_actions")
         schema_version = rtc_sidecar["schema_version"]
         if (
             isinstance(schema_version, bool)
@@ -100,8 +98,11 @@ class RtcActionChunk:
 class RtcPlan:
     """Own action-chunk timing while leaving transport and clocks to the caller."""
 
-    def __init__(self, *, d_init: int):
+    def __init__(self, *, d_init: int, fixed_delay: bool = False):
         self._d_init = _validate_initial_delay(d_init)
+        if not isinstance(fixed_delay, bool):
+            raise ValueError("fixed_delay must be a boolean")
+        self._fixed_delay = fixed_delay
         self.reset()
 
     @property
@@ -131,6 +132,8 @@ class RtcPlan:
 
     @property
     def forecast_delay(self) -> int:
+        if self._fixed_delay:
+            return self._d_init
         return max(self._delay_history)
 
     @property
@@ -224,6 +227,35 @@ class RtcPlan:
         self._delay_history.append(actual_delay)
         self._request_kind = None
         self._request_start_cursor = None
+
+
+class RawAsyncPlan(RtcPlan):
+    """Baseline async timing with no RTC continuity guidance."""
+
+    def __init__(self, *, d_init: int):
+        super().__init__(d_init=d_init, fixed_delay=True)
+
+    def begin_background(self) -> Dict[str, Dict[str, int]]:
+        if self._request_kind is not None:
+            raise RtcRequestInFlightError("an async request is already in flight")
+        if self._chunk is None:
+            raise RtcLaunchNotReadyError("async bootstrap has not installed a chunk")
+        if self._cursor >= ACTION_HORIZON:
+            raise RtcPlanExhaustedError("async action plan is exhausted")
+
+        delay = self.forecast_delay
+        if self._cursor + delay > ACTION_HORIZON:
+            raise RtcLaunchInfeasibleError("async launch cannot satisfy cursor + delay <= 16")
+        if self._cursor < max(MIN_START, delay):
+            raise RtcLaunchNotReadyError("async launch threshold has not been reached")
+
+        self._request_kind = "raw_background"
+        self._request_start_cursor = self._cursor
+        return {
+            inference.RTC_REQUEST_KEY: {
+                "schema_version": inference.RTC_SCHEMA_VERSION,
+            }
+        }
 
 
 def _validated_float32_copy(value: Any, *, shape: Tuple[int, int], label: str) -> np.ndarray:

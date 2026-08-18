@@ -1,4 +1,4 @@
-"""Pure schema-v4 LIBERO control, calibration, and scheduling primitives."""
+"""Pure schema-v5 LIBERO control, calibration, and scheduling primitives."""
 
 import dataclasses
 import hashlib
@@ -13,11 +13,17 @@ import numpy as np
 
 from openpi_client import bsp_spline
 from openpi_client import inference
+from openpi_client import latency_sampling
 from openpi_client import msgpack_numpy
 from openpi_client import rtc
 
 
 CONTROL_PERIOD_NS = 50_000_000
+LATENCY_DISTRIBUTION_MEAN_NS = 300_000_000
+LATENCY_DISTRIBUTION_STDDEV_NS = 60_000_000
+THEORETICAL_P95_LATENCY_NS = 398_691_218
+SCHEDULING_LATENCY_BUDGET_NS = 400_000_000
+SCHEDULING_DELAY_TICKS = 8
 CALIBRATION_WARMUP_COUNT = 5
 CALIBRATION_MEASUREMENT_COUNT = 20
 CALIBRATION_INFRASTRUCTURE_RETRIES = 2
@@ -30,12 +36,16 @@ _CANONICAL_TYPE_TAGS = frozenset(("__float_hex__", "__bytes__", "__ndarray__"))
 
 
 _EXECUTION_PARAMETERS_BY_NAME = {
-    "baseline_sync_n5": {
+    "baseline_async": {
         "action_representation": "native",
-        "dispatch": "synchronous",
+        "dispatch": "asynchronous_after_initial",
         "model_action_horizon": 16,
-        "execution_horizon": 8,
+        "model_action_dim": 32,
+        "minimum_launch_cursor": 8,
+        "forecast_delay_ticks": 8,
         "num_inference_steps": 5,
+        "continuity_guidance": False,
+        "activation_policy": "immediate_skip_elapsed_prefix",
     },
     "baseline_rtc": {
         "action_representation": "native",
@@ -45,18 +55,9 @@ _EXECUTION_PARAMETERS_BY_NAME = {
         "minimum_launch_cursor": 8,
         "num_inference_steps": 5,
         "guidance_beta": 5,
-        "delay_history_size": 10,
+        "forecast_delay_ticks": 8,
+        "continuity_guidance": True,
         "activation_policy": "immediate",
-    },
-    "bsp_spline_sync": {
-        "action_representation": "bsp",
-        "dispatch": "synchronous",
-        "parameter_shape": [16, 8],
-        "origin_hz": 10,
-        "degree": 3,
-        "speedup": 1,
-        "alignment": "disabled_delta_eff",
-        "activation_policy": "blocking_replace",
     },
     "bsp_spline_async": {
         "action_representation": "bsp",
@@ -72,9 +73,8 @@ _EXECUTION_PARAMETERS_BY_NAME = {
 }
 
 _MODE_IDENTITIES = {
-    "baseline_sync_n5": ("baseline", "baseline_h16_n5_v1", 16, False, None),
+    "baseline_async": ("baseline", "baseline_async_h16_v1", 16, True, "baseline_async"),
     "baseline_rtc": ("baseline", "baseline_rtc_h16_v1", 16, True, "rtc"),
-    "bsp_spline_sync": ("bsp", "bsp_spline_h8_v1", 8, False, None),
     "bsp_spline_async": ("bsp", "bsp_spline_h8_v1", 8, True, "bsp"),
 }
 
@@ -169,7 +169,7 @@ class ExecutionModeSpec:
             type(value) is not type(expected_value) or value != expected_value
             for value, expected_value in zip(actual, expected)
         ):
-            raise ValueError("Execution mode does not match the frozen schema-v4 mode table")
+            raise ValueError("Execution mode does not match the frozen schema-v5 mode table")
 
     def to_parameters_dict(self) -> Dict[str, Any]:
         return _copy_json_value(_EXECUTION_PARAMETERS_BY_NAME[self.name])
@@ -191,7 +191,7 @@ EXECUTION_MODES = MappingProxyType(
 
 
 @dataclasses.dataclass(frozen=True)
-class RequestIntentV4:
+class RequestIntentV5:
     dispatch: str
     trigger: str
     scheduler_context: Mapping[str, int]
@@ -202,9 +202,8 @@ class RequestIntentV4:
             raise ValueError("Unsupported request dispatch")
         if self.trigger not in (
             "initial_plan",
-            "baseline_chunk_exhausted",
+            "baseline_async_launch",
             "rtc_launch",
-            "bsp_curve_exhausted",
             "bsp_prefetch",
         ):
             raise ValueError("Unsupported request trigger")
@@ -224,17 +223,16 @@ class RequestIntentV4:
         )
         expected_dispatch = {
             "initial_plan": "blocking_initial",
-            "baseline_chunk_exhausted": "blocking_replan",
+            "baseline_async_launch": "background",
             "rtc_launch": "background",
-            "bsp_curve_exhausted": "blocking_replan",
             "bsp_prefetch": "background",
         }[self.trigger]
         if self.dispatch != expected_dispatch:
             raise ValueError("request dispatch does not match its trigger")
-        if self.trigger in ("initial_plan", "baseline_chunk_exhausted", "bsp_curve_exhausted"):
+        if self.trigger == "initial_plan":
             if scheduler_context:
                 raise ValueError("request trigger requires an empty scheduler context")
-        elif self.trigger == "rtc_launch":
+        elif self.trigger in ("baseline_async_launch", "rtc_launch"):
             if set(scheduler_context) != {"s", "d"}:
                 raise ValueError("RTC launch context must contain exactly s and d")
             start = scheduler_context["s"]
@@ -253,7 +251,7 @@ class RequestIntentV4:
 
 
 @dataclasses.dataclass(frozen=True)
-class ActivationDecisionV4:
+class ActivationDecisionV5:
     activation: str
     activation_context: Mapping[str, int]
 
@@ -286,7 +284,7 @@ class ActivationDecisionV4:
 
 
 @dataclasses.dataclass(frozen=True)
-class ActionDecisionV4:
+class ActionDecisionV5:
     action: Optional[np.ndarray]
     underflow: bool
 
@@ -307,11 +305,9 @@ class ActionDecisionV4:
 
 
 class Clock(Protocol):
-    def monotonic_ns(self) -> int:
-        ...
+    def monotonic_ns(self) -> int: ...
 
-    def wait_until_ns(self, deadline_ns: int) -> None:
-        ...
+    def wait_until_ns(self, deadline_ns: int) -> None: ...
 
 
 class NoCatchupPacer:
@@ -332,9 +328,7 @@ class NoCatchupPacer:
         while True:
             now_ns = self._read_clock()
             if self._next_deadline_ns is None or now_ns >= self._next_deadline_ns:
-                self._current_due_ns = (
-                    now_ns if self._next_deadline_ns is None else self._next_deadline_ns
-                )
+                self._current_due_ns = now_ns if self._next_deadline_ns is None else self._next_deadline_ns
                 return now_ns
             self._clock.wait_until_ns(self._next_deadline_ns)
 
@@ -401,7 +395,7 @@ def _canonical_value(value: Any) -> Any:
 
 
 def canonical_json_bytes(value: Any) -> bytes:
-    """Encode a value with the strict schema-v4 canonical fingerprint format."""
+    """Encode a value with the strict schema-v5 canonical fingerprint format."""
     return json.dumps(
         _canonical_value(value),
         sort_keys=True,
@@ -477,9 +471,7 @@ class CheckpointIdentityV1:
         if not isinstance(self.code_sha, str) or _CODE_SHA_PATTERN.fullmatch(self.code_sha) is None:
             raise ValueError("code_sha must be a lowercase 40- or 64-character Git SHA")
         _require_nonempty_text(self.config_name, label="config_name")
-        checkpoint_step = _require_nonbool_int(
-            self.checkpoint_step, label="checkpoint_step", minimum=0
-        )
+        checkpoint_step = _require_nonbool_int(self.checkpoint_step, label="checkpoint_step", minimum=0)
         object.__setattr__(self, "checkpoint_step", checkpoint_step)
         checkpoint = _require_nonempty_text(self.checkpoint, label="checkpoint").rstrip("/")
         if not checkpoint or checkpoint.rsplit("/", 1)[-1] != str(checkpoint_step):
@@ -566,10 +558,7 @@ def nearest_rank_p95_ns(measurements_ns: Sequence[int]) -> Tuple[int, int]:
         raise ValueError("p95 measurements must be a sequence")
     if len(measurements_ns) != CALIBRATION_MEASUREMENT_COUNT:
         raise ValueError("p95 requires exactly 20 measurements")
-    measurements = [
-        _require_nonbool_int(value, label="latency measurement", minimum=0)
-        for value in measurements_ns
-    ]
+    measurements = [_require_nonbool_int(value, label="latency measurement", minimum=0) for value in measurements_ns]
     rank = 19
     return rank, sorted(measurements)[rank - 1]
 
@@ -606,10 +595,7 @@ class LatencyCalibrationV1:
         object.__setattr__(
             self,
             "warmup_latency_ns",
-            tuple(
-                _require_nonbool_int(value, label="warmup latency", minimum=0)
-                for value in self.warmup_latency_ns
-            ),
+            tuple(_require_nonbool_int(value, label="warmup latency", minimum=0) for value in self.warmup_latency_ns),
         )
         object.__setattr__(
             self,
@@ -636,9 +622,7 @@ class LatencyCalibrationV1:
         warmup_latency_ns: Sequence[int],
         measurement_latency_ns: Sequence[int],
     ) -> "LatencyCalibrationV1":
-        if not isinstance(
-            canonical_observation_identity, CalibrationObservationIdentityV1
-        ):
+        if not isinstance(canonical_observation_identity, CalibrationObservationIdentityV1):
             raise ValueError("canonical_observation_identity must use schema version 1")
         rank, p95_ns = nearest_rank_p95_ns(measurement_latency_ns)
         delay_ticks = None  # type: Optional[int]
@@ -687,9 +671,7 @@ class LatencyCalibrationV1:
             label="checkpoint_identity_fingerprint",
         )
         _require_sha256(self.server_metadata_fingerprint, label="server_metadata_fingerprint")
-        if not isinstance(
-            self.canonical_observation_identity, CalibrationObservationIdentityV1
-        ):
+        if not isinstance(self.canonical_observation_identity, CalibrationObservationIdentityV1):
             raise ValueError("canonical_observation_identity must use schema version 1")
         self.canonical_observation_identity.__post_init__()
         expected_namespace = "openpi-libero-calibration-v1/{}/{}".format(
@@ -705,32 +687,21 @@ class LatencyCalibrationV1:
         for value in self.warmup_request_fingerprints + self.measurement_request_fingerprints:
             _require_sha256(value, label="request fingerprint")
         warmups = tuple(
-            _require_nonbool_int(value, label="warmup latency", minimum=0)
-            for value in self.warmup_latency_ns
+            _require_nonbool_int(value, label="warmup latency", minimum=0) for value in self.warmup_latency_ns
         )
         if len(warmups) != CALIBRATION_WARMUP_COUNT:
             raise ValueError("calibration requires exactly five warmup latencies")
         measurements = tuple(
-            _require_nonbool_int(value, label="measurement latency", minimum=0)
-            for value in self.measurement_latency_ns
+            _require_nonbool_int(value, label="measurement latency", minimum=0) for value in self.measurement_latency_ns
         )
         if len(measurements) != CALIBRATION_MEASUREMENT_COUNT:
             raise ValueError("calibration requires exactly twenty measurement latencies")
         rank, p95_ns = nearest_rank_p95_ns(measurements)
-        if (
-            self.p95_method != "nearest_rank"
-            or _require_nonbool_int(self.p95_rank, label="p95_rank") != rank
-        ):
+        if self.p95_method != "nearest_rank" or _require_nonbool_int(self.p95_rank, label="p95_rank") != rank:
             raise ValueError("calibration must use nearest-rank p95 at rank 19")
-        if (
-            _require_nonbool_int(self.p95_latency_ns, label="p95_latency_ns", minimum=0)
-            != p95_ns
-        ):
+        if _require_nonbool_int(self.p95_latency_ns, label="p95_latency_ns", minimum=0) != p95_ns:
             raise ValueError("calibration p95_latency_ns does not match raw measurements")
-        if (
-            _require_nonbool_int(self.control_period_ns, label="control_period_ns", minimum=1)
-            != CONTROL_PERIOD_NS
-        ):
+        if _require_nonbool_int(self.control_period_ns, label="control_period_ns", minimum=1) != CONTROL_PERIOD_NS:
             raise ValueError("calibration control_period_ns must be 50000000")
         rounded_ticks = (p95_ns + CONTROL_PERIOD_NS - 1) // CONTROL_PERIOD_NS
         if self.execution_mode == "baseline_rtc":
@@ -850,6 +821,335 @@ def _calibration_payload(values: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+_CALIBRATION_V2_SERIES_FIELDS = (
+    "warmup_raw_inference_latency_ns",
+    "warmup_sampled_target_latency_ns",
+    "warmup_synthetic_delay_ns",
+    "warmup_effective_inference_latency_ns",
+    "measurement_raw_inference_latency_ns",
+    "measurement_sampled_target_latency_ns",
+    "measurement_synthetic_delay_ns",
+    "measurement_effective_inference_latency_ns",
+)
+_CALIBRATION_V2_FIELDS = {
+    "schema_version",
+    "execution_mode",
+    "clock",
+    "checkpoint_identity_fingerprint",
+    "server_metadata_fingerprint",
+    "canonical_observation_identity",
+    "seed_namespace",
+    "bootstrap_request_fingerprint",
+    "warmup_request_fingerprints",
+    "measurement_request_fingerprints",
+    *_CALIBRATION_V2_SERIES_FIELDS,
+    "p95_method",
+    "p95_rank",
+    "empirical_raw_p95_ns",
+    "empirical_sampled_target_p95_ns",
+    "empirical_effective_p95_ns",
+    "theoretical_p95_latency_ns",
+    "control_period_ns",
+    "scheduling_latency_budget_ns",
+    "derived_delay_ticks",
+    "derived_prefetch_budget_ns",
+    "empirical_p95_exceeds_budget",
+    "fingerprint",
+}
+
+
+def _latency_series(values: Sequence[int], *, label: str, count: int) -> Tuple[int, ...]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise ValueError("{} must be a sequence".format(label))
+    result = tuple(_require_nonbool_int(value, label=label, minimum=0) for value in values)
+    if len(result) != count:
+        raise ValueError("{} must contain exactly {} values".format(label, count))
+    return result
+
+
+def _calibration_v2_payload(values: Mapping[str, Any]) -> Dict[str, Any]:
+    identity = values["canonical_observation_identity"]
+    if isinstance(identity, CalibrationObservationIdentityV1):
+        identity = identity.to_dict()
+    payload = {
+        "schema_version": values["schema_version"],
+        "execution_mode": values["execution_mode"],
+        "clock": values["clock"],
+        "checkpoint_identity_fingerprint": values["checkpoint_identity_fingerprint"],
+        "server_metadata_fingerprint": values["server_metadata_fingerprint"],
+        "canonical_observation_identity": dict(identity),
+        "seed_namespace": values["seed_namespace"],
+        "bootstrap_request_fingerprint": values["bootstrap_request_fingerprint"],
+        "warmup_request_fingerprints": list(values["warmup_request_fingerprints"]),
+        "measurement_request_fingerprints": list(values["measurement_request_fingerprints"]),
+        "p95_method": values["p95_method"],
+        "p95_rank": values["p95_rank"],
+        "empirical_raw_p95_ns": values["empirical_raw_p95_ns"],
+        "empirical_sampled_target_p95_ns": values["empirical_sampled_target_p95_ns"],
+        "empirical_effective_p95_ns": values["empirical_effective_p95_ns"],
+        "theoretical_p95_latency_ns": values["theoretical_p95_latency_ns"],
+        "control_period_ns": values["control_period_ns"],
+        "scheduling_latency_budget_ns": values["scheduling_latency_budget_ns"],
+        "derived_delay_ticks": values["derived_delay_ticks"],
+        "derived_prefetch_budget_ns": values["derived_prefetch_budget_ns"],
+        "empirical_p95_exceeds_budget": values["empirical_p95_exceeds_budget"],
+    }
+    for field in _CALIBRATION_V2_SERIES_FIELDS:
+        payload[field] = list(values[field])
+    return payload
+
+
+@dataclasses.dataclass(frozen=True)
+class LatencyCalibrationV2:
+    schema_version: int
+    execution_mode: str
+    clock: str
+    checkpoint_identity_fingerprint: str
+    server_metadata_fingerprint: str
+    canonical_observation_identity: CalibrationObservationIdentityV1
+    seed_namespace: str
+    bootstrap_request_fingerprint: Optional[str]
+    warmup_request_fingerprints: Tuple[str, ...]
+    measurement_request_fingerprints: Tuple[str, ...]
+    warmup_raw_inference_latency_ns: Tuple[int, ...]
+    warmup_sampled_target_latency_ns: Tuple[int, ...]
+    warmup_synthetic_delay_ns: Tuple[int, ...]
+    warmup_effective_inference_latency_ns: Tuple[int, ...]
+    measurement_raw_inference_latency_ns: Tuple[int, ...]
+    measurement_sampled_target_latency_ns: Tuple[int, ...]
+    measurement_synthetic_delay_ns: Tuple[int, ...]
+    measurement_effective_inference_latency_ns: Tuple[int, ...]
+    p95_method: str
+    p95_rank: int
+    empirical_raw_p95_ns: int
+    empirical_sampled_target_p95_ns: int
+    empirical_effective_p95_ns: int
+    theoretical_p95_latency_ns: int
+    control_period_ns: int
+    scheduling_latency_budget_ns: int
+    derived_delay_ticks: Optional[int]
+    derived_prefetch_budget_ns: Optional[int]
+    empirical_p95_exceeds_budget: bool
+    fingerprint: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "warmup_request_fingerprints", tuple(self.warmup_request_fingerprints))
+        object.__setattr__(
+            self,
+            "measurement_request_fingerprints",
+            tuple(self.measurement_request_fingerprints),
+        )
+        for field in _CALIBRATION_V2_SERIES_FIELDS:
+            count = CALIBRATION_WARMUP_COUNT if field.startswith("warmup_") else CALIBRATION_MEASUREMENT_COUNT
+            object.__setattr__(
+                self,
+                field,
+                _latency_series(getattr(self, field), label=field, count=count),
+            )
+        self._validate()
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        execution_mode: str,
+        checkpoint_identity_fingerprint: str,
+        server_metadata_fingerprint: str,
+        canonical_observation_identity: CalibrationObservationIdentityV1,
+        seed_namespace: str,
+        bootstrap_request_fingerprint: Optional[str],
+        warmup_request_fingerprints: Sequence[str],
+        measurement_request_fingerprints: Sequence[str],
+        warmup_raw_inference_latency_ns: Sequence[int],
+        warmup_sampled_target_latency_ns: Sequence[int],
+        warmup_synthetic_delay_ns: Sequence[int],
+        warmup_effective_inference_latency_ns: Sequence[int],
+        measurement_raw_inference_latency_ns: Sequence[int],
+        measurement_sampled_target_latency_ns: Sequence[int],
+        measurement_synthetic_delay_ns: Sequence[int],
+        measurement_effective_inference_latency_ns: Sequence[int],
+    ) -> "LatencyCalibrationV2":
+        if not isinstance(canonical_observation_identity, CalibrationObservationIdentityV1):
+            raise ValueError("canonical_observation_identity must use schema version 1")
+        raw = _latency_series(
+            measurement_raw_inference_latency_ns,
+            label="measurement_raw_inference_latency_ns",
+            count=CALIBRATION_MEASUREMENT_COUNT,
+        )
+        sampled = _latency_series(
+            measurement_sampled_target_latency_ns,
+            label="measurement_sampled_target_latency_ns",
+            count=CALIBRATION_MEASUREMENT_COUNT,
+        )
+        effective = _latency_series(
+            measurement_effective_inference_latency_ns,
+            label="measurement_effective_inference_latency_ns",
+            count=CALIBRATION_MEASUREMENT_COUNT,
+        )
+        rank, raw_p95 = nearest_rank_p95_ns(raw)
+        _, sampled_p95 = nearest_rank_p95_ns(sampled)
+        _, effective_p95 = nearest_rank_p95_ns(effective)
+        if execution_mode in ("baseline_async", "baseline_rtc"):
+            delay_ticks = SCHEDULING_DELAY_TICKS
+            prefetch_budget_ns = None
+        elif execution_mode == "bsp_spline_async":
+            delay_ticks = None
+            prefetch_budget_ns = SCHEDULING_LATENCY_BUDGET_NS
+        else:
+            raise ValueError("latency calibration is defined only for schema-v5 modes")
+        values = {
+            "schema_version": 2,
+            "execution_mode": execution_mode,
+            "clock": "monotonic_ns",
+            "checkpoint_identity_fingerprint": checkpoint_identity_fingerprint,
+            "server_metadata_fingerprint": server_metadata_fingerprint,
+            "canonical_observation_identity": canonical_observation_identity,
+            "seed_namespace": seed_namespace,
+            "bootstrap_request_fingerprint": bootstrap_request_fingerprint,
+            "warmup_request_fingerprints": tuple(warmup_request_fingerprints),
+            "measurement_request_fingerprints": tuple(measurement_request_fingerprints),
+            "warmup_raw_inference_latency_ns": tuple(warmup_raw_inference_latency_ns),
+            "warmup_sampled_target_latency_ns": tuple(warmup_sampled_target_latency_ns),
+            "warmup_synthetic_delay_ns": tuple(warmup_synthetic_delay_ns),
+            "warmup_effective_inference_latency_ns": tuple(warmup_effective_inference_latency_ns),
+            "measurement_raw_inference_latency_ns": raw,
+            "measurement_sampled_target_latency_ns": sampled,
+            "measurement_synthetic_delay_ns": tuple(measurement_synthetic_delay_ns),
+            "measurement_effective_inference_latency_ns": effective,
+            "p95_method": "nearest_rank",
+            "p95_rank": rank,
+            "empirical_raw_p95_ns": raw_p95,
+            "empirical_sampled_target_p95_ns": sampled_p95,
+            "empirical_effective_p95_ns": effective_p95,
+            "theoretical_p95_latency_ns": THEORETICAL_P95_LATENCY_NS,
+            "control_period_ns": CONTROL_PERIOD_NS,
+            "scheduling_latency_budget_ns": SCHEDULING_LATENCY_BUDGET_NS,
+            "derived_delay_ticks": delay_ticks,
+            "derived_prefetch_budget_ns": prefetch_budget_ns,
+            "empirical_p95_exceeds_budget": effective_p95 > SCHEDULING_LATENCY_BUDGET_NS,
+        }
+        return cls(
+            fingerprint=canonical_fingerprint(_calibration_v2_payload(values)),
+            **values,
+        )
+
+    def _validate(self) -> None:
+        if _require_nonbool_int(self.schema_version, label="calibration schema_version") != 2:
+            raise ValueError("calibration schema_version must be integer 2")
+        if self.execution_mode not in EXECUTION_MODES:
+            raise ValueError("calibration execution_mode must be a schema-v5 mode")
+        if self.clock != "monotonic_ns":
+            raise ValueError("calibration clock must be monotonic_ns")
+        _require_sha256(self.checkpoint_identity_fingerprint, label="checkpoint_identity_fingerprint")
+        _require_sha256(self.server_metadata_fingerprint, label="server_metadata_fingerprint")
+        if not isinstance(self.canonical_observation_identity, CalibrationObservationIdentityV1):
+            raise ValueError("canonical_observation_identity must use schema version 1")
+        self.canonical_observation_identity.__post_init__()
+        expected_namespace = "openpi-libero-calibration-v2/{}/{}".format(
+            self.execution_mode,
+            self.checkpoint_identity_fingerprint,
+        )
+        if self.seed_namespace != expected_namespace:
+            raise ValueError("calibration seed_namespace does not match its identities")
+        if len(self.warmup_request_fingerprints) != CALIBRATION_WARMUP_COUNT:
+            raise ValueError("calibration requires exactly five warmup request fingerprints")
+        if len(self.measurement_request_fingerprints) != CALIBRATION_MEASUREMENT_COUNT:
+            raise ValueError("calibration requires exactly twenty measurement request fingerprints")
+        for value in self.warmup_request_fingerprints + self.measurement_request_fingerprints:
+            _require_sha256(value, label="request fingerprint")
+        if self.execution_mode == "baseline_rtc":
+            _require_sha256(self.bootstrap_request_fingerprint, label="bootstrap_request_fingerprint")
+        elif self.bootstrap_request_fingerprint is not None:
+            raise ValueError("only RTC calibration may carry a bootstrap fingerprint")
+        for prefix, count in (
+            ("warmup", CALIBRATION_WARMUP_COUNT),
+            ("measurement", CALIBRATION_MEASUREMENT_COUNT),
+        ):
+            raw = _latency_series(
+                getattr(self, prefix + "_raw_inference_latency_ns"),
+                label=prefix + " raw latency",
+                count=count,
+            )
+            sampled = _latency_series(
+                getattr(self, prefix + "_sampled_target_latency_ns"),
+                label=prefix + " sampled target",
+                count=count,
+            )
+            synthetic = _latency_series(
+                getattr(self, prefix + "_synthetic_delay_ns"),
+                label=prefix + " synthetic delay",
+                count=count,
+            )
+            effective = _latency_series(
+                getattr(self, prefix + "_effective_inference_latency_ns"),
+                label=prefix + " effective latency",
+                count=count,
+            )
+            if any(
+                raw_value + synthetic_value != effective_value or effective_value != max(raw_value, sampled_value)
+                for raw_value, sampled_value, synthetic_value, effective_value in zip(
+                    raw, sampled, synthetic, effective
+                )
+            ):
+                raise ValueError("calibration latency breakdown is inconsistent")
+        rank, raw_p95 = nearest_rank_p95_ns(self.measurement_raw_inference_latency_ns)
+        _, sampled_p95 = nearest_rank_p95_ns(self.measurement_sampled_target_latency_ns)
+        _, effective_p95 = nearest_rank_p95_ns(self.measurement_effective_inference_latency_ns)
+        expected_scalars = {
+            "p95_rank": rank,
+            "empirical_raw_p95_ns": raw_p95,
+            "empirical_sampled_target_p95_ns": sampled_p95,
+            "empirical_effective_p95_ns": effective_p95,
+            "theoretical_p95_latency_ns": THEORETICAL_P95_LATENCY_NS,
+            "control_period_ns": CONTROL_PERIOD_NS,
+            "scheduling_latency_budget_ns": SCHEDULING_LATENCY_BUDGET_NS,
+        }
+        if self.p95_method != "nearest_rank":
+            raise ValueError("calibration must use nearest-rank p95")
+        for field, expected in expected_scalars.items():
+            if _require_nonbool_int(getattr(self, field), label=field, minimum=0) != expected:
+                raise ValueError("{} does not match calibration measurements".format(field))
+        if self.execution_mode in ("baseline_async", "baseline_rtc"):
+            if self.derived_delay_ticks != SCHEDULING_DELAY_TICKS or self.derived_prefetch_budget_ns is not None:
+                raise ValueError("baseline calibration must use the fixed eight-tick budget")
+        elif self.derived_delay_ticks is not None or self.derived_prefetch_budget_ns != SCHEDULING_LATENCY_BUDGET_NS:
+            raise ValueError("BSP calibration must use the fixed prefetch budget")
+        if type(self.empirical_p95_exceeds_budget) is not bool or self.empirical_p95_exceeds_budget != (
+            effective_p95 > SCHEDULING_LATENCY_BUDGET_NS
+        ):
+            raise ValueError("empirical_p95_exceeds_budget does not match the measurements")
+        _require_sha256(self.fingerprint, label="calibration fingerprint")
+        if self.fingerprint != canonical_fingerprint(self._payload_without_fingerprint()):
+            raise ValueError("calibration fingerprint does not bind its serialized fields")
+
+    def _payload_without_fingerprint(self) -> Dict[str, Any]:
+        return _calibration_v2_payload(dataclasses.asdict(self))
+
+    def to_dict(self) -> Dict[str, Any]:
+        self._validate()
+        payload = self._payload_without_fingerprint()
+        payload["fingerprint"] = self.fingerprint
+        return payload
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "LatencyCalibrationV2":
+        if not isinstance(value, Mapping) or set(value) != _CALIBRATION_V2_FIELDS:
+            raise ValueError("latency calibration fields must exactly match schema version 2")
+        values = dict(value)
+        values["canonical_observation_identity"] = CalibrationObservationIdentityV1.from_dict(
+            values["canonical_observation_identity"]
+        )
+        for field in (
+            "warmup_request_fingerprints",
+            "measurement_request_fingerprints",
+            *_CALIBRATION_V2_SERIES_FIELDS,
+        ):
+            if not isinstance(values[field], list):
+                raise ValueError("{} must be a JSON list".format(field))
+            values[field] = tuple(values[field])
+        return cls(**values)
+
+
 def validate_server_metadata(mode: ExecutionModeSpec, metadata: Mapping[str, Any]) -> str:
     """Validate the exact family capability and fingerprint all server metadata."""
     _require_known_mode(mode)
@@ -873,7 +1173,11 @@ def validate_server_metadata(mode: ExecutionModeSpec, metadata: Mapping[str, Any
             "action_representation": "native",
             "model_action_horizon": 16,
             "model_action_dim": 32,
-            "supported_protocols": ["baseline_h16_n5_v1", "baseline_rtc_h16_v1"],
+            "supported_protocols": [
+                "baseline_h16_n5_v1",
+                "baseline_async_h16_v1",
+                "baseline_rtc_h16_v1",
+            ],
         }
     else:
         expected = {
@@ -894,14 +1198,12 @@ def calibration_seed(namespace: str, phase: str, index: int) -> int:
     _require_nonempty_text(namespace, label="namespace")
     _require_nonempty_text(phase, label="phase")
     seed_index = _require_nonbool_int(index, label="seed index", minimum=0)
-    payload = canonical_json_bytes(
-        {"namespace": namespace, "phase": phase, "index": seed_index}
-    )
+    payload = canonical_json_bytes({"namespace": namespace, "phase": phase, "index": seed_index})
     return int.from_bytes(hashlib.sha256(payload).digest()[:4], "big", signed=False)
 
 
 class CalibrationError(RuntimeError):
-    """Base class for fatal schema-v4 calibration failures."""
+    """Base class for fatal schema-v5 calibration failures."""
 
 
 class CalibrationInfrastructureError(CalibrationError):
@@ -917,27 +1219,30 @@ class CalibrationIdentityError(CalibrationError):
 
 
 class CalibrationWorker(Protocol):
-    def connect(self, timeout: Optional[float] = None) -> Any:
-        ...
+    def connect(self, timeout: Optional[float] = None) -> Any: ...
 
-    def submit(self, observation: Dict[str, Any]) -> Any:
-        ...
+    def submit(
+        self,
+        observation: Dict[str, Any],
+        *,
+        latency_sample_key: latency_sampling.LatencySampleKeyV1,
+    ) -> Any: ...
 
-    def wait(self, job: Any, timeout: Optional[float] = None) -> Any:
-        ...
+    def wait(self, job: Any, timeout: Optional[float] = None) -> Any: ...
 
-    def reset_generation(self) -> int:
-        ...
+    def reset_generation(self) -> int: ...
 
-    def wait_until_ready(self, generation: int, timeout: Optional[float] = None) -> None:
-        ...
+    def wait_until_ready(self, generation: int, timeout: Optional[float] = None) -> None: ...
 
 
 @dataclasses.dataclass(frozen=True)
 class _ProbeResult:
     response: Mapping[str, Any]
     request_fingerprint: str
-    latency_ns: int
+    raw_inference_latency_ns: int
+    sampled_target_latency_ns: int
+    synthetic_delay_ns: int
+    effective_inference_latency_ns: int
 
 
 class _RetryCalibration(Exception):
@@ -951,10 +1256,10 @@ def calibrate_async_mode(
     worker: CalibrationWorker,
     checkpoint_identity: CheckpointIdentityV1,
     server_metadata_fingerprint: str,
-) -> LatencyCalibrationV1:
+) -> LatencyCalibrationV2:
     """Run a complete deterministic 5+20 calibration through the public worker API."""
     _require_known_mode(mode)
-    if mode.calibration_kind not in ("rtc", "bsp"):
+    if mode.calibration_kind not in ("baseline_async", "rtc", "bsp"):
         raise ValueError("calibration is defined only for asynchronous modes")
     if not isinstance(canonical_request, Mapping):
         raise ValueError("canonical_request must be a mapping")
@@ -978,7 +1283,7 @@ def calibrate_async_mode(
         raise CalibrationIdentityError("BSP calibration requires BSP cache identities")
 
     checkpoint_fingerprint = checkpoint_identity.fingerprint
-    namespace = "openpi-libero-calibration-v1/{}/{}".format(
+    namespace = "openpi-libero-calibration-v2/{}/{}".format(
         mode.name,
         checkpoint_fingerprint,
     )
@@ -1031,7 +1336,7 @@ def _calibrate_once(
     checkpoint_fingerprint: str,
     server_metadata_fingerprint: str,
     namespace: str,
-) -> LatencyCalibrationV1:
+) -> LatencyCalibrationV2:
     bootstrap_fingerprint = None  # type: Optional[str]
     previous_response = None  # type: Optional[Mapping[str, Any]]
     if mode.calibration_kind == "rtc":
@@ -1052,20 +1357,20 @@ def _calibrate_once(
 
     warmup_fingerprints = []  # type: List[str]
     measurement_fingerprints = []  # type: List[str]
-    warmup_latencies = []  # type: List[int]
-    measurement_latencies = []  # type: List[int]
-    for phase, count, fingerprints, latencies in (
+    warmup_breakdown = {field: [] for field in _CALIBRATION_V2_SERIES_FIELDS[:4]}
+    measurement_breakdown = {field: [] for field in _CALIBRATION_V2_SERIES_FIELDS[4:]}
+    for phase, count, fingerprints, breakdown in (
         (
             "warmup",
             CALIBRATION_WARMUP_COUNT,
             warmup_fingerprints,
-            warmup_latencies,
+            warmup_breakdown,
         ),
         (
             "measurement",
             CALIBRATION_MEASUREMENT_COUNT,
             measurement_fingerprints,
-            measurement_latencies,
+            measurement_breakdown,
         ),
     ):
         for index in range(count):
@@ -1079,6 +1384,12 @@ def _calibrate_once(
                 for _ in range(8):
                     plan.consume_action()
                 overlay = plan.begin_guided()
+            elif mode.calibration_kind == "baseline_async":
+                overlay = {
+                    inference.RTC_REQUEST_KEY: {
+                        "schema_version": inference.RTC_SCHEMA_VERSION,
+                    }
+                }
             probe = _run_probe(
                 mode,
                 canonical_request,
@@ -1089,15 +1400,20 @@ def _calibrate_once(
                 overlay=overlay,
                 expected_metadata_fingerprint=server_metadata_fingerprint,
             )
-            if mode.calibration_kind == "rtc":
+            if mode.calibration_kind in ("baseline_async", "rtc"):
                 _validate_rtc_calibration_response(probe.response)
-                previous_response = probe.response
+                if mode.calibration_kind == "rtc":
+                    previous_response = probe.response
             else:
                 _validate_bsp_calibration_response(probe.response)
             fingerprints.append(probe.request_fingerprint)
-            latencies.append(probe.latency_ns)
+            prefix = phase + "_"
+            breakdown[prefix + "raw_inference_latency_ns"].append(probe.raw_inference_latency_ns)
+            breakdown[prefix + "sampled_target_latency_ns"].append(probe.sampled_target_latency_ns)
+            breakdown[prefix + "synthetic_delay_ns"].append(probe.synthetic_delay_ns)
+            breakdown[prefix + "effective_inference_latency_ns"].append(probe.effective_inference_latency_ns)
 
-    return LatencyCalibrationV1.create(
+    return LatencyCalibrationV2.create(
         execution_mode=mode.name,
         checkpoint_identity_fingerprint=checkpoint_fingerprint,
         server_metadata_fingerprint=server_metadata_fingerprint,
@@ -1106,8 +1422,8 @@ def _calibrate_once(
         bootstrap_request_fingerprint=bootstrap_fingerprint,
         warmup_request_fingerprints=warmup_fingerprints,
         measurement_request_fingerprints=measurement_fingerprints,
-        warmup_latency_ns=warmup_latencies,
-        measurement_latency_ns=measurement_latencies,
+        **warmup_breakdown,
+        **measurement_breakdown,
     )
 
 
@@ -1126,8 +1442,16 @@ def _run_probe(
     request.update(overlay)
     request[inference.INFERENCE_SEED_KEY] = calibration_seed(namespace, phase, index)
     request_fingerprint = canonical_fingerprint(request)
+    latency_sample_key = latency_sampling.LatencySampleKeyV1(
+        namespace="calibration/{}".format(phase),
+        seed=latency_sampling.DEFAULT_SEED,
+        suite="calibration",
+        task_id=0,
+        trial_index=0,
+        request_ordinal=index,
+    )
     try:
-        job = worker.submit(request)
+        job = worker.submit(request, latency_sample_key=latency_sample_key)
         outcome = worker.wait(job)
     except Exception as error:
         if _is_infrastructure_error(error):
@@ -1138,9 +1462,7 @@ def _run_probe(
     if getattr(outcome, "job", None) is not job:
         raise CalibrationPolicyError("Calibration worker returned an outcome for a different job")
     if getattr(outcome, "stale", False) or getattr(outcome, "cancelled", False):
-        raise _RetryCalibration() from CalibrationInfrastructureError(
-            "Calibration request became stale or cancelled"
-        )
+        raise _RetryCalibration() from CalibrationInfrastructureError("Calibration request became stale or cancelled")
     _validate_connection_identity(
         mode,
         getattr(outcome, "connection", None),
@@ -1152,56 +1474,50 @@ def _run_probe(
             raise error
         if _is_infrastructure_error(error):
             raise _RetryCalibration() from error
-        raise CalibrationPolicyError(
-            "Calibration policy failed: {}: {}".format(type(error).__name__, error)
-        ) from error
+        raise CalibrationPolicyError("Calibration policy failed: {}: {}".format(type(error).__name__, error)) from error
     submitted_ns = getattr(job, "submitted_monotonic_ns", None)
     completed_ns = getattr(outcome, "completed_monotonic_ns", None)
     try:
         submitted_ns = _require_nonbool_int(submitted_ns, label="probe submit time", minimum=0)
-        completed_ns = _require_nonbool_int(
-            completed_ns, label="probe completion time", minimum=0
-        )
+        completed_ns = _require_nonbool_int(completed_ns, label="probe completion time", minimum=0)
     except ValueError as error:
         raise CalibrationPolicyError(str(error)) from error
     if completed_ns < submitted_ns:
         raise CalibrationPolicyError("Calibration completion precedes submission")
     measured_latency_ns = completed_ns - submitted_ns
     breakdown = (
+        getattr(outcome, "sampled_target_latency_ns", None),
         getattr(outcome, "raw_inference_latency_ns", None),
         getattr(outcome, "synthetic_delay_ns", None),
         getattr(outcome, "effective_inference_latency_ns", None),
     )
-    if any(value is not None for value in breakdown):
-        if any(value is None for value in breakdown):
-            raise CalibrationPolicyError("Calibration latency breakdown must be complete")
-        try:
-            raw_latency_ns = _require_nonbool_int(
-                breakdown[0], label="raw inference latency", minimum=0
-            )
-            synthetic_delay_ns = _require_nonbool_int(
-                breakdown[1], label="synthetic inference delay", minimum=0
-            )
-            effective_latency_ns = _require_nonbool_int(
-                breakdown[2], label="effective inference latency", minimum=0
-            )
-        except ValueError as error:
-            raise CalibrationPolicyError(str(error)) from error
-        if (
-            raw_latency_ns + synthetic_delay_ns != effective_latency_ns
-            or effective_latency_ns != measured_latency_ns
-        ):
-            raise CalibrationPolicyError(
-                "Calibration effective latency does not match its measured breakdown"
-            )
-        measured_latency_ns = effective_latency_ns
+    if any(value is None for value in breakdown):
+        raise CalibrationPolicyError("Calibration latency breakdown must be complete")
+    try:
+        sampled_target_latency_ns = _require_nonbool_int(breakdown[0], label="sampled target latency", minimum=0)
+        raw_latency_ns = _require_nonbool_int(breakdown[1], label="raw inference latency", minimum=0)
+        synthetic_delay_ns = _require_nonbool_int(breakdown[2], label="synthetic inference delay", minimum=0)
+        effective_latency_ns = _require_nonbool_int(breakdown[3], label="effective inference latency", minimum=0)
+    except ValueError as error:
+        raise CalibrationPolicyError(str(error)) from error
+    if (
+        raw_latency_ns + synthetic_delay_ns != effective_latency_ns
+        or effective_latency_ns != max(raw_latency_ns, sampled_target_latency_ns)
+        or effective_latency_ns != measured_latency_ns
+        or getattr(job, "sampled_target_latency_ns", None) != sampled_target_latency_ns
+        or getattr(job, "latency_sample_key", None) != latency_sample_key
+    ):
+        raise CalibrationPolicyError("Calibration effective latency does not match its measured breakdown")
     response = getattr(outcome, "result", None)
     if not isinstance(response, Mapping):
         raise CalibrationPolicyError("Calibration response must be a mapping")
     return _ProbeResult(
         response=response,
         request_fingerprint=request_fingerprint,
-        latency_ns=measured_latency_ns,
+        raw_inference_latency_ns=raw_latency_ns,
+        sampled_target_latency_ns=sampled_target_latency_ns,
+        synthetic_delay_ns=synthetic_delay_ns,
+        effective_inference_latency_ns=effective_latency_ns,
     )
 
 
@@ -1244,8 +1560,8 @@ def _validate_bsp_calibration_response(response: Mapping[str, Any]) -> None:
         raise CalibrationPolicyError("Malformed BSP calibration response") from error
 
 
-class ModeSchedulerV4:
-    _pending_intent: Optional[RequestIntentV4]
+class ModeSchedulerV5:
+    _pending_intent: Optional[RequestIntentV5]
 
     def reset(self) -> None:
         raise NotImplementedError
@@ -1256,40 +1572,40 @@ class ModeSchedulerV4:
         *,
         at_due: bool,
         request_in_flight: bool,
-    ) -> Optional[RequestIntentV4]:
+    ) -> Optional[RequestIntentV5]:
         raise NotImplementedError
 
     def install_response(
         self,
-        intent: RequestIntentV4,
+        intent: RequestIntentV5,
         response: Mapping[str, Any],
         *,
         now_ns: int,
         control_step: int,
-    ) -> ActivationDecisionV4:
+    ) -> ActivationDecisionV5:
         raise NotImplementedError
 
-    def take_action(self, now_ns: int) -> ActionDecisionV4:
+    def take_action(self, now_ns: int) -> ActionDecisionV5:
         raise NotImplementedError
 
     def _reuse_pending(
         self,
         *,
         request_in_flight: bool,
-    ) -> Optional[RequestIntentV4]:
+    ) -> Optional[RequestIntentV5]:
         if self._pending_intent is None:
             return None
         if request_in_flight:
             return None
         return self._pending_intent
 
-    def _set_pending(self, intent: RequestIntentV4) -> RequestIntentV4:
+    def _set_pending(self, intent: RequestIntentV5) -> RequestIntentV5:
         if self._pending_intent is not None:
             raise RuntimeError("a scheduler request transition is already pending")
         self._pending_intent = intent
         return intent
 
-    def _require_pending(self, intent: RequestIntentV4) -> None:
+    def _require_pending(self, intent: RequestIntentV5) -> None:
         if intent is not self._pending_intent:
             raise ValueError("response intent does not match the pending scheduler transition")
 
@@ -1299,88 +1615,10 @@ class ModeSchedulerV4:
         self._pending_intent = None
 
 
-class _BaselineSyncScheduler(ModeSchedulerV4):
-    def __init__(self) -> None:
-        self.reset()
-
-    def reset(self) -> None:
-        self._chunk = None  # type: Optional[rtc.RtcActionChunk]
-        self._cursor = 0
-        self._installed_count = 0
-        self._pending_intent = None
-
-    def maybe_request(
-        self,
-        now_ns: int,
-        *,
-        at_due: bool,
-        request_in_flight: bool,
-    ) -> Optional[RequestIntentV4]:
-        _require_nonbool_int(now_ns, label="now_ns", minimum=0)
-        _require_bool(at_due, label="at_due")
-        _require_bool(request_in_flight, label="request_in_flight")
-        pending = self._reuse_pending(request_in_flight=request_in_flight)
-        if pending is not None or self._pending_intent is not None:
-            return pending
-        if request_in_flight:
-            return None
-        if self._chunk is None:
-            dispatch = "blocking_initial"
-            trigger = "initial_plan"
-        elif self._cursor >= 8:
-            dispatch = "blocking_replan"
-            trigger = "baseline_chunk_exhausted"
-        else:
-            return None
-        return self._set_pending(
-            RequestIntentV4(
-                dispatch=dispatch,
-                trigger=trigger,
-                scheduler_context={},
-                request_overlay={
-                    inference.RTC_REQUEST_KEY: {
-                        "schema_version": inference.RTC_SCHEMA_VERSION
-                    }
-                },
-            )
-        )
-
-    def install_response(
-        self,
-        intent: RequestIntentV4,
-        response: Mapping[str, Any],
-        *,
-        now_ns: int,
-        control_step: int,
-    ) -> ActivationDecisionV4:
-        _validate_install_inputs(intent, now_ns=now_ns, control_step=control_step)
-        self._require_pending(intent)
-        chunk = rtc.RtcActionChunk.from_response(response)
-        self._chunk = chunk
-        self._cursor = 0
-        activation = "initial" if self._installed_count == 0 else "blocking_replace"
-        self._installed_count += 1
-        self._complete_pending()
-        return ActivationDecisionV4(
-            activation=activation,
-            activation_context={"action_cursor": 0},
-        )
-
-    def take_action(self, now_ns: int) -> ActionDecisionV4:
-        _require_nonbool_int(now_ns, label="now_ns", minimum=0)
-        if self._chunk is None:
-            raise rtc.RtcPlanExhaustedError("baseline sync has no installed chunk")
-        if self._cursor >= 8:
-            return ActionDecisionV4(action=None, underflow=True)
-        action = self._chunk.actions[self._cursor]
-        self._cursor += 1
-        return ActionDecisionV4(action=action, underflow=False)
-
-
-class _RtcScheduler(ModeSchedulerV4):
+class _BaselineAsyncScheduler(ModeSchedulerV5):
     def __init__(self, d_init: int) -> None:
         self._d_init = d_init
-        self._plan = rtc.RtcPlan(d_init=d_init)
+        self._plan = rtc.RawAsyncPlan(d_init=d_init)
         self._installed_count = 0
         self._pending_intent = None
 
@@ -1395,7 +1633,7 @@ class _RtcScheduler(ModeSchedulerV4):
         *,
         at_due: bool,
         request_in_flight: bool,
-    ) -> Optional[RequestIntentV4]:
+    ) -> Optional[RequestIntentV5]:
         _require_nonbool_int(now_ns, label="now_ns", minimum=0)
         _require_bool(at_due, label="at_due")
         _require_bool(request_in_flight, label="request_in_flight")
@@ -1407,7 +1645,84 @@ class _RtcScheduler(ModeSchedulerV4):
         state = self._plan.state
         if state is rtc.RtcPlanState.BOOTSTRAP_REQUIRED:
             return self._set_pending(
-                RequestIntentV4(
+                RequestIntentV5(
+                    dispatch="blocking_initial",
+                    trigger="initial_plan",
+                    scheduler_context={},
+                    request_overlay=self._plan.begin_bootstrap(),
+                )
+            )
+        if state is rtc.RtcPlanState.READY_TO_LAUNCH:
+            context = {"s": self._plan.cursor, "d": self._plan.forecast_delay}
+            return self._set_pending(
+                RequestIntentV5(
+                    dispatch="background",
+                    trigger="baseline_async_launch",
+                    scheduler_context=context,
+                    request_overlay=self._plan.begin_background(),
+                )
+            )
+        if state is rtc.RtcPlanState.INFEASIBLE:
+            self._plan.begin_background()
+        return None
+
+    def install_response(
+        self,
+        intent: RequestIntentV5,
+        response: Mapping[str, Any],
+        *,
+        now_ns: int,
+        control_step: int,
+    ) -> ActivationDecisionV5:
+        _validate_install_inputs(intent, now_ns=now_ns, control_step=control_step)
+        self._require_pending(intent)
+        self._plan.install_result(response)
+        activation = "initial" if self._installed_count == 0 else "immediate_swap"
+        self._installed_count += 1
+        self._complete_pending()
+        return ActivationDecisionV5(
+            activation=activation,
+            activation_context={"action_cursor": self._plan.cursor},
+        )
+
+    def take_action(self, now_ns: int) -> ActionDecisionV5:
+        _require_nonbool_int(now_ns, label="now_ns", minimum=0)
+        if self._plan.state is rtc.RtcPlanState.EXHAUSTED:
+            return ActionDecisionV5(action=None, underflow=True)
+        return ActionDecisionV5(action=self._plan.consume_action(), underflow=False)
+
+
+class _RtcScheduler(ModeSchedulerV5):
+    def __init__(self, d_init: int) -> None:
+        self._d_init = d_init
+        self._plan = rtc.RtcPlan(d_init=d_init, fixed_delay=True)
+        self._installed_count = 0
+        self._pending_intent = None
+
+    def reset(self) -> None:
+        self._plan.reset(d_init=self._d_init)
+        self._installed_count = 0
+        self._pending_intent = None
+
+    def maybe_request(
+        self,
+        now_ns: int,
+        *,
+        at_due: bool,
+        request_in_flight: bool,
+    ) -> Optional[RequestIntentV5]:
+        _require_nonbool_int(now_ns, label="now_ns", minimum=0)
+        _require_bool(at_due, label="at_due")
+        _require_bool(request_in_flight, label="request_in_flight")
+        pending = self._reuse_pending(request_in_flight=request_in_flight)
+        if pending is not None or self._pending_intent is not None:
+            return pending
+        if request_in_flight:
+            return None
+        state = self._plan.state
+        if state is rtc.RtcPlanState.BOOTSTRAP_REQUIRED:
+            return self._set_pending(
+                RequestIntentV5(
                     dispatch="blocking_initial",
                     trigger="initial_plan",
                     scheduler_context={},
@@ -1418,7 +1733,7 @@ class _RtcScheduler(ModeSchedulerV4):
             overlay = self._plan.begin_guided()
             context = overlay[inference.RTC_REQUEST_KEY]
             return self._set_pending(
-                RequestIntentV4(
+                RequestIntentV5(
                     dispatch="background",
                     trigger="rtc_launch",
                     scheduler_context={"s": context["s"], "d": context["d"]},
@@ -1431,35 +1746,35 @@ class _RtcScheduler(ModeSchedulerV4):
 
     def install_response(
         self,
-        intent: RequestIntentV4,
+        intent: RequestIntentV5,
         response: Mapping[str, Any],
         *,
         now_ns: int,
         control_step: int,
-    ) -> ActivationDecisionV4:
+    ) -> ActivationDecisionV5:
         _validate_install_inputs(intent, now_ns=now_ns, control_step=control_step)
         self._require_pending(intent)
         self._plan.install_result(response)
         activation = "initial" if self._installed_count == 0 else "immediate_swap"
         self._installed_count += 1
         self._complete_pending()
-        return ActivationDecisionV4(
+        return ActivationDecisionV5(
             activation=activation,
             activation_context={"action_cursor": self._plan.cursor},
         )
 
-    def take_action(self, now_ns: int) -> ActionDecisionV4:
+    def take_action(self, now_ns: int) -> ActionDecisionV5:
         _require_nonbool_int(now_ns, label="now_ns", minimum=0)
         if self._plan.state is rtc.RtcPlanState.EXHAUSTED:
-            return ActionDecisionV4(action=None, underflow=True)
-        return ActionDecisionV4(action=self._plan.consume_action(), underflow=False)
+            return ActionDecisionV5(action=None, underflow=True)
+        return ActionDecisionV5(action=self._plan.consume_action(), underflow=False)
 
 
 class BspBudgetError(RuntimeError):
     """The calibrated prefetch budget cannot fit inside a returned curve."""
 
 
-class _BspScheduler(ModeSchedulerV4):
+class _BspScheduler(ModeSchedulerV5):
     def __init__(self, *, asynchronous: bool, budget_ns: Optional[int]) -> None:
         self._asynchronous = asynchronous
         self._budget_ns = budget_ns
@@ -1476,7 +1791,7 @@ class _BspScheduler(ModeSchedulerV4):
         *,
         at_due: bool,
         request_in_flight: bool,
-    ) -> Optional[RequestIntentV4]:
+    ) -> Optional[RequestIntentV5]:
         now = _require_nonbool_int(now_ns, label="now_ns", minimum=0)
         _require_bool(at_due, label="at_due")
         _require_bool(request_in_flight, label="request_in_flight")
@@ -1487,7 +1802,7 @@ class _BspScheduler(ModeSchedulerV4):
             return None
         if self._plan.spline is None:
             return self._set_pending(
-                RequestIntentV4(
+                RequestIntentV5(
                     dispatch="blocking_initial",
                     trigger="initial_plan",
                     scheduler_context={},
@@ -1501,7 +1816,7 @@ class _BspScheduler(ModeSchedulerV4):
             if not decision.should_prefetch:
                 return None
             return self._set_pending(
-                RequestIntentV4(
+                RequestIntentV5(
                     dispatch="background",
                     trigger="bsp_prefetch",
                     scheduler_context={
@@ -1517,7 +1832,7 @@ class _BspScheduler(ModeSchedulerV4):
         if not sample.underflow:
             return None
         return self._set_pending(
-            RequestIntentV4(
+            RequestIntentV5(
                 dispatch="blocking_replan",
                 trigger="bsp_curve_exhausted",
                 scheduler_context={},
@@ -1527,12 +1842,12 @@ class _BspScheduler(ModeSchedulerV4):
 
     def install_response(
         self,
-        intent: RequestIntentV4,
+        intent: RequestIntentV5,
         response: Mapping[str, Any],
         *,
         now_ns: int,
         control_step: int,
-    ) -> ActivationDecisionV4:
+    ) -> ActivationDecisionV5:
         now, _ = _validate_install_inputs(intent, now_ns=now_ns, control_step=control_step)
         self._require_pending(intent)
         validate_bsp_response(response)
@@ -1543,9 +1858,7 @@ class _BspScheduler(ModeSchedulerV4):
                 raise AssertionError("asynchronous BSP scheduler is missing its budget")
             usable_duration_ns = candidate_plan.remaining_time_ns(now)
             if self._budget_ns >= usable_duration_ns:
-                raise BspBudgetError(
-                    "BSP prefetch budget must be smaller than the curve usable duration"
-                )
+                raise BspBudgetError("BSP prefetch budget must be smaller than the curve usable duration")
         self._plan.install(response["bsp"], activation_time_ns=now)
         if self._installed_count == 0:
             activation = "initial"
@@ -1555,38 +1868,33 @@ class _BspScheduler(ModeSchedulerV4):
             activation = "blocking_replace"
         self._installed_count += 1
         self._complete_pending()
-        return ActivationDecisionV4(
+        return ActivationDecisionV5(
             activation=activation,
             activation_context={"curve_elapsed_ns": 0},
         )
 
-    def take_action(self, now_ns: int) -> ActionDecisionV4:
+    def take_action(self, now_ns: int) -> ActionDecisionV5:
         now = _require_nonbool_int(now_ns, label="now_ns", minimum=0)
         sample = self._plan.sample(now)
         if sample.underflow:
-            return ActionDecisionV4(action=None, underflow=True)
-        return ActionDecisionV4(action=sample.action, underflow=False)
+            return ActionDecisionV5(action=None, underflow=True)
+        return ActionDecisionV5(action=sample.action, underflow=False)
 
 
-def make_scheduler_v4(
+def make_scheduler_v5(
     mode: ExecutionModeSpec,
-    calibration: Optional[LatencyCalibrationV1],
-) -> ModeSchedulerV4:
+    calibration: Optional["LatencyCalibrationV2"],
+) -> ModeSchedulerV5:
     _require_known_mode(mode)
-    if mode.name == "baseline_sync_n5":
-        if calibration is not None:
-            raise ValueError("synchronous modes cannot have latency calibration")
-        return _BaselineSyncScheduler()
+    _require_matching_calibration(mode, calibration)
+    if mode.name == "baseline_async":
+        if calibration.derived_delay_ticks is None:
+            raise ValueError("baseline async calibration is missing derived delay ticks")
+        return _BaselineAsyncScheduler(calibration.derived_delay_ticks)
     if mode.name == "baseline_rtc":
-        _require_matching_calibration(mode, calibration)
         if calibration.derived_delay_ticks is None:
             raise ValueError("RTC calibration is missing derived delay ticks")
         return _RtcScheduler(calibration.derived_delay_ticks)
-    if mode.name == "bsp_spline_sync":
-        if calibration is not None:
-            raise ValueError("synchronous modes cannot have latency calibration")
-        return _BspScheduler(asynchronous=False, budget_ns=None)
-    _require_matching_calibration(mode, calibration)
     if calibration.derived_prefetch_budget_ns is None:
         raise ValueError("BSP calibration is missing its prefetch budget")
     return _BspScheduler(
@@ -1597,14 +1905,14 @@ def make_scheduler_v4(
 
 def _require_known_mode(mode: ExecutionModeSpec) -> None:
     if not isinstance(mode, ExecutionModeSpec) or EXECUTION_MODES.get(mode.name) != mode:
-        raise ValueError("mode must be one of the frozen schema-v4 execution modes")
+        raise ValueError("mode must be one of the frozen schema-v5 execution modes")
 
 
 def _require_matching_calibration(
     mode: ExecutionModeSpec,
-    calibration: Optional[LatencyCalibrationV1],
+    calibration: Optional["LatencyCalibrationV2"],
 ) -> None:
-    if not isinstance(calibration, LatencyCalibrationV1):
+    if not isinstance(calibration, LatencyCalibrationV2):
         raise ValueError("asynchronous modes require latency calibration")
     calibration._validate()
     if calibration.execution_mode != mode.name:
@@ -1618,13 +1926,13 @@ def _require_bool(value: Any, *, label: str) -> bool:
 
 
 def _validate_install_inputs(
-    intent: RequestIntentV4,
+    intent: RequestIntentV5,
     *,
     now_ns: int,
     control_step: int,
 ) -> Tuple[int, int]:
-    if not isinstance(intent, RequestIntentV4):
-        raise ValueError("intent must be a RequestIntentV4")
+    if not isinstance(intent, RequestIntentV5):
+        raise ValueError("intent must be a RequestIntentV5")
     now = _require_nonbool_int(now_ns, label="now_ns", minimum=0)
     step = _require_nonbool_int(control_step, label="control_step", minimum=0)
     return now, step
@@ -1640,9 +1948,7 @@ def validate_bsp_response(response: Mapping[str, Any]) -> bsp_spline.BspSpline:
         raise ValueError("BSP legacy actions must be a numeric array") from error
     if actions.shape != (8, 7):
         raise ValueError("BSP legacy actions must have exact shape (8, 7)")
-    if not np.issubdtype(actions.dtype, np.number) or np.issubdtype(
-        actions.dtype, np.complexfloating
-    ):
+    if not np.issubdtype(actions.dtype, np.number) or np.issubdtype(actions.dtype, np.complexfloating):
         raise ValueError("BSP legacy actions must be real numeric values")
     if not np.isfinite(actions).all():
         raise ValueError("BSP legacy actions must be finite")

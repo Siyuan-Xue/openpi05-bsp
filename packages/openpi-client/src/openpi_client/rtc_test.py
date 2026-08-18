@@ -229,3 +229,59 @@ def test_exhausted_state_and_reset_return_to_a_clean_bootstrap_seam():
     assert plan.cursor == 0
     assert plan.delay_history == (4,)
     assert not plan.request_in_flight
+
+
+def test_raw_async_and_rtc_share_the_same_eight_tick_launch_gate():
+    raw = rtc.RawAsyncPlan(d_init=8)
+    guided = rtc.RtcPlan(d_init=8, fixed_delay=True)
+    raw.begin_bootstrap()
+    guided.begin_bootstrap()
+    response = _response()
+    raw.install_result(response)
+    guided.install_result(response)
+
+    for _ in range(7):
+        raw.consume_action()
+        guided.consume_action()
+    assert raw.state is rtc.RtcPlanState.EXECUTING
+    assert guided.state is rtc.RtcPlanState.EXECUTING
+
+    raw.consume_action()
+    guided.consume_action()
+    assert raw.state is rtc.RtcPlanState.READY_TO_LAUNCH
+    assert guided.state is rtc.RtcPlanState.READY_TO_LAUNCH
+    assert raw.forecast_delay == guided.forecast_delay == 8
+
+
+def test_raw_async_request_has_no_continuity_guidance_and_skips_elapsed_prefix():
+    plan = rtc.RawAsyncPlan(d_init=8)
+    plan.begin_bootstrap()
+    plan.install_result(_response(action_offset=0.0))
+    for _ in range(8):
+        plan.consume_action()
+
+    overlay = plan.begin_background()
+    assert overlay == {inference.RTC_REQUEST_KEY: {"schema_version": inference.RTC_SCHEMA_VERSION}}
+
+    for _ in range(3):
+        plan.consume_action()
+    response = _response(action_offset=1_000.0)
+    plan.install_result(response)
+
+    assert plan.cursor == 3
+    np.testing.assert_array_equal(plan.consume_action(), response["actions"][3].astype(np.float32))
+
+
+def test_fixed_rtc_delay_does_not_adapt_below_theoretical_budget():
+    plan = rtc.RtcPlan(d_init=8, fixed_delay=True)
+    plan.begin_bootstrap()
+    plan.install_result(_response())
+
+    for cycle in range(12):
+        while plan.cursor < 8:
+            plan.consume_action()
+        overlay = plan.begin_guided()
+        assert overlay[inference.RTC_REQUEST_KEY]["s"] == 8
+        assert overlay[inference.RTC_REQUEST_KEY]["d"] == 8
+        plan.install_result(_response(action_offset=float(cycle + 1)))
+        assert plan.forecast_delay == 8

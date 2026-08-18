@@ -1,6 +1,6 @@
-"""Strict schema-v4 LIBERO evaluation records and artifact persistence.
+"""Strict schema-v5 LIBERO evaluation records and artifact persistence.
 
-Schema-v4 is intentionally independent of the schema-v2/v3 producer and
+Schema-v5 is intentionally independent of the schema-v2/v3 producer and
 writer.  Only rollout identities, deterministic flow seeds, and failure
 classification are shared where their behavior is unchanged.
 """
@@ -22,9 +22,10 @@ from typing import Optional
 from typing import Tuple
 
 from openpi_client import libero_artifacts
-from openpi_client import libero_control_v4 as _control
+from openpi_client import libero_control_v5 as _control
 from openpi_client import libero_eval as _legacy_identity
-from openpi_client import libero_video_timing_v4 as _timing
+from openpi_client import libero_video_timing_v5 as _timing
+from openpi_client import latency_sampling
 
 
 EpisodeIdentity = _legacy_identity.EpisodeIdentity
@@ -45,7 +46,7 @@ MAX_STEPS_BY_SUITE = MappingProxyType(
 )
 BSP_PARAMETERS = MappingProxyType(dict(_legacy_identity.BSP_PARAMETERS))
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DATASET_FPS = 10
 SOURCE_DEMO_CONTROL_HZ = 20
 CONTROL_FREQ_HZ = 20
@@ -56,9 +57,7 @@ INFRASTRUCTURE_RETRIES = 2
 
 _INFRASTRUCTURE_KINDS = frozenset(("simulator", "container", "network"))
 _FAILURE_KINDS = frozenset(("policy", "timeout"))
-_STATUSES = frozenset(
-    ("success", "policy_failure", "timeout_failure", "infrastructure_incomplete")
-)
+_STATUSES = frozenset(("success", "policy_failure", "timeout_failure", "infrastructure_incomplete"))
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _CODE_SHA_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _CONTAINER_DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
@@ -72,7 +71,10 @@ _MANIFEST_FIELDS = frozenset(
         "controller_period_ns",
         "video_fps",
         "video_show_inference_waits",
-        "synthetic_latency_target_ms",
+        "latency_distribution",
+        "theoretical_p95_latency_ns",
+        "scheduling_latency_budget_ns",
+        "scheduling_delay_ticks",
         "execution_mode",
         "execution_parameters",
         "latency_calibration",
@@ -127,6 +129,7 @@ _EPISODE_FIELDS = frozenset(
         "inference_requests",
         "inference_latencies",
         "plan_activations",
+        "action_seams",
         "action_underflows",
         "control_stalls",
         "infrastructure_history",
@@ -208,12 +211,7 @@ def _require_sha256(value: Any, *, name: str) -> str:
 
 
 def _require_timeout(value: Any, *, name: str) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-        or value <= 0
-    ):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
         raise ValueError("{} must be positive and finite".format(name))
     return float(value)
 
@@ -257,8 +255,7 @@ def _json_values_match(actual: Any, expected: Any) -> bool:
             isinstance(actual, tuple)
             and len(actual) == len(expected)
             and all(
-                _json_values_match(actual_item, expected_item)
-                for actual_item, expected_item in zip(actual, expected)
+                _json_values_match(actual_item, expected_item) for actual_item, expected_item in zip(actual, expected)
             )
         )
     return type(actual) is type(expected) and actual == expected
@@ -308,9 +305,7 @@ def _freeze_infrastructure_history(values: Any) -> Tuple[Mapping[str, Any], ...]
         if not isinstance(kind, str) or kind not in _INFRASTRUCTURE_KINDS:
             raise ValueError("unsupported infrastructure history kind")
         error = _require_nonempty_text(entry["error"], name="infrastructure history error")
-        result.append(
-            MappingProxyType({"attempt": attempt, "kind": kind, "error": error})
-        )
+        result.append(MappingProxyType({"attempt": attempt, "kind": kind, "error": error}))
         previous_attempt = attempt
     return tuple(result)
 
@@ -323,9 +318,7 @@ def _validate_stall_source_frames(values: Any, *, steps: int) -> Tuple[Tuple[int
     for value in values:
         if not isinstance(value, tuple) or len(value) != 2:
             raise ValueError("stall_source_frames must contain (control_step, frame) tuples")
-        control_step = _require_nonnegative_integer(
-            value[0], name="stall source control_step"
-        )
+        control_step = _require_nonnegative_integer(value[0], name="stall source control_step")
         if control_step <= previous_step or control_step > steps:
             raise ValueError("stall source control steps must be ordered within 0..steps")
         result.append((control_step, value[1]))
@@ -334,7 +327,7 @@ def _validate_stall_source_frames(values: Any, *, steps: int) -> Tuple[Tuple[int
 
 
 @dataclasses.dataclass(frozen=True)
-class EvaluationManifestV4:
+class EvaluationManifestV5:
     schema_version: int
     dataset_fps: int
     source_demo_control_hz: int
@@ -342,10 +335,13 @@ class EvaluationManifestV4:
     controller_period_ns: int
     video_fps: int
     video_show_inference_waits: bool
-    synthetic_latency_target_ms: int
+    latency_distribution: Mapping[str, Any]
+    theoretical_p95_latency_ns: int
+    scheduling_latency_budget_ns: int
+    scheduling_delay_ticks: int
     execution_mode: str
     execution_parameters: Mapping[str, Any]
-    latency_calibration: Optional[_control.LatencyCalibrationV1]
+    latency_calibration: _control.LatencyCalibrationV2
     server_metadata_fingerprint: str
     code_sha: str
     dataset_revision: str
@@ -374,6 +370,11 @@ class EvaluationManifestV4:
     def __post_init__(self) -> None:
         object.__setattr__(
             self,
+            "latency_distribution",
+            _freeze_json(self.latency_distribution, label="latency_distribution"),
+        )
+        object.__setattr__(
+            self,
             "execution_parameters",
             _freeze_json(self.execution_parameters, label="execution_parameters"),
         )
@@ -398,7 +399,7 @@ class EvaluationManifestV4:
 
     def _validate(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != SCHEMA_VERSION:
-            raise ValueError("manifest schema_version must be integer 4")
+            raise ValueError("manifest schema_version must be integer 5")
         for name, actual, expected in (
             ("dataset_fps", self.dataset_fps, DATASET_FPS),
             ("source_demo_control_hz", self.source_demo_control_hz, SOURCE_DEMO_CONTROL_HZ),
@@ -409,20 +410,45 @@ class EvaluationManifestV4:
         ):
             if isinstance(actual, bool) or not isinstance(actual, int) or actual != expected:
                 raise ValueError("{} must be exactly {}".format(name, expected))
-        _timing.validate_video_frequencies_v4(
+        _timing.validate_video_frequencies_v5(
             control_hz=self.control_freq_hz,
             video_fps=self.video_fps,
         )
         if type(self.video_show_inference_waits) is not bool:
             raise ValueError("video_show_inference_waits must be boolean")
-        if self.synthetic_latency_target_ms not in (0, 100, 200, 300, 850):
-            raise ValueError(
-                "synthetic_latency_target_ms must be one of 0, 100, 200, 300, or 850"
-            )
+        expected_latency_distribution = {
+            "distribution": "normal",
+            "mean_ns": latency_sampling.DEFAULT_MEAN_NS,
+            "stddev_ns": latency_sampling.DEFAULT_STDDEV_NS,
+            "seed": latency_sampling.DEFAULT_SEED,
+            "sampler_version": latency_sampling.SAMPLER_VERSION,
+            "negative_policy": latency_sampling.NEGATIVE_POLICY,
+        }
+        if not _json_values_match(self.latency_distribution, expected_latency_distribution):
+            raise ValueError("latency_distribution does not match the frozen schema-v5 sampler")
+        for name, value, expected in (
+            (
+                "theoretical_p95_latency_ns",
+                self.theoretical_p95_latency_ns,
+                _control.THEORETICAL_P95_LATENCY_NS,
+            ),
+            (
+                "scheduling_latency_budget_ns",
+                self.scheduling_latency_budget_ns,
+                _control.SCHEDULING_LATENCY_BUDGET_NS,
+            ),
+            (
+                "scheduling_delay_ticks",
+                self.scheduling_delay_ticks,
+                _control.SCHEDULING_DELAY_TICKS,
+            ),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+                raise ValueError("{} must be exactly {}".format(name, expected))
         try:
             mode = _control.EXECUTION_MODES[self.execution_mode]
         except (KeyError, TypeError) as error:
-            raise ValueError("unsupported schema-v4 execution_mode") from error
+            raise ValueError("unsupported schema-v5 execution_mode") from error
         expected_parameters = mode.to_parameters_dict()
         if not _json_values_match(self.execution_parameters, expected_parameters):
             raise ValueError("execution_parameters do not match the frozen mode table")
@@ -476,55 +502,36 @@ class EvaluationManifestV4:
         if not _json_values_match(self.bsp_parameters, dict(BSP_PARAMETERS)):
             raise ValueError("bsp_parameters must match the frozen LIBERO BSP identity")
         calibration = self.latency_calibration
-        if mode.asynchronous:
-            if not isinstance(calibration, _control.LatencyCalibrationV1):
-                raise ValueError("asynchronous modes require LatencyCalibrationV1")
-            calibration.to_dict()
-            if calibration.execution_mode != self.execution_mode:
-                raise ValueError("calibration execution_mode does not match manifest")
-            if calibration.server_metadata_fingerprint != self.server_metadata_fingerprint:
-                raise ValueError("calibration server fingerprint does not match manifest")
-            if calibration.checkpoint_identity_fingerprint != checkpoint_identity.fingerprint:
-                raise ValueError("calibration checkpoint fingerprint does not match manifest")
-        elif self.latency_calibration is not None:
-            raise ValueError("synchronous modes require null latency_calibration")
+        if not isinstance(calibration, _control.LatencyCalibrationV2):
+            raise ValueError("schema-v5 modes require LatencyCalibrationV2")
+        calibration.to_dict()
+        if calibration.execution_mode != self.execution_mode:
+            raise ValueError("calibration execution_mode does not match manifest")
+        if calibration.server_metadata_fingerprint != self.server_metadata_fingerprint:
+            raise ValueError("calibration server fingerprint does not match manifest")
+        if calibration.checkpoint_identity_fingerprint != checkpoint_identity.fingerprint:
+            raise ValueError("calibration checkpoint fingerprint does not match manifest")
 
         suites = tuple(self.suites)
         if suites not in tuple((suite,) for suite in SUPPORTED_SUITES) + (SUPPORTED_SUITES,):
             raise ValueError("suites must be one suite or all four in canonical order")
-        task_ids = tuple(
-            _require_integer(value, name="task_id", minimum=0, maximum=9)
-            for value in self.task_ids
-        )
+        task_ids = tuple(_require_integer(value, name="task_id", minimum=0, maximum=9) for value in self.task_ids)
         if not task_ids or task_ids != tuple(sorted(set(task_ids))):
             raise ValueError("task_ids must be non-empty, unique, and sorted")
-        if mode.asynchronous:
-            if not isinstance(calibration, _control.LatencyCalibrationV1):
-                raise ValueError("asynchronous modes require LatencyCalibrationV1")
-            canonical = calibration.canonical_observation_identity
-            if canonical.suite != suites[0]:
-                raise ValueError(
-                    "calibration canonical observation suite must match suites[0]"
-                )
-            if canonical.task_id != task_ids[0]:
-                raise ValueError(
-                    "calibration canonical observation task_id must match task_ids[0]"
-                )
-            if canonical.init_state_index != 0:
-                raise ValueError(
-                    "calibration canonical observation init_state_index must be zero"
-                )
+        canonical = calibration.canonical_observation_identity
+        if canonical.suite != suites[0]:
+            raise ValueError("calibration canonical observation suite must match suites[0]")
+        if canonical.task_id != task_ids[0]:
+            raise ValueError("calibration canonical observation task_id must match task_ids[0]")
+        if canonical.init_state_index != 0:
+            raise ValueError("calibration canonical observation init_state_index must be zero")
         _require_integer(self.trials_per_task, name="trials_per_task", minimum=1)
         _require_nonnegative_integer(self.num_steps_wait, name="num_steps_wait")
         if set(self.max_steps_by_suite) != set(suites):
             raise ValueError("max_steps_by_suite must exactly match selected suites")
         for suite, value in self.max_steps_by_suite.items():
             expected = MAX_STEPS_BY_SUITE[suite]
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or value != expected
-            ):
+            if isinstance(value, bool) or not isinstance(value, int) or value != expected:
                 raise ValueError("max steps for {} must be {}".format(suite, expected))
         _require_timeout(self.connection_timeout_s, name="connection_timeout_s")
         _require_timeout(self.inference_timeout_s, name="inference_timeout_s")
@@ -539,13 +546,14 @@ class EvaluationManifestV4:
             "controller_period_ns": self.controller_period_ns,
             "video_fps": self.video_fps,
             "video_show_inference_waits": self.video_show_inference_waits,
-            "synthetic_latency_target_ms": self.synthetic_latency_target_ms,
+            "latency_distribution": _thaw_json(self.latency_distribution),
+            "theoretical_p95_latency_ns": self.theoretical_p95_latency_ns,
+            "scheduling_latency_budget_ns": self.scheduling_latency_budget_ns,
+            "scheduling_delay_ticks": self.scheduling_delay_ticks,
             "execution_mode": self.execution_mode,
             "execution_parameters": _thaw_json(self.execution_parameters),
             "latency_calibration": (
-                self.latency_calibration.to_dict()
-                if self.latency_calibration is not None
-                else None
+                self.latency_calibration.to_dict() if self.latency_calibration is not None else None
             ),
             "server_metadata_fingerprint": self.server_metadata_fingerprint,
             "code_sha": self.code_sha,
@@ -574,8 +582,9 @@ class EvaluationManifestV4:
         }
 
     @classmethod
-    def from_dict(cls, value: Any) -> "EvaluationManifestV4":
-        payload = dict(_require_exact_fields(value, _MANIFEST_FIELDS, label="v4 manifest"))
+    def from_dict(cls, value: Any) -> "EvaluationManifestV5":
+        payload = dict(_require_exact_fields(value, _MANIFEST_FIELDS, label="v5 manifest"))
+        _require_json_object(payload["latency_distribution"], label="latency_distribution")
         _require_json_object(payload["execution_parameters"], label="execution_parameters")
         _require_json_object(payload["bsp_parameters"], label="bsp_parameters")
         _require_json_object(payload["max_steps_by_suite"], label="max_steps_by_suite")
@@ -584,21 +593,15 @@ class EvaluationManifestV4:
         if not isinstance(payload["task_ids"], list):
             raise ValueError("task_ids must be a JSON list")
         mode = _control.EXECUTION_MODES.get(payload["execution_mode"])
-        if mode is not None and not _json_wire_values_match(
-            payload["execution_parameters"], mode.to_parameters_dict()
-        ):
+        if mode is not None and not _json_wire_values_match(payload["execution_parameters"], mode.to_parameters_dict()):
             raise ValueError("execution_parameters must use the exact JSON container types")
-        calibration_payload = payload["latency_calibration"]
-        if calibration_payload is not None:
-            _require_json_object(calibration_payload, label="latency_calibration")
-            payload["latency_calibration"] = _control.LatencyCalibrationV1.from_dict(
-                calibration_payload
-            )
+        calibration_payload = _require_json_object(payload["latency_calibration"], label="latency_calibration")
+        payload["latency_calibration"] = _control.LatencyCalibrationV2.from_dict(calibration_payload)
         return cls(**payload)
 
 
 @dataclasses.dataclass(frozen=True)
-class AttemptResultV4:
+class AttemptResultV5:
     execution_mode: str
     success: bool
     steps: int
@@ -606,15 +609,14 @@ class AttemptResultV4:
     episode_duration_ns: int
     failure_kind: Optional[str] = None
     error: Optional[str] = None
-    inference_requests: Tuple[_timing.RequestEventV4, ...] = ()
-    inference_latencies: Tuple[_timing.LatencyEventV4, ...] = ()
-    plan_activations: Tuple[_timing.PlanActivationV4, ...] = ()
-    action_underflows: Tuple[_timing.ActionUnderflowV4, ...] = ()
-    control_stalls: Tuple[_timing.ControlStallV4, ...] = ()
+    inference_requests: Tuple[_timing.RequestEventV5, ...] = ()
+    inference_latencies: Tuple[_timing.LatencyEventV5, ...] = ()
+    plan_activations: Tuple[_timing.PlanActivationV5, ...] = ()
+    action_seams: Tuple[_timing.ActionSeamV5, ...] = ()
+    action_underflows: Tuple[_timing.ActionUnderflowV5, ...] = ()
+    control_stalls: Tuple[_timing.ControlStallV5, ...] = ()
     replay_frames: Tuple[Any, ...] = dataclasses.field(default=(), repr=False, compare=False)
-    stall_source_frames: Tuple[Tuple[int, Any], ...] = dataclasses.field(
-        default=(), repr=False, compare=False
-    )
+    stall_source_frames: Tuple[Tuple[int, Any], ...] = dataclasses.field(default=(), repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -622,7 +624,7 @@ class AttemptResultV4:
             "inference_requests",
             _record_tuple(
                 self.inference_requests,
-                _timing.RequestEventV4,
+                _timing.RequestEventV5,
                 label="inference_requests",
             ),
         )
@@ -631,7 +633,7 @@ class AttemptResultV4:
             "inference_latencies",
             _record_tuple(
                 self.inference_latencies,
-                _timing.LatencyEventV4,
+                _timing.LatencyEventV5,
                 label="inference_latencies",
             ),
         )
@@ -640,16 +642,21 @@ class AttemptResultV4:
             "plan_activations",
             _record_tuple(
                 self.plan_activations,
-                _timing.PlanActivationV4,
+                _timing.PlanActivationV5,
                 label="plan_activations",
             ),
+        )
+        object.__setattr__(
+            self,
+            "action_seams",
+            _record_tuple(self.action_seams, _timing.ActionSeamV5, label="action_seams"),
         )
         object.__setattr__(
             self,
             "action_underflows",
             _record_tuple(
                 self.action_underflows,
-                _timing.ActionUnderflowV4,
+                _timing.ActionUnderflowV5,
                 label="action_underflows",
             ),
         )
@@ -658,13 +665,11 @@ class AttemptResultV4:
             "control_stalls",
             _record_tuple(
                 self.control_stalls,
-                _timing.ControlStallV4,
+                _timing.ControlStallV5,
                 label="control_stalls",
             ),
         )
-        if isinstance(self.replay_frames, (str, bytes)) or not isinstance(
-            self.replay_frames, Sequence
-        ):
+        if isinstance(self.replay_frames, (str, bytes)) or not isinstance(self.replay_frames, Sequence):
             raise ValueError("replay_frames must be a sequence")
         object.__setattr__(self, "replay_frames", tuple(self.replay_frames))
         object.__setattr__(
@@ -676,7 +681,7 @@ class AttemptResultV4:
 
     def _validate(self) -> None:
         if self.execution_mode not in _control.EXECUTION_MODES:
-            raise ValueError("unsupported schema-v4 execution_mode")
+            raise ValueError("unsupported schema-v5 execution_mode")
         if type(self.success) is not bool:
             raise ValueError("attempt success must be boolean")
         _require_nonnegative_integer(self.steps, name="steps")
@@ -695,6 +700,7 @@ class AttemptResultV4:
                 (
                     self.inference_latencies,
                     self.plan_activations,
+                    self.action_seams,
                     self.action_underflows,
                     self.control_stalls,
                 )
@@ -705,7 +711,7 @@ class AttemptResultV4:
 
 
 @dataclasses.dataclass(frozen=True)
-class EpisodeRecordV4:
+class EpisodeRecordV5:
     schema_version: int
     episode_id: str
     paired_key: str
@@ -726,19 +732,16 @@ class EpisodeRecordV4:
     steps: int
     replans: int
     episode_duration_ns: int
-    inference_requests: Tuple[_timing.RequestEventV4, ...]
-    inference_latencies: Tuple[_timing.LatencyEventV4, ...]
-    plan_activations: Tuple[_timing.PlanActivationV4, ...]
-    action_underflows: Tuple[_timing.ActionUnderflowV4, ...]
-    control_stalls: Tuple[_timing.ControlStallV4, ...]
+    inference_requests: Tuple[_timing.RequestEventV5, ...]
+    inference_latencies: Tuple[_timing.LatencyEventV5, ...]
+    plan_activations: Tuple[_timing.PlanActivationV5, ...]
+    action_seams: Tuple[_timing.ActionSeamV5, ...]
+    action_underflows: Tuple[_timing.ActionUnderflowV5, ...]
+    control_stalls: Tuple[_timing.ControlStallV5, ...]
     infrastructure_history: Tuple[Mapping[str, Any], ...]
     replay_frames: Tuple[Any, ...] = dataclasses.field(default=(), repr=False, compare=False)
-    stall_source_frames: Tuple[Tuple[int, Any], ...] = dataclasses.field(
-        default=(), repr=False, compare=False
-    )
-    expected_bsp_prefetch_budget_ns: Optional[int] = dataclasses.field(
-        default=None, repr=False, compare=False
-    )
+    stall_source_frames: Tuple[Tuple[int, Any], ...] = dataclasses.field(default=(), repr=False, compare=False)
+    expected_bsp_prefetch_budget_ns: Optional[int] = dataclasses.field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -746,7 +749,7 @@ class EpisodeRecordV4:
             "inference_requests",
             _record_tuple(
                 self.inference_requests,
-                _timing.RequestEventV4,
+                _timing.RequestEventV5,
                 label="inference_requests",
             ),
         )
@@ -755,7 +758,7 @@ class EpisodeRecordV4:
             "inference_latencies",
             _record_tuple(
                 self.inference_latencies,
-                _timing.LatencyEventV4,
+                _timing.LatencyEventV5,
                 label="inference_latencies",
             ),
         )
@@ -764,16 +767,21 @@ class EpisodeRecordV4:
             "plan_activations",
             _record_tuple(
                 self.plan_activations,
-                _timing.PlanActivationV4,
+                _timing.PlanActivationV5,
                 label="plan_activations",
             ),
+        )
+        object.__setattr__(
+            self,
+            "action_seams",
+            _record_tuple(self.action_seams, _timing.ActionSeamV5, label="action_seams"),
         )
         object.__setattr__(
             self,
             "action_underflows",
             _record_tuple(
                 self.action_underflows,
-                _timing.ActionUnderflowV4,
+                _timing.ActionUnderflowV5,
                 label="action_underflows",
             ),
         )
@@ -782,7 +790,7 @@ class EpisodeRecordV4:
             "control_stalls",
             _record_tuple(
                 self.control_stalls,
-                _timing.ControlStallV4,
+                _timing.ControlStallV5,
                 label="control_stalls",
             ),
         )
@@ -791,9 +799,7 @@ class EpisodeRecordV4:
             "infrastructure_history",
             _freeze_infrastructure_history(self.infrastructure_history),
         )
-        if isinstance(self.replay_frames, (str, bytes)) or not isinstance(
-            self.replay_frames, Sequence
-        ):
+        if isinstance(self.replay_frames, (str, bytes)) or not isinstance(self.replay_frames, Sequence):
             raise ValueError("replay_frames must be a sequence")
         object.__setattr__(self, "replay_frames", tuple(self.replay_frames))
         object.__setattr__(
@@ -815,7 +821,7 @@ class EpisodeRecordV4:
 
     def _validate(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != SCHEMA_VERSION:
-            raise ValueError("episode schema_version must be integer 4")
+            raise ValueError("episode schema_version must be integer 5")
         _require_nonempty_text(self.episode_id, name="episode_id")
         _require_nonempty_text(self.paired_key, name="paired_key")
         _require_nonempty_text(self.task_name, name="task_name")
@@ -827,7 +833,7 @@ class EpisodeRecordV4:
             raise ValueError("episode_id and paired_key must match the rollout identity")
         _require_nonnegative_integer(self.eval_seed, name="eval_seed")
         if self.execution_mode not in _control.EXECUTION_MODES:
-            raise ValueError("unsupported schema-v4 execution_mode")
+            raise ValueError("unsupported schema-v5 execution_mode")
         if self.execution_mode == "bsp_spline_async":
             if self.expected_bsp_prefetch_budget_ns is not None:
                 _require_nonnegative_integer(
@@ -863,17 +869,12 @@ class EpisodeRecordV4:
         )
         if actual != expected:
             raise ValueError("episode status fields are inconsistent")
-        if (
-            self.infrastructure_kind is not None
-            and self.infrastructure_kind not in _INFRASTRUCTURE_KINDS
-        ):
+        if self.infrastructure_kind is not None and self.infrastructure_kind not in _INFRASTRUCTURE_KINDS:
             raise ValueError("unsupported infrastructure_kind")
         if self.status == "infrastructure_incomplete":
             if self.error is None or not self.infrastructure_history:
                 raise ValueError("infrastructure-incomplete episodes require history and error")
-            if tuple(entry["attempt"] for entry in self.infrastructure_history) != tuple(
-                range(1, self.attempts + 1)
-            ):
+            if tuple(entry["attempt"] for entry in self.infrastructure_history) != tuple(range(1, self.attempts + 1)):
                 raise ValueError("infrastructure-incomplete history must cover every attempt")
             final_history = self.infrastructure_history[-1]
             if (
@@ -890,6 +891,7 @@ class EpisodeRecordV4:
                     self.inference_requests,
                     self.inference_latencies,
                     self.plan_activations,
+                    self.action_seams,
                     self.action_underflows,
                     self.control_stalls,
                     self.replay_frames,
@@ -898,9 +900,7 @@ class EpisodeRecordV4:
             ):
                 raise ValueError("infrastructure-incomplete episodes must have empty metrics")
             return
-        if tuple(entry["attempt"] for entry in self.infrastructure_history) != tuple(
-            range(1, self.attempts)
-        ):
+        if tuple(entry["attempt"] for entry in self.infrastructure_history) != tuple(range(1, self.attempts)):
             raise ValueError("retry history must cover every preceding attempt")
         if self.status == "success" and self.error is not None:
             raise ValueError("successful episodes cannot carry an error")
@@ -920,16 +920,20 @@ class EpisodeRecordV4:
                 "execution_mode": self.execution_mode,
                 "eval_seed": self.eval_seed,
                 "identity": identity,
+                "verify_sampled_targets": True,
             }
             if self.execution_mode == "bsp_spline_async":
-                validation_args["expected_bsp_prefetch_budget_ns"] = (
-                    self.expected_bsp_prefetch_budget_ns
-                )
-            _timing.validate_timing_events_v4(**validation_args)
+                validation_args["expected_bsp_prefetch_budget_ns"] = self.expected_bsp_prefetch_budget_ns
+            _timing.validate_timing_events_v5(**validation_args)
+            _timing.validate_action_seams_v5(
+                seams=self.action_seams,
+                activations=self.plan_activations,
+            )
         elif any(
             (
                 self.inference_latencies,
                 self.plan_activations,
+                self.action_seams,
                 self.action_underflows,
                 self.control_stalls,
             )
@@ -946,14 +950,14 @@ class EpisodeRecordV4:
         attempts: int,
         *,
         execution_mode: str,
-        result: AttemptResultV4,
+        result: AttemptResultV5,
         infrastructure_history: Sequence[Mapping[str, Any]] = (),
         expected_bsp_prefetch_budget_ns: Optional[int] = None,
-    ) -> "EpisodeRecordV4":
+    ) -> "EpisodeRecordV5":
         if not isinstance(identity, EpisodeIdentity):
             raise ValueError("identity must be an EpisodeIdentity")
-        if not isinstance(result, AttemptResultV4):
-            raise ValueError("result must be AttemptResultV4")
+        if not isinstance(result, AttemptResultV5):
+            raise ValueError("result must be AttemptResultV5")
         if result.execution_mode != execution_mode:
             raise ValueError("attempt execution_mode does not match episode")
         failure_kind = None if result.success else result.failure_kind
@@ -982,6 +986,7 @@ class EpisodeRecordV4:
             inference_requests=result.inference_requests,
             inference_latencies=result.inference_latencies,
             plan_activations=result.plan_activations,
+            action_seams=result.action_seams,
             action_underflows=result.action_underflows,
             control_stalls=result.control_stalls,
             infrastructure_history=tuple(infrastructure_history),
@@ -1001,7 +1006,7 @@ class EpisodeRecordV4:
         kind: str,
         error: str,
         infrastructure_history: Sequence[Mapping[str, Any]],
-    ) -> "EpisodeRecordV4":
+    ) -> "EpisodeRecordV5":
         return cls(
             schema_version=SCHEMA_VERSION,
             episode_id=identity.episode_id,
@@ -1026,6 +1031,7 @@ class EpisodeRecordV4:
             inference_requests=(),
             inference_latencies=(),
             plan_activations=(),
+            action_seams=(),
             action_underflows=(),
             control_stalls=(),
             infrastructure_history=tuple(infrastructure_history),
@@ -1057,6 +1063,7 @@ class EpisodeRecordV4:
             "inference_requests": [event.to_dict() for event in self.inference_requests],
             "inference_latencies": [event.to_dict() for event in self.inference_latencies],
             "plan_activations": [event.to_dict() for event in self.plan_activations],
+            "action_seams": [event.to_dict() for event in self.action_seams],
             "action_underflows": [event.to_dict() for event in self.action_underflows],
             "control_stalls": [event.to_dict() for event in self.control_stalls],
             "infrastructure_history": [dict(entry) for entry in self.infrastructure_history],
@@ -1068,14 +1075,15 @@ class EpisodeRecordV4:
         value: Any,
         *,
         expected_bsp_prefetch_budget_ns: Optional[int] = None,
-    ) -> "EpisodeRecordV4":
-        payload = dict(_require_exact_fields(value, _EPISODE_FIELDS, label="v4 episode"))
+    ) -> "EpisodeRecordV5":
+        payload = dict(_require_exact_fields(value, _EPISODE_FIELDS, label="v5 episode"))
         event_fields = (
-            ("inference_requests", _timing.RequestEventV4),
-            ("inference_latencies", _timing.LatencyEventV4),
-            ("plan_activations", _timing.PlanActivationV4),
-            ("action_underflows", _timing.ActionUnderflowV4),
-            ("control_stalls", _timing.ControlStallV4),
+            ("inference_requests", _timing.RequestEventV5),
+            ("inference_latencies", _timing.LatencyEventV5),
+            ("plan_activations", _timing.PlanActivationV5),
+            ("action_seams", _timing.ActionSeamV5),
+            ("action_underflows", _timing.ActionUnderflowV5),
+            ("control_stalls", _timing.ControlStallV5),
         )
         for field, record_type in event_fields:
             if not isinstance(payload[field], list):
@@ -1089,35 +1097,33 @@ class EpisodeRecordV4:
         return cls(**payload)
 
 
-def run_episode_with_retries_v4(
+def run_episode_with_retries_v5(
     identity: EpisodeIdentity,
-    attempt: Callable[[int], AttemptResultV4],
+    attempt: Callable[[int], AttemptResultV5],
     *,
     eval_seed: int,
     execution_mode: str,
     infrastructure_retries: int = INFRASTRUCTURE_RETRIES,
     expected_bsp_prefetch_budget_ns: Optional[int] = None,
-) -> EpisodeRecordV4:
+) -> EpisodeRecordV5:
     """Retry only infrastructure and retain metrics from the final attempt."""
     if (
         isinstance(infrastructure_retries, bool)
         or not isinstance(infrastructure_retries, int)
         or infrastructure_retries != INFRASTRUCTURE_RETRIES
     ):
-        raise ValueError("schema-v4 evaluation requires exactly two infrastructure retries")
+        raise ValueError("schema-v5 evaluation requires exactly two infrastructure retries")
     if execution_mode not in _control.EXECUTION_MODES:
-        raise ValueError("unsupported schema-v4 execution_mode")
+        raise ValueError("unsupported schema-v5 execution_mode")
     history = []  # type: List[Dict[str, Any]]
     for attempt_number in range(1, infrastructure_retries + 2):
         try:
             result = attempt(attempt_number)
         except InfrastructureFailure as error:
-            history.append(
-                {"attempt": attempt_number, "kind": error.kind, "error": str(error)}
-            )
+            history.append({"attempt": attempt_number, "kind": error.kind, "error": str(error)})
             if attempt_number <= infrastructure_retries:
                 continue
-            return EpisodeRecordV4.infrastructure_incomplete(
+            return EpisodeRecordV5.infrastructure_incomplete(
                 identity,
                 eval_seed,
                 attempt_number,
@@ -1126,9 +1132,9 @@ def run_episode_with_retries_v4(
                 error=str(error),
                 infrastructure_history=history,
             )
-        if not isinstance(result, AttemptResultV4):
-            raise TypeError("attempt callback must return AttemptResultV4")
-        return EpisodeRecordV4.from_attempt(
+        if not isinstance(result, AttemptResultV5):
+            raise TypeError("attempt callback must return AttemptResultV5")
+        return EpisodeRecordV5.from_attempt(
             identity,
             eval_seed,
             attempt_number,
@@ -1144,17 +1150,17 @@ def _rate(successes: int, eligible: int) -> Optional[float]:
     return successes / eligible if eligible else None
 
 
-def aggregate_records_v4(
-    records: Sequence[EpisodeRecordV4],
+def aggregate_records_v5(
+    records: Sequence[EpisodeRecordV5],
     *,
-    artifact_errors: Sequence["ArtifactErrorV4"] = (),
+    artifact_errors: Sequence["ArtifactErrorV5"] = (),
 ) -> Dict[str, Any]:
     """Aggregate final episode records without counting infrastructure gaps."""
     if isinstance(records, (str, bytes)) or not isinstance(records, Sequence):
         raise ValueError("records must be a sequence")
     episode_records = tuple(records)
-    if any(not isinstance(record, EpisodeRecordV4) for record in episode_records):
-        raise ValueError("records must contain only EpisodeRecordV4")
+    if any(not isinstance(record, EpisodeRecordV5) for record in episode_records):
+        raise ValueError("records must contain only EpisodeRecordV5")
     for record in episode_records:
         record._validate()
     modes = {record.execution_mode for record in episode_records}
@@ -1163,12 +1169,12 @@ def aggregate_records_v4(
     if isinstance(artifact_errors, (str, bytes)) or not isinstance(artifact_errors, Sequence):
         raise ValueError("artifact_errors must be a sequence")
     errors = tuple(artifact_errors)
-    if any(not isinstance(error, ArtifactErrorV4) for error in errors):
-        raise ValueError("artifact_errors must contain only ArtifactErrorV4")
+    if any(not isinstance(error, ArtifactErrorV5) for error in errors):
+        raise ValueError("artifact_errors must contain only ArtifactErrorV5")
     for error in errors:
         error._validate()
 
-    task_groups = {}  # type: Dict[Tuple[str, int], List[EpisodeRecordV4]]
+    task_groups = {}  # type: Dict[Tuple[str, int], List[EpisodeRecordV5]]
     for record in episode_records:
         task_groups.setdefault((record.suite, record.task_id), []).append(record)
     tasks = []  # type: List[Dict[str, Any]]
@@ -1184,9 +1190,7 @@ def aggregate_records_v4(
                 "eligible_episodes": eligible,
                 "successes": successes,
                 "failures": eligible - successes,
-                "incomplete_infrastructure_count": sum(
-                    not record.include_in_success_rate for record in group
-                ),
+                "incomplete_infrastructure_count": sum(not record.include_in_success_rate for record in group),
                 "success_rate": _rate(successes, eligible),
             }
         )
@@ -1205,13 +1209,9 @@ def aggregate_records_v4(
                 "eligible_episodes": eligible,
                 "successes": successes,
                 "failures": eligible - successes,
-                "incomplete_infrastructure_count": sum(
-                    not record.include_in_success_rate for record in suite_records
-                ),
+                "incomplete_infrastructure_count": sum(not record.include_in_success_rate for record in suite_records),
                 "success_rate": _rate(successes, eligible),
-                "task_macro_success_rate": (
-                    sum(task_rates) / len(task_rates) if task_rates else None
-                ),
+                "task_macro_success_rate": (sum(task_rates) / len(task_rates) if task_rates else None),
             }
         )
     suite_rates = [row["success_rate"] for row in suites if row["success_rate"] is not None]
@@ -1228,9 +1228,7 @@ def aggregate_records_v4(
         "evaluated_suite_count": len(suites),
         "all_four_suites_evaluated": all_four,
         "requested_episodes": len(episode_records),
-        "eligible_episodes": sum(
-            record.include_in_success_rate for record in episode_records
-        ),
+        "eligible_episodes": sum(record.include_in_success_rate for record in episode_records),
         "successes": sum(record.success is True for record in episode_records),
         "incomplete_infrastructure_count": incomplete,
         "artifact_error_count": len(errors),
@@ -1239,7 +1237,7 @@ def aggregate_records_v4(
 
 
 @dataclasses.dataclass(frozen=True)
-class ArtifactErrorV4:
+class ArtifactErrorV5:
     episode_id: str
     artifact_type: str
     path: str
@@ -1264,24 +1262,24 @@ class ArtifactErrorV4:
         }
 
     @classmethod
-    def from_dict(cls, value: Any) -> "ArtifactErrorV4":
+    def from_dict(cls, value: Any) -> "ArtifactErrorV5":
         return cls(
             **_require_exact_fields(
                 value,
                 _ARTIFACT_ERROR_FIELDS,
-                label="v4 artifact error",
+                label="v5 artifact error",
             )
         )
 
 
 @dataclasses.dataclass(frozen=True)
-class VideoArtifactAuditV4:
+class VideoArtifactAuditV5:
     schema_version: int
     episode_id: str
     execution_mode: str
     path: str
     video_show_inference_waits: bool
-    planned: _timing.VideoTimingAuditV4
+    planned: _timing.VideoTimingAuditV5
     encoded_fps: float
     encoded_frame_count: int
     encoded_duration_ns: int
@@ -1298,27 +1296,22 @@ class VideoArtifactAuditV4:
 
     @property
     def timing_tolerance_ns(self) -> int:
-        return (
-            _timing.NANOSECONDS_PER_SECOND + self.planned.video_fps - 1
-        ) // self.planned.video_fps
+        return (_timing.NANOSECONDS_PER_SECOND + self.planned.video_fps - 1) // self.planned.video_fps
 
     def _validate(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != SCHEMA_VERSION:
-            raise ValueError("video artifact schema_version must be integer 4")
+            raise ValueError("video artifact schema_version must be integer 5")
         _require_nonempty_text(self.episode_id, name="video episode_id")
         if self.execution_mode not in _control.EXECUTION_MODES:
             raise ValueError("unsupported video execution_mode")
         _require_nonempty_text(self.path, name="video path")
         if type(self.video_show_inference_waits) is not bool:
             raise ValueError("video_show_inference_waits must be boolean")
-        if not isinstance(self.planned, _timing.VideoTimingAuditV4):
-            raise ValueError("planned must be VideoTimingAuditV4")
+        if not isinstance(self.planned, _timing.VideoTimingAuditV5):
+            raise ValueError("planned must be VideoTimingAuditV5")
         self.planned._validate()
-        if (
-            self.planned.control_hz != CONTROL_FREQ_HZ
-            or self.planned.video_fps != VIDEO_FPS
-        ):
-            raise ValueError("planned video timing must use the schema-v4 20/40 Hz rates")
+        if self.planned.control_hz != CONTROL_FREQ_HZ or self.planned.video_fps != VIDEO_FPS:
+            raise ValueError("planned video timing must use the schema-v5 20/40 Hz rates")
         if self.video_show_inference_waits:
             if self.planned.included_stall_count != self.planned.measured_stall_count:
                 raise ValueError("enabled wait overlays must include every measured stall")
@@ -1355,10 +1348,7 @@ class VideoArtifactAuditV4:
             raise ValueError("encoded frame count does not match planned timing")
         if type(self.timing_gate_pass) is not bool:
             raise ValueError("timing_gate_pass must be boolean")
-        expected_gate = (
-            abs(self.encoded_duration_ns - self.planned.expected_duration_ns)
-            <= self.timing_tolerance_ns
-        )
+        expected_gate = abs(self.encoded_duration_ns - self.planned.expected_duration_ns) <= self.timing_tolerance_ns
         if self.timing_gate_pass != expected_gate:
             raise ValueError("timing_gate_pass does not match encoded duration")
         if expected_gate:
@@ -1367,15 +1357,15 @@ class VideoArtifactAuditV4:
         else:
             _require_nonempty_text(self.warning, name="video warning")
 
-    def validate_episode(self, episode: EpisodeRecordV4) -> None:
-        if not isinstance(episode, EpisodeRecordV4):
-            raise ValueError("episode must be EpisodeRecordV4")
+    def validate_episode(self, episode: EpisodeRecordV5) -> None:
+        if not isinstance(episode, EpisodeRecordV5):
+            raise ValueError("episode must be EpisodeRecordV5")
         episode._validate()
         if self.episode_id != episode.episode_id:
             raise ValueError("video episode_id does not match episode record")
         if self.execution_mode != episode.execution_mode:
             raise ValueError("video execution_mode does not match episode record")
-        expected = _timing.build_video_timing_audit_v4(
+        expected = _timing.build_video_timing_audit_v5(
             control_frame_count=episode.steps,
             requests=episode.inference_requests,
             latencies=episode.inference_latencies,
@@ -1407,33 +1397,33 @@ class VideoArtifactAuditV4:
         }
 
     @classmethod
-    def from_dict(cls, value: Any) -> "VideoArtifactAuditV4":
+    def from_dict(cls, value: Any) -> "VideoArtifactAuditV5":
         payload = dict(
             _require_exact_fields(
                 value,
                 _VIDEO_ARTIFACT_FIELDS,
-                label="v4 video artifact audit",
+                label="v5 video artifact audit",
             )
         )
         planned = _require_json_object(payload["planned"], label="planned")
-        payload["planned"] = _timing.VideoTimingAuditV4.from_dict(planned)
+        payload["planned"] = _timing.VideoTimingAuditV5.from_dict(planned)
         return cls(**payload)
 
 
-def build_video_artifact_audit_v4(
+def build_video_artifact_audit_v5(
     *,
-    episode: EpisodeRecordV4,
+    episode: EpisodeRecordV5,
     path: str,
-    planned: _timing.VideoTimingAuditV4,
+    planned: _timing.VideoTimingAuditV5,
     video_show_inference_waits: bool,
     encoded_fps: float,
     encoded_frame_count: int,
     encoded_duration_s: float,
     artifact_padding_frame_count: int = 0,
-) -> VideoArtifactAuditV4:
+) -> VideoArtifactAuditV5:
     """Cross-check an encoded video against its exact episode event timeline."""
-    if not isinstance(episode, EpisodeRecordV4):
-        raise ValueError("episode must be EpisodeRecordV4")
+    if not isinstance(episode, EpisodeRecordV5):
+        raise ValueError("episode must be EpisodeRecordV5")
     if (
         isinstance(encoded_duration_s, bool)
         or not isinstance(encoded_duration_s, (int, float))
@@ -1441,26 +1431,19 @@ def build_video_artifact_audit_v4(
         or encoded_duration_s < 0
     ):
         raise ValueError("encoded_duration_s must be non-negative and finite")
-    encoded_duration_ns = round(
-        float(encoded_duration_s) * _timing.NANOSECONDS_PER_SECOND
-    )
-    if not isinstance(planned, _timing.VideoTimingAuditV4):
-        raise ValueError("planned must be VideoTimingAuditV4")
-    tolerance_ns = (
-        _timing.NANOSECONDS_PER_SECOND + planned.video_fps - 1
-    ) // planned.video_fps
+    encoded_duration_ns = round(float(encoded_duration_s) * _timing.NANOSECONDS_PER_SECOND)
+    if not isinstance(planned, _timing.VideoTimingAuditV5):
+        raise ValueError("planned must be VideoTimingAuditV5")
+    tolerance_ns = (_timing.NANOSECONDS_PER_SECOND + planned.video_fps - 1) // planned.video_fps
     deviation_ns = encoded_duration_ns - planned.expected_duration_ns
     timing_gate_pass = abs(deviation_ns) <= tolerance_ns
     warning = None
     if not timing_gate_pass:
-        warning = (
-            "encoded duration deviates from expected duration by {:.6f} s "
-            "(tolerance {:.6f} s)"
-        ).format(
+        warning = ("encoded duration deviates from expected duration by {:.6f} s " "(tolerance {:.6f} s)").format(
             abs(deviation_ns) / _timing.NANOSECONDS_PER_SECOND,
             tolerance_ns / _timing.NANOSECONDS_PER_SECOND,
         )
-    audit = VideoArtifactAuditV4(
+    audit = VideoArtifactAuditV5(
         schema_version=SCHEMA_VERSION,
         episode_id=episode.episode_id,
         execution_mode=episode.execution_mode,
@@ -1483,16 +1466,16 @@ def _safe_component(value: str, *, fallback: str) -> str:
     return component or fallback
 
 
-class VideoSelectorV4:
+class VideoSelectorV5:
     """Reserve the first success and counted failure video per task."""
 
     def __init__(self, root: Path):
         self._root = Path(root)
         self._claimed = set()  # type: set
 
-    def claim(self, record: EpisodeRecordV4) -> Optional[Path]:
-        if not isinstance(record, EpisodeRecordV4):
-            raise ValueError("record must be EpisodeRecordV4")
+    def claim(self, record: EpisodeRecordV5) -> Optional[Path]:
+        if not isinstance(record, EpisodeRecordV5):
+            raise ValueError("record must be EpisodeRecordV5")
         record._validate()
         if record.success is True:
             outcome = "success"
@@ -1505,11 +1488,7 @@ class VideoSelectorV4:
             return None
         self._claimed.add(key)
         task_name = _safe_component(record.task_name, fallback="task")
-        directory = (
-            self._root
-            / record.suite
-            / "task-{:03d}-{}".format(record.task_id, task_name)
-        )
+        directory = self._root / record.suite / "task-{:03d}-{}".format(record.task_id, task_name)
         directory.mkdir(parents=True, exist_ok=True)
         return directory / "{}-init-{:03d}-{}.mp4".format(
             outcome,
@@ -1519,9 +1498,7 @@ class VideoSelectorV4:
 
 
 def _atomic_append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
-    encoded_line = (
-        json.dumps(payload, sort_keys=True, allow_nan=False) + "\n"
-    ).encode("utf-8")
+    encoded_line = (json.dumps(payload, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
     existing = path.read_bytes() if path.exists() else b""
     if existing and not existing.endswith(b"\n"):
         raise ValueError("existing JSONL artifact must end with a complete newline")
@@ -1529,8 +1506,8 @@ def _atomic_append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
     libero_artifacts.atomic_text(path, combined)
 
 
-class ArtifactWriterV4:
-    """Persist schema-v4 artifacts without invoking any schema-v3 producer."""
+class ArtifactWriterV5:
+    """Persist schema-v5 artifacts without invoking any schema-v3 producer."""
 
     def __init__(self, output_dir: Path):
         self.output_dir = Path(output_dir)
@@ -1548,36 +1525,36 @@ class ArtifactWriterV4:
             if not path.exists():
                 libero_artifacts.atomic_text(path, "")
 
-    def write_manifest(self, manifest: EvaluationManifestV4) -> None:
-        if not isinstance(manifest, EvaluationManifestV4):
-            raise ValueError("manifest must be EvaluationManifestV4")
+    def write_manifest(self, manifest: EvaluationManifestV5) -> None:
+        if not isinstance(manifest, EvaluationManifestV5):
+            raise ValueError("manifest must be EvaluationManifestV5")
         libero_artifacts.atomic_text(
             self.manifest_path,
             libero_artifacts.json_text(manifest.to_dict()),
         )
 
-    def append_episode(self, record: EpisodeRecordV4) -> None:
-        if not isinstance(record, EpisodeRecordV4):
-            raise ValueError("record must be EpisodeRecordV4")
+    def append_episode(self, record: EpisodeRecordV5) -> None:
+        if not isinstance(record, EpisodeRecordV5):
+            raise ValueError("record must be EpisodeRecordV5")
         _atomic_append_jsonl(self.episodes_path, record.to_dict())
 
-    def append_video_audit(self, audit: VideoArtifactAuditV4) -> None:
-        if not isinstance(audit, VideoArtifactAuditV4):
-            raise ValueError("audit must be VideoArtifactAuditV4")
+    def append_video_audit(self, audit: VideoArtifactAuditV5) -> None:
+        if not isinstance(audit, VideoArtifactAuditV5):
+            raise ValueError("audit must be VideoArtifactAuditV5")
         _atomic_append_jsonl(self.video_audit_path, audit.to_dict())
 
-    def append_artifact_error(self, error: ArtifactErrorV4) -> None:
-        if not isinstance(error, ArtifactErrorV4):
-            raise ValueError("error must be ArtifactErrorV4")
+    def append_artifact_error(self, error: ArtifactErrorV5) -> None:
+        if not isinstance(error, ArtifactErrorV5):
+            raise ValueError("error must be ArtifactErrorV5")
         _atomic_append_jsonl(self.artifact_errors_path, error.to_dict())
 
     def write_summary(
         self,
-        records: Sequence[EpisodeRecordV4],
+        records: Sequence[EpisodeRecordV5],
         *,
-        artifact_errors: Sequence[ArtifactErrorV4] = (),
+        artifact_errors: Sequence[ArtifactErrorV5] = (),
     ) -> Dict[str, Any]:
-        summary = aggregate_records_v4(records, artifact_errors=artifact_errors)
+        summary = aggregate_records_v5(records, artifact_errors=artifact_errors)
         libero_artifacts.atomic_text(
             self.summary_path,
             libero_artifacts.json_text(summary),
