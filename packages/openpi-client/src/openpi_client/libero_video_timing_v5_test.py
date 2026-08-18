@@ -108,8 +108,10 @@ def test_request_and_latency_records_expose_paired_sample_identity_and_target():
         duration_ns=300_000_000,
         outcome="success",
         raw_inference_latency_ns=80_000_000,
-        synthetic_delay_ns=220_000_000,
-        effective_inference_latency_ns=300_000_000,
+        requested_synthetic_delay_ns=220_000_000,
+        observed_synthetic_delay_ns=220_000_000,
+        observed_effective_latency_ns=300_000_000,
+        latency_overshoot_ns=0,
         sampled_target_latency_ns=300_000_000,
     )
 
@@ -133,25 +135,51 @@ def test_action_seam_records_exact_arm_and_gripper_jumps():
     assert timing.ActionSeamV5.from_dict(seam.to_dict()) == seam
 
 
-def test_latency_event_records_raw_synthetic_and_effective_durations_separately():
+def test_latency_event_records_requested_and_observed_durations_separately():
     event = timing.LatencyEventV5(
         request_id=3,
         completed_offset_ns=400_000_000,
         duration_ns=300_000_000,
         outcome="success",
         raw_inference_latency_ns=80_000_000,
-        synthetic_delay_ns=220_000_000,
-        effective_inference_latency_ns=300_000_000,
+        requested_synthetic_delay_ns=220_000_000,
+        observed_synthetic_delay_ns=220_000_000,
+        observed_effective_latency_ns=300_000_000,
+        latency_overshoot_ns=0,
     )
 
     payload = event.to_dict()
     assert payload["raw_inference_latency_ns"] == 80_000_000
-    assert payload["synthetic_delay_ns"] == 220_000_000
-    assert payload["effective_inference_latency_ns"] == 300_000_000
+    assert payload["requested_synthetic_delay_ns"] == 220_000_000
+    assert payload["observed_synthetic_delay_ns"] == 220_000_000
+    assert payload["observed_effective_latency_ns"] == 300_000_000
+    assert payload["latency_overshoot_ns"] == 0
     assert timing.LatencyEventV5.from_dict(payload) == event
 
 
-def test_latency_event_rejects_breakdowns_that_do_not_sum_to_effective_latency():
+def test_latency_event_records_requested_and_observed_wait_when_real_clock_overshoots():
+    event = timing.LatencyEventV5(
+        request_id=3,
+        completed_offset_ns=400_500_000,
+        duration_ns=300_500_000,
+        outcome="success",
+        raw_inference_latency_ns=80_000_000,
+        requested_synthetic_delay_ns=220_000_000,
+        observed_synthetic_delay_ns=220_500_000,
+        observed_effective_latency_ns=300_500_000,
+        latency_overshoot_ns=500_000,
+        sampled_target_latency_ns=300_000_000,
+    )
+
+    payload = event.to_dict()
+    assert payload["requested_synthetic_delay_ns"] == 220_000_000
+    assert payload["observed_synthetic_delay_ns"] == 220_500_000
+    assert payload["observed_effective_latency_ns"] == 300_500_000
+    assert payload["latency_overshoot_ns"] == 500_000
+    assert timing.LatencyEventV5.from_dict(payload) == event
+
+
+def test_latency_event_rejects_breakdowns_that_do_not_sum_to_observed_effective_latency():
     with pytest.raises(ValueError, match="raw.*synthetic.*effective"):
         timing.LatencyEventV5(
             request_id=3,
@@ -159,8 +187,10 @@ def test_latency_event_rejects_breakdowns_that_do_not_sum_to_effective_latency()
             duration_ns=300_000_000,
             outcome="success",
             raw_inference_latency_ns=80_000_000,
-            synthetic_delay_ns=10_000_000,
-            effective_inference_latency_ns=300_000_000,
+            requested_synthetic_delay_ns=220_000_000,
+            observed_synthetic_delay_ns=10_000_000,
+            observed_effective_latency_ns=300_000_000,
+            latency_overshoot_ns=0,
         )
 
 
@@ -409,7 +439,10 @@ def test_cross_event_validation_rejects_id_orphan_order_interval_and_seed_mutati
             completed_offset_ns=1_000_000_001,
             duration_ns=200_000_001,
             raw_inference_latency_ns=200_000_001,
-            effective_inference_latency_ns=200_000_001,
+            requested_synthetic_delay_ns=0,
+            observed_synthetic_delay_ns=0,
+            observed_effective_latency_ns=200_000_001,
+            latency_overshoot_ns=0,
         ),
     )
     wrong_seed_requests = (

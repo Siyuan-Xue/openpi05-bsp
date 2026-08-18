@@ -58,12 +58,16 @@ def _calibration(mode: str, *, identity_suffix: str = "") -> control.LatencyCali
         measurement_request_fingerprints=[_sha("measurement-{}".format(index)) for index in range(20)],
         warmup_raw_inference_latency_ns=raw_warmup,
         warmup_sampled_target_latency_ns=target_warmup,
-        warmup_synthetic_delay_ns=[200_000_000] * 5,
-        warmup_effective_inference_latency_ns=target_warmup,
+        warmup_requested_synthetic_delay_ns=[200_000_000] * 5,
+        warmup_observed_synthetic_delay_ns=[200_000_000] * 5,
+        warmup_observed_effective_latency_ns=target_warmup,
+        warmup_latency_overshoot_ns=[0] * 5,
         measurement_raw_inference_latency_ns=raw_measurement,
         measurement_sampled_target_latency_ns=target_measurement,
-        measurement_synthetic_delay_ns=[200_000_000] * 20,
-        measurement_effective_inference_latency_ns=target_measurement,
+        measurement_requested_synthetic_delay_ns=[200_000_000] * 20,
+        measurement_observed_synthetic_delay_ns=[200_000_000] * 20,
+        measurement_observed_effective_latency_ns=target_measurement,
+        measurement_latency_overshoot_ns=[0] * 20,
     )
 
 
@@ -170,8 +174,10 @@ def _records(mode: str) -> list[dict]:
                             {
                                 "raw_inference_latency_ns": raw,
                                 "sampled_target_latency_ns": sampled_target,
-                                "synthetic_delay_ns": sampled_target - raw,
-                                "effective_inference_latency_ns": sampled_target,
+                                "requested_synthetic_delay_ns": sampled_target - raw,
+                                "observed_synthetic_delay_ns": sampled_target - raw,
+                                "observed_effective_latency_ns": sampled_target,
+                                "latency_overshoot_ns": 0,
                                 "duration_ns": sampled_target,
                             }
                         ],
@@ -253,6 +259,30 @@ def test_compare_reports_three_required_deltas_and_runtime_diagnostics():
     assert comparison["diagnostics"]["baseline_async"]["action_underflow_count"] == 2000
     assert comparison["diagnostics"]["baseline_async"]["action_seam_count"] == 2000
     assert comparison["diagnostics"]["baseline_rtc"]["latency_hidden_ratio"] == 1.0
+
+
+def test_compare_reports_real_clock_overshoot_separately_from_requested_delay():
+    runs = _runs()
+    records = copy.deepcopy(list(runs["baseline_async"].records))
+    event = records[0]["inference_latencies"][0]
+    event["observed_synthetic_delay_ns"] += 500_000
+    event["observed_effective_latency_ns"] += 500_000
+    event["latency_overshoot_ns"] = 500_000
+    event["duration_ns"] += 500_000
+    runs["baseline_async"] = report.RunDataV5(
+        path=runs["baseline_async"].path,
+        manifest=runs["baseline_async"].manifest,
+        records=records,
+        summary={},
+        video_audits=(),
+        file_sha256=runs["baseline_async"].file_sha256,
+    )
+
+    diagnostics = report.compare_checkpoint_v5(runs)["diagnostics"]["baseline_async"]
+
+    assert diagnostics["latency_overshoot_ns_total"] == 500_000
+    assert diagnostics["latency_overshoot_ns_p95"] == 0
+    assert diagnostics["requested_synthetic_delay_ns_total"] < diagnostics["observed_synthetic_delay_ns_total"]
 
 
 def test_compare_rejects_unpaired_request_sample_identity():

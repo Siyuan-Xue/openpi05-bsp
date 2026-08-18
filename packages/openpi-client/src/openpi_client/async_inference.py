@@ -47,8 +47,10 @@ class InferenceOutcome:
     connection: Optional[ConnectionSnapshot] = None
     sampled_target_latency_ns: int = 0
     raw_inference_latency_ns: Optional[int] = None
-    synthetic_delay_ns: Optional[int] = None
-    effective_inference_latency_ns: Optional[int] = None
+    requested_synthetic_delay_ns: Optional[int] = None
+    observed_synthetic_delay_ns: Optional[int] = None
+    observed_effective_latency_ns: Optional[int] = None
+    latency_overshoot_ns: Optional[int] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -60,8 +62,10 @@ class _Completion:
     completed_monotonic_ns: Optional[int] = None
     connection: Optional[ConnectionSnapshot] = None
     raw_inference_latency_ns: Optional[int] = None
-    synthetic_delay_ns: Optional[int] = None
-    effective_inference_latency_ns: Optional[int] = None
+    requested_synthetic_delay_ns: Optional[int] = None
+    observed_synthetic_delay_ns: Optional[int] = None
+    observed_effective_latency_ns: Optional[int] = None
+    latency_overshoot_ns: Optional[int] = None
     observed: bool = False
 
     def for_job(self, job: InferenceJob) -> InferenceOutcome:
@@ -75,8 +79,10 @@ class _Completion:
             connection=self.connection,
             sampled_target_latency_ns=job.sampled_target_latency_ns,
             raw_inference_latency_ns=self.raw_inference_latency_ns,
-            synthetic_delay_ns=self.synthetic_delay_ns,
-            effective_inference_latency_ns=self.effective_inference_latency_ns,
+            requested_synthetic_delay_ns=self.requested_synthetic_delay_ns,
+            observed_synthetic_delay_ns=self.observed_synthetic_delay_ns,
+            observed_effective_latency_ns=self.observed_effective_latency_ns,
+            latency_overshoot_ns=self.latency_overshoot_ns,
         )
 
 
@@ -470,8 +476,10 @@ class AsyncInferenceWorker:
                 result = None
                 error = None
                 raw_inference_latency_ns = None
-                synthetic_delay_ns = None
-                effective_inference_latency_ns = None
+                requested_synthetic_delay_ns = None
+                observed_synthetic_delay_ns = None
+                observed_effective_latency_ns = None
+                latency_overshoot_ns = None
                 try:
                     result = policy.infer_packed(
                         job.payload,
@@ -490,8 +498,14 @@ class AsyncInferenceWorker:
                         completed_monotonic_ns = self._monotonic_ns()
                     else:
                         completed_monotonic_ns = raw_completed_monotonic_ns
-                    synthetic_delay_ns = completed_monotonic_ns - raw_completed_monotonic_ns
-                    effective_inference_latency_ns = completed_monotonic_ns - job.submitted_monotonic_ns
+                    scheduled_effective_latency_ns = max(
+                        raw_inference_latency_ns,
+                        job.sampled_target_latency_ns,
+                    )
+                    requested_synthetic_delay_ns = scheduled_effective_latency_ns - raw_inference_latency_ns
+                    observed_synthetic_delay_ns = completed_monotonic_ns - raw_completed_monotonic_ns
+                    observed_effective_latency_ns = completed_monotonic_ns - job.submitted_monotonic_ns
+                    latency_overshoot_ns = observed_effective_latency_ns - scheduled_effective_latency_ns
 
                 with self._condition:
                     cancelled = (
@@ -517,8 +531,10 @@ class AsyncInferenceWorker:
                                 completed_monotonic_ns=completed_monotonic_ns,
                                 connection=connection,
                                 raw_inference_latency_ns=raw_inference_latency_ns,
-                                synthetic_delay_ns=synthetic_delay_ns,
-                                effective_inference_latency_ns=effective_inference_latency_ns,
+                                requested_synthetic_delay_ns=requested_synthetic_delay_ns,
+                                observed_synthetic_delay_ns=observed_synthetic_delay_ns,
+                                observed_effective_latency_ns=observed_effective_latency_ns,
+                                latency_overshoot_ns=latency_overshoot_ns,
                             )
                     self._active_job = None
                     retire = cancelled or error is not None
@@ -582,16 +598,20 @@ class AsyncInferenceWorker:
         completed_monotonic_ns: int,
         connection: ConnectionSnapshot,
         raw_inference_latency_ns: int,
-        synthetic_delay_ns: int,
-        effective_inference_latency_ns: int,
+        requested_synthetic_delay_ns: int,
+        observed_synthetic_delay_ns: int,
+        observed_effective_latency_ns: int,
+        latency_overshoot_ns: int,
     ) -> None:
         self._completions[job.request_id] = _Completion(
             result=result,
             completed_monotonic_ns=completed_monotonic_ns,
             connection=connection,
             raw_inference_latency_ns=raw_inference_latency_ns,
-            synthetic_delay_ns=synthetic_delay_ns,
-            effective_inference_latency_ns=effective_inference_latency_ns,
+            requested_synthetic_delay_ns=requested_synthetic_delay_ns,
+            observed_synthetic_delay_ns=observed_synthetic_delay_ns,
+            observed_effective_latency_ns=observed_effective_latency_ns,
+            latency_overshoot_ns=latency_overshoot_ns,
         )
         self._condition.notify_all()
 

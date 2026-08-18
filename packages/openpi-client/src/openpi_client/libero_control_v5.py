@@ -824,12 +824,16 @@ def _calibration_payload(values: Mapping[str, Any]) -> Dict[str, Any]:
 _CALIBRATION_V2_SERIES_FIELDS = (
     "warmup_raw_inference_latency_ns",
     "warmup_sampled_target_latency_ns",
-    "warmup_synthetic_delay_ns",
-    "warmup_effective_inference_latency_ns",
+    "warmup_requested_synthetic_delay_ns",
+    "warmup_observed_synthetic_delay_ns",
+    "warmup_observed_effective_latency_ns",
+    "warmup_latency_overshoot_ns",
     "measurement_raw_inference_latency_ns",
     "measurement_sampled_target_latency_ns",
-    "measurement_synthetic_delay_ns",
-    "measurement_effective_inference_latency_ns",
+    "measurement_requested_synthetic_delay_ns",
+    "measurement_observed_synthetic_delay_ns",
+    "measurement_observed_effective_latency_ns",
+    "measurement_latency_overshoot_ns",
 )
 _CALIBRATION_V2_FIELDS = {
     "schema_version",
@@ -847,7 +851,7 @@ _CALIBRATION_V2_FIELDS = {
     "p95_rank",
     "empirical_raw_p95_ns",
     "empirical_sampled_target_p95_ns",
-    "empirical_effective_p95_ns",
+    "empirical_observed_effective_p95_ns",
     "theoretical_p95_latency_ns",
     "control_period_ns",
     "scheduling_latency_budget_ns",
@@ -886,7 +890,7 @@ def _calibration_v2_payload(values: Mapping[str, Any]) -> Dict[str, Any]:
         "p95_rank": values["p95_rank"],
         "empirical_raw_p95_ns": values["empirical_raw_p95_ns"],
         "empirical_sampled_target_p95_ns": values["empirical_sampled_target_p95_ns"],
-        "empirical_effective_p95_ns": values["empirical_effective_p95_ns"],
+        "empirical_observed_effective_p95_ns": values["empirical_observed_effective_p95_ns"],
         "theoretical_p95_latency_ns": values["theoretical_p95_latency_ns"],
         "control_period_ns": values["control_period_ns"],
         "scheduling_latency_budget_ns": values["scheduling_latency_budget_ns"],
@@ -913,17 +917,21 @@ class LatencyCalibrationV2:
     measurement_request_fingerprints: Tuple[str, ...]
     warmup_raw_inference_latency_ns: Tuple[int, ...]
     warmup_sampled_target_latency_ns: Tuple[int, ...]
-    warmup_synthetic_delay_ns: Tuple[int, ...]
-    warmup_effective_inference_latency_ns: Tuple[int, ...]
+    warmup_requested_synthetic_delay_ns: Tuple[int, ...]
+    warmup_observed_synthetic_delay_ns: Tuple[int, ...]
+    warmup_observed_effective_latency_ns: Tuple[int, ...]
+    warmup_latency_overshoot_ns: Tuple[int, ...]
     measurement_raw_inference_latency_ns: Tuple[int, ...]
     measurement_sampled_target_latency_ns: Tuple[int, ...]
-    measurement_synthetic_delay_ns: Tuple[int, ...]
-    measurement_effective_inference_latency_ns: Tuple[int, ...]
+    measurement_requested_synthetic_delay_ns: Tuple[int, ...]
+    measurement_observed_synthetic_delay_ns: Tuple[int, ...]
+    measurement_observed_effective_latency_ns: Tuple[int, ...]
+    measurement_latency_overshoot_ns: Tuple[int, ...]
     p95_method: str
     p95_rank: int
     empirical_raw_p95_ns: int
     empirical_sampled_target_p95_ns: int
-    empirical_effective_p95_ns: int
+    empirical_observed_effective_p95_ns: int
     theoretical_p95_latency_ns: int
     control_period_ns: int
     scheduling_latency_budget_ns: int
@@ -962,12 +970,16 @@ class LatencyCalibrationV2:
         measurement_request_fingerprints: Sequence[str],
         warmup_raw_inference_latency_ns: Sequence[int],
         warmup_sampled_target_latency_ns: Sequence[int],
-        warmup_synthetic_delay_ns: Sequence[int],
-        warmup_effective_inference_latency_ns: Sequence[int],
+        warmup_requested_synthetic_delay_ns: Sequence[int],
+        warmup_observed_synthetic_delay_ns: Sequence[int],
+        warmup_observed_effective_latency_ns: Sequence[int],
+        warmup_latency_overshoot_ns: Sequence[int],
         measurement_raw_inference_latency_ns: Sequence[int],
         measurement_sampled_target_latency_ns: Sequence[int],
-        measurement_synthetic_delay_ns: Sequence[int],
-        measurement_effective_inference_latency_ns: Sequence[int],
+        measurement_requested_synthetic_delay_ns: Sequence[int],
+        measurement_observed_synthetic_delay_ns: Sequence[int],
+        measurement_observed_effective_latency_ns: Sequence[int],
+        measurement_latency_overshoot_ns: Sequence[int],
     ) -> "LatencyCalibrationV2":
         if not isinstance(canonical_observation_identity, CalibrationObservationIdentityV1):
             raise ValueError("canonical_observation_identity must use schema version 1")
@@ -981,14 +993,14 @@ class LatencyCalibrationV2:
             label="measurement_sampled_target_latency_ns",
             count=CALIBRATION_MEASUREMENT_COUNT,
         )
-        effective = _latency_series(
-            measurement_effective_inference_latency_ns,
-            label="measurement_effective_inference_latency_ns",
+        observed_effective = _latency_series(
+            measurement_observed_effective_latency_ns,
+            label="measurement_observed_effective_latency_ns",
             count=CALIBRATION_MEASUREMENT_COUNT,
         )
         rank, raw_p95 = nearest_rank_p95_ns(raw)
         _, sampled_p95 = nearest_rank_p95_ns(sampled)
-        _, effective_p95 = nearest_rank_p95_ns(effective)
+        _, observed_effective_p95 = nearest_rank_p95_ns(observed_effective)
         if execution_mode in ("baseline_async", "baseline_rtc"):
             delay_ticks = SCHEDULING_DELAY_TICKS
             prefetch_budget_ns = None
@@ -1010,23 +1022,27 @@ class LatencyCalibrationV2:
             "measurement_request_fingerprints": tuple(measurement_request_fingerprints),
             "warmup_raw_inference_latency_ns": tuple(warmup_raw_inference_latency_ns),
             "warmup_sampled_target_latency_ns": tuple(warmup_sampled_target_latency_ns),
-            "warmup_synthetic_delay_ns": tuple(warmup_synthetic_delay_ns),
-            "warmup_effective_inference_latency_ns": tuple(warmup_effective_inference_latency_ns),
+            "warmup_requested_synthetic_delay_ns": tuple(warmup_requested_synthetic_delay_ns),
+            "warmup_observed_synthetic_delay_ns": tuple(warmup_observed_synthetic_delay_ns),
+            "warmup_observed_effective_latency_ns": tuple(warmup_observed_effective_latency_ns),
+            "warmup_latency_overshoot_ns": tuple(warmup_latency_overshoot_ns),
             "measurement_raw_inference_latency_ns": raw,
             "measurement_sampled_target_latency_ns": sampled,
-            "measurement_synthetic_delay_ns": tuple(measurement_synthetic_delay_ns),
-            "measurement_effective_inference_latency_ns": effective,
+            "measurement_requested_synthetic_delay_ns": tuple(measurement_requested_synthetic_delay_ns),
+            "measurement_observed_synthetic_delay_ns": tuple(measurement_observed_synthetic_delay_ns),
+            "measurement_observed_effective_latency_ns": observed_effective,
+            "measurement_latency_overshoot_ns": tuple(measurement_latency_overshoot_ns),
             "p95_method": "nearest_rank",
             "p95_rank": rank,
             "empirical_raw_p95_ns": raw_p95,
             "empirical_sampled_target_p95_ns": sampled_p95,
-            "empirical_effective_p95_ns": effective_p95,
+            "empirical_observed_effective_p95_ns": observed_effective_p95,
             "theoretical_p95_latency_ns": THEORETICAL_P95_LATENCY_NS,
             "control_period_ns": CONTROL_PERIOD_NS,
             "scheduling_latency_budget_ns": SCHEDULING_LATENCY_BUDGET_NS,
             "derived_delay_ticks": delay_ticks,
             "derived_prefetch_budget_ns": prefetch_budget_ns,
-            "empirical_p95_exceeds_budget": effective_p95 > SCHEDULING_LATENCY_BUDGET_NS,
+            "empirical_p95_exceeds_budget": observed_effective_p95 > SCHEDULING_LATENCY_BUDGET_NS,
         }
         return cls(
             fingerprint=canonical_fingerprint(_calibration_v2_payload(values)),
@@ -1075,31 +1091,50 @@ class LatencyCalibrationV2:
                 label=prefix + " sampled target",
                 count=count,
             )
-            synthetic = _latency_series(
-                getattr(self, prefix + "_synthetic_delay_ns"),
-                label=prefix + " synthetic delay",
+            requested = _latency_series(
+                getattr(self, prefix + "_requested_synthetic_delay_ns"),
+                label=prefix + " requested synthetic delay",
                 count=count,
             )
-            effective = _latency_series(
-                getattr(self, prefix + "_effective_inference_latency_ns"),
-                label=prefix + " effective latency",
+            observed_synthetic = _latency_series(
+                getattr(self, prefix + "_observed_synthetic_delay_ns"),
+                label=prefix + " observed synthetic delay",
+                count=count,
+            )
+            observed_effective = _latency_series(
+                getattr(self, prefix + "_observed_effective_latency_ns"),
+                label=prefix + " observed effective latency",
+                count=count,
+            )
+            overshoot = _latency_series(
+                getattr(self, prefix + "_latency_overshoot_ns"),
+                label=prefix + " latency overshoot",
                 count=count,
             )
             if any(
-                raw_value + synthetic_value != effective_value or effective_value != max(raw_value, sampled_value)
-                for raw_value, sampled_value, synthetic_value, effective_value in zip(
-                    raw, sampled, synthetic, effective
+                requested_value != max(raw_value, sampled_value) - raw_value
+                or raw_value + observed_synthetic_value != observed_effective_value
+                or observed_effective_value < max(raw_value, sampled_value)
+                or overshoot_value != observed_effective_value - max(raw_value, sampled_value)
+                or observed_synthetic_value != requested_value + overshoot_value
+                for raw_value, sampled_value, requested_value, observed_synthetic_value, observed_effective_value, overshoot_value in zip(
+                    raw,
+                    sampled,
+                    requested,
+                    observed_synthetic,
+                    observed_effective,
+                    overshoot,
                 )
             ):
                 raise ValueError("calibration latency breakdown is inconsistent")
         rank, raw_p95 = nearest_rank_p95_ns(self.measurement_raw_inference_latency_ns)
         _, sampled_p95 = nearest_rank_p95_ns(self.measurement_sampled_target_latency_ns)
-        _, effective_p95 = nearest_rank_p95_ns(self.measurement_effective_inference_latency_ns)
+        _, observed_effective_p95 = nearest_rank_p95_ns(self.measurement_observed_effective_latency_ns)
         expected_scalars = {
             "p95_rank": rank,
             "empirical_raw_p95_ns": raw_p95,
             "empirical_sampled_target_p95_ns": sampled_p95,
-            "empirical_effective_p95_ns": effective_p95,
+            "empirical_observed_effective_p95_ns": observed_effective_p95,
             "theoretical_p95_latency_ns": THEORETICAL_P95_LATENCY_NS,
             "control_period_ns": CONTROL_PERIOD_NS,
             "scheduling_latency_budget_ns": SCHEDULING_LATENCY_BUDGET_NS,
@@ -1115,7 +1150,7 @@ class LatencyCalibrationV2:
         elif self.derived_delay_ticks is not None or self.derived_prefetch_budget_ns != SCHEDULING_LATENCY_BUDGET_NS:
             raise ValueError("BSP calibration must use the fixed prefetch budget")
         if type(self.empirical_p95_exceeds_budget) is not bool or self.empirical_p95_exceeds_budget != (
-            effective_p95 > SCHEDULING_LATENCY_BUDGET_NS
+            observed_effective_p95 > SCHEDULING_LATENCY_BUDGET_NS
         ):
             raise ValueError("empirical_p95_exceeds_budget does not match the measurements")
         _require_sha256(self.fingerprint, label="calibration fingerprint")
@@ -1241,8 +1276,10 @@ class _ProbeResult:
     request_fingerprint: str
     raw_inference_latency_ns: int
     sampled_target_latency_ns: int
-    synthetic_delay_ns: int
-    effective_inference_latency_ns: int
+    requested_synthetic_delay_ns: int
+    observed_synthetic_delay_ns: int
+    observed_effective_latency_ns: int
+    latency_overshoot_ns: int
 
 
 class _RetryCalibration(Exception):
@@ -1357,8 +1394,8 @@ def _calibrate_once(
 
     warmup_fingerprints = []  # type: List[str]
     measurement_fingerprints = []  # type: List[str]
-    warmup_breakdown = {field: [] for field in _CALIBRATION_V2_SERIES_FIELDS[:4]}
-    measurement_breakdown = {field: [] for field in _CALIBRATION_V2_SERIES_FIELDS[4:]}
+    warmup_breakdown = {field: [] for field in _CALIBRATION_V2_SERIES_FIELDS[:6]}
+    measurement_breakdown = {field: [] for field in _CALIBRATION_V2_SERIES_FIELDS[6:]}
     for phase, count, fingerprints, breakdown in (
         (
             "warmup",
@@ -1410,8 +1447,10 @@ def _calibrate_once(
             prefix = phase + "_"
             breakdown[prefix + "raw_inference_latency_ns"].append(probe.raw_inference_latency_ns)
             breakdown[prefix + "sampled_target_latency_ns"].append(probe.sampled_target_latency_ns)
-            breakdown[prefix + "synthetic_delay_ns"].append(probe.synthetic_delay_ns)
-            breakdown[prefix + "effective_inference_latency_ns"].append(probe.effective_inference_latency_ns)
+            breakdown[prefix + "requested_synthetic_delay_ns"].append(probe.requested_synthetic_delay_ns)
+            breakdown[prefix + "observed_synthetic_delay_ns"].append(probe.observed_synthetic_delay_ns)
+            breakdown[prefix + "observed_effective_latency_ns"].append(probe.observed_effective_latency_ns)
+            breakdown[prefix + "latency_overshoot_ns"].append(probe.latency_overshoot_ns)
 
     return LatencyCalibrationV2.create(
         execution_mode=mode.name,
@@ -1488,22 +1527,30 @@ def _run_probe(
     breakdown = (
         getattr(outcome, "sampled_target_latency_ns", None),
         getattr(outcome, "raw_inference_latency_ns", None),
-        getattr(outcome, "synthetic_delay_ns", None),
-        getattr(outcome, "effective_inference_latency_ns", None),
+        getattr(outcome, "requested_synthetic_delay_ns", None),
+        getattr(outcome, "observed_synthetic_delay_ns", None),
+        getattr(outcome, "observed_effective_latency_ns", None),
+        getattr(outcome, "latency_overshoot_ns", None),
     )
     if any(value is None for value in breakdown):
         raise CalibrationPolicyError("Calibration latency breakdown must be complete")
     try:
         sampled_target_latency_ns = _require_nonbool_int(breakdown[0], label="sampled target latency", minimum=0)
         raw_latency_ns = _require_nonbool_int(breakdown[1], label="raw inference latency", minimum=0)
-        synthetic_delay_ns = _require_nonbool_int(breakdown[2], label="synthetic inference delay", minimum=0)
-        effective_latency_ns = _require_nonbool_int(breakdown[3], label="effective inference latency", minimum=0)
+        requested_delay_ns = _require_nonbool_int(breakdown[2], label="requested synthetic delay", minimum=0)
+        observed_delay_ns = _require_nonbool_int(breakdown[3], label="observed synthetic delay", minimum=0)
+        observed_effective_ns = _require_nonbool_int(breakdown[4], label="observed effective latency", minimum=0)
+        overshoot_ns = _require_nonbool_int(breakdown[5], label="latency overshoot", minimum=0)
     except ValueError as error:
         raise CalibrationPolicyError(str(error)) from error
+    scheduled_effective_ns = max(raw_latency_ns, sampled_target_latency_ns)
     if (
-        raw_latency_ns + synthetic_delay_ns != effective_latency_ns
-        or effective_latency_ns != max(raw_latency_ns, sampled_target_latency_ns)
-        or effective_latency_ns != measured_latency_ns
+        requested_delay_ns != scheduled_effective_ns - raw_latency_ns
+        or raw_latency_ns + observed_delay_ns != observed_effective_ns
+        or observed_effective_ns != measured_latency_ns
+        or observed_effective_ns < scheduled_effective_ns
+        or overshoot_ns != observed_effective_ns - scheduled_effective_ns
+        or observed_delay_ns != requested_delay_ns + overshoot_ns
         or getattr(job, "sampled_target_latency_ns", None) != sampled_target_latency_ns
         or getattr(job, "latency_sample_key", None) != latency_sample_key
     ):
@@ -1516,8 +1563,10 @@ def _run_probe(
         request_fingerprint=request_fingerprint,
         raw_inference_latency_ns=raw_latency_ns,
         sampled_target_latency_ns=sampled_target_latency_ns,
-        synthetic_delay_ns=synthetic_delay_ns,
-        effective_inference_latency_ns=effective_latency_ns,
+        requested_synthetic_delay_ns=requested_delay_ns,
+        observed_synthetic_delay_ns=observed_delay_ns,
+        observed_effective_latency_ns=observed_effective_ns,
+        latency_overshoot_ns=overshoot_ns,
     )
 
 

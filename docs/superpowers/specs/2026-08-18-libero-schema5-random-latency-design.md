@@ -114,15 +114,22 @@ resample counter 的新哈希重新采样。最终纳秒数使用文档化、跨
 ```text
 sampled_target_latency_ns
 raw_inference_latency_ns
-synthetic_delay_ns
-effective_inference_latency_ns
+requested_synthetic_delay_ns
+observed_synthetic_delay_ns
+observed_effective_latency_ns
+latency_overshoot_ns
 ```
 
-关系为：
+其中目标补足量和真实观测量必须分开。操作系统的等待允许晚于 deadline 唤醒，但绝不
+允许提前发布 outcome。关系为：
 
 ```text
-effective = max(raw, sampled_target)
-synthetic_delay = effective - raw
+scheduled_effective = max(raw, sampled_target)
+requested_synthetic_delay = scheduled_effective - raw
+observed_effective = raw + observed_synthetic_delay
+observed_effective >= scheduled_effective
+latency_overshoot = observed_effective - scheduled_effective
+observed_synthetic_delay = requested_synthetic_delay + latency_overshoot
 ```
 
 等待与时间戳使用 monotonic clock。真实请求超过目标样本时绝不截短。
@@ -130,7 +137,9 @@ synthetic_delay = effective - raw
 ### 4.3 Calibration 与调度预算
 
 每种模式执行 5 次 warmup 和 20 次 measurement。Warmup 排除连接、JAX 编译和 GPU
-首次初始化；measurement 同时记录 raw、sampled、synthetic 和 effective latency。
+首次初始化；measurement 同时记录 raw、sampled、requested、observed 和 overshoot。
+Empirical p95 使用 outcome 真正对 scheduler 可见的 `observed_effective_latency_ns`，不能
+使用理想 deadline 替代实测完成时间。
 
 本轮调度预算不使用仅 20 个随机样本的 empirical p95。配置分布的理论单侧 p95 为：
 

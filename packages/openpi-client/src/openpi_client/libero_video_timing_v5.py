@@ -74,8 +74,10 @@ _LATENCY_FIELDS = frozenset(
         "duration_ns",
         "outcome",
         "raw_inference_latency_ns",
-        "synthetic_delay_ns",
-        "effective_inference_latency_ns",
+        "requested_synthetic_delay_ns",
+        "observed_synthetic_delay_ns",
+        "observed_effective_latency_ns",
+        "latency_overshoot_ns",
         "sampled_target_latency_ns",
     )
 )
@@ -312,19 +314,38 @@ class LatencyEventV5:
     duration_ns: int
     outcome: str
     raw_inference_latency_ns: Optional[int] = None
-    synthetic_delay_ns: Optional[int] = None
-    effective_inference_latency_ns: Optional[int] = None
+    requested_synthetic_delay_ns: Optional[int] = None
+    observed_synthetic_delay_ns: Optional[int] = None
+    observed_effective_latency_ns: Optional[int] = None
+    latency_overshoot_ns: Optional[int] = None
     sampled_target_latency_ns: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.raw_inference_latency_ns is None:
             object.__setattr__(self, "raw_inference_latency_ns", self.duration_ns)
-        if self.synthetic_delay_ns is None:
-            object.__setattr__(self, "synthetic_delay_ns", 0)
-        if self.effective_inference_latency_ns is None:
-            object.__setattr__(self, "effective_inference_latency_ns", self.duration_ns)
         if self.sampled_target_latency_ns is None:
             object.__setattr__(self, "sampled_target_latency_ns", self.duration_ns)
+        scheduled_effective_ns = max(self.raw_inference_latency_ns, self.sampled_target_latency_ns)
+        if self.requested_synthetic_delay_ns is None:
+            object.__setattr__(
+                self,
+                "requested_synthetic_delay_ns",
+                scheduled_effective_ns - self.raw_inference_latency_ns,
+            )
+        if self.observed_effective_latency_ns is None:
+            object.__setattr__(self, "observed_effective_latency_ns", self.duration_ns)
+        if self.observed_synthetic_delay_ns is None:
+            object.__setattr__(
+                self,
+                "observed_synthetic_delay_ns",
+                self.observed_effective_latency_ns - self.raw_inference_latency_ns,
+            )
+        if self.latency_overshoot_ns is None:
+            object.__setattr__(
+                self,
+                "latency_overshoot_ns",
+                self.observed_effective_latency_ns - scheduled_effective_ns,
+            )
         self._validate()
 
     def _validate(self) -> None:
@@ -335,27 +356,42 @@ class LatencyEventV5:
             self.raw_inference_latency_ns,
             name="raw_inference_latency_ns",
         )
-        synthetic_ns = _require_nonnegative_integer(
-            self.synthetic_delay_ns,
-            name="synthetic_delay_ns",
+        requested_ns = _require_nonnegative_integer(
+            self.requested_synthetic_delay_ns,
+            name="requested_synthetic_delay_ns",
         )
-        effective_ns = _require_nonnegative_integer(
-            self.effective_inference_latency_ns,
-            name="effective_inference_latency_ns",
+        observed_synthetic_ns = _require_nonnegative_integer(
+            self.observed_synthetic_delay_ns,
+            name="observed_synthetic_delay_ns",
+        )
+        observed_effective_ns = _require_nonnegative_integer(
+            self.observed_effective_latency_ns,
+            name="observed_effective_latency_ns",
+        )
+        overshoot_ns = _require_nonnegative_integer(
+            self.latency_overshoot_ns,
+            name="latency_overshoot_ns",
         )
         sampled_ns = _require_nonnegative_integer(
             self.sampled_target_latency_ns,
             name="sampled_target_latency_ns",
         )
         _require_enum(self.outcome, _LATENCY_OUTCOMES, name="latency outcome")
-        if raw_ns + synthetic_ns != effective_ns:
-            raise ValueError("raw plus synthetic latency must equal effective latency")
-        if self.duration_ns != effective_ns:
-            raise ValueError("duration_ns must equal effective_inference_latency_ns")
+        scheduled_effective_ns = max(raw_ns, sampled_ns)
+        if requested_ns != scheduled_effective_ns - raw_ns:
+            raise ValueError("requested synthetic delay must complete the scheduled effective latency")
+        if raw_ns + observed_synthetic_ns != observed_effective_ns:
+            raise ValueError("raw plus observed synthetic latency must equal observed effective latency")
+        if self.duration_ns != observed_effective_ns:
+            raise ValueError("duration_ns must equal observed_effective_latency_ns")
         if self.duration_ns > self.completed_offset_ns:
             raise ValueError("latency duration cannot begin before the episode origin")
-        if effective_ns != max(raw_ns, sampled_ns):
-            raise ValueError("effective latency must equal max(raw latency, sampled target)")
+        if observed_effective_ns < scheduled_effective_ns:
+            raise ValueError("observed effective latency cannot be shorter than its scheduled target")
+        if overshoot_ns != observed_effective_ns - scheduled_effective_ns:
+            raise ValueError("latency overshoot must equal observed latency minus scheduled latency")
+        if observed_synthetic_ns != requested_ns + overshoot_ns:
+            raise ValueError("observed synthetic delay must equal requested delay plus overshoot")
 
     def to_dict(self) -> Dict[str, Any]:
         self._validate()
@@ -366,8 +402,10 @@ class LatencyEventV5:
             "duration_ns": self.duration_ns,
             "outcome": self.outcome,
             "raw_inference_latency_ns": self.raw_inference_latency_ns,
-            "synthetic_delay_ns": self.synthetic_delay_ns,
-            "effective_inference_latency_ns": self.effective_inference_latency_ns,
+            "requested_synthetic_delay_ns": self.requested_synthetic_delay_ns,
+            "observed_synthetic_delay_ns": self.observed_synthetic_delay_ns,
+            "observed_effective_latency_ns": self.observed_effective_latency_ns,
+            "latency_overshoot_ns": self.latency_overshoot_ns,
             "sampled_target_latency_ns": self.sampled_target_latency_ns,
         }
 
@@ -381,8 +419,10 @@ class LatencyEventV5:
             duration_ns=payload["duration_ns"],
             outcome=payload["outcome"],
             raw_inference_latency_ns=payload["raw_inference_latency_ns"],
-            synthetic_delay_ns=payload["synthetic_delay_ns"],
-            effective_inference_latency_ns=payload["effective_inference_latency_ns"],
+            requested_synthetic_delay_ns=payload["requested_synthetic_delay_ns"],
+            observed_synthetic_delay_ns=payload["observed_synthetic_delay_ns"],
+            observed_effective_latency_ns=payload["observed_effective_latency_ns"],
+            latency_overshoot_ns=payload["latency_overshoot_ns"],
             sampled_target_latency_ns=payload["sampled_target_latency_ns"],
         )
 

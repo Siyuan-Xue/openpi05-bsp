@@ -407,6 +407,18 @@ class _LatencyWaiter:
             self.clock.set(deadline_ns)
 
 
+class _OvershootingLatencyWaiter:
+    def __init__(self, clock, overshoot_ns):
+        self.clock = clock
+        self.overshoot_ns = overshoot_ns
+        self.deadlines = []
+
+    def __call__(self, deadline_ns):
+        self.deadlines.append(deadline_ns)
+        if self.clock() < deadline_ns:
+            self.clock.set(deadline_ns + self.overshoot_ns)
+
+
 def test_synthetic_latency_completes_target_from_request_submission():
     clock = _ManualMonotonicNs(10_000_000)
     waiter = _LatencyWaiter(clock)
@@ -426,10 +438,41 @@ def test_synthetic_latency_completes_target_from_request_submission():
 
         assert waiter.deadlines == [110_000_000]
         assert outcome.raw_inference_latency_ns == 30_000_000
-        assert outcome.synthetic_delay_ns == 70_000_000
-        assert outcome.effective_inference_latency_ns == 100_000_000
+        assert outcome.requested_synthetic_delay_ns == 70_000_000
+        assert outcome.observed_synthetic_delay_ns == 70_000_000
+        assert outcome.observed_effective_latency_ns == 100_000_000
+        assert outcome.latency_overshoot_ns == 0
         assert outcome.completed_monotonic_ns == 110_000_000
         assert outcome.result == {"answer": 7}
+    finally:
+        policy.release.set()
+        worker.close()
+
+
+def test_synthetic_latency_records_real_wait_overshoot_separately_from_requested_delay():
+    clock = _ManualMonotonicNs(10_000_000)
+    waiter = _OvershootingLatencyWaiter(clock, overshoot_ns=500_000)
+    policy = _GatePolicy(result={"answer": 7})
+    worker = async_inference.AsyncInferenceWorker(
+        _Factory([policy]),
+        monotonic_ns=clock,
+        wait_until_ns=waiter,
+        synthetic_latency_target_ms=100,
+    )
+    try:
+        job = worker.submit({"request": "delayed-with-real-overshoot"})
+        assert policy.started.wait(1.0)
+        clock.set(40_000_000)
+        policy.release.set()
+        outcome = worker.wait(job, timeout=1.0)
+
+        assert waiter.deadlines == [110_000_000]
+        assert outcome.raw_inference_latency_ns == 30_000_000
+        assert outcome.requested_synthetic_delay_ns == 70_000_000
+        assert outcome.observed_synthetic_delay_ns == 70_500_000
+        assert outcome.observed_effective_latency_ns == 100_500_000
+        assert outcome.latency_overshoot_ns == 500_000
+        assert outcome.completed_monotonic_ns == 110_500_000
     finally:
         policy.release.set()
         worker.close()
@@ -454,8 +497,10 @@ def test_synthetic_latency_never_shortens_a_slower_real_request():
 
         assert waiter.deadlines == []
         assert outcome.raw_inference_latency_ns == 150_000_000
-        assert outcome.synthetic_delay_ns == 0
-        assert outcome.effective_inference_latency_ns == 150_000_000
+        assert outcome.requested_synthetic_delay_ns == 0
+        assert outcome.observed_synthetic_delay_ns == 0
+        assert outcome.observed_effective_latency_ns == 150_000_000
+        assert outcome.latency_overshoot_ns == 0
         assert outcome.completed_monotonic_ns == 160_000_000
     finally:
         policy.release.set()
@@ -493,8 +538,10 @@ def test_sampled_latency_is_snapshotted_on_job_and_outcome():
 
         assert outcome.sampled_target_latency_ns == sampled_target_ns
         assert outcome.raw_inference_latency_ns == 30_000_000
-        assert outcome.synthetic_delay_ns == sampled_target_ns - 30_000_000
-        assert outcome.effective_inference_latency_ns == sampled_target_ns
+        assert outcome.requested_synthetic_delay_ns == sampled_target_ns - 30_000_000
+        assert outcome.observed_synthetic_delay_ns == sampled_target_ns - 30_000_000
+        assert outcome.observed_effective_latency_ns == sampled_target_ns
+        assert outcome.latency_overshoot_ns == 0
         assert waiter.deadlines == [10_000_000 + sampled_target_ns]
     finally:
         policy.release.set()
@@ -530,8 +577,10 @@ def test_sampled_latency_never_shortens_raw_request():
         assert waiter.deadlines == []
         assert outcome.sampled_target_latency_ns == job.sampled_target_latency_ns
         assert outcome.raw_inference_latency_ns == 990
-        assert outcome.synthetic_delay_ns == 0
-        assert outcome.effective_inference_latency_ns == 990
+        assert outcome.requested_synthetic_delay_ns == 0
+        assert outcome.observed_synthetic_delay_ns == 0
+        assert outcome.observed_effective_latency_ns == 990
+        assert outcome.latency_overshoot_ns == 0
     finally:
         policy.release.set()
         worker.close()

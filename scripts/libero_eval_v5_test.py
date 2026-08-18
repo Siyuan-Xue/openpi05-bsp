@@ -115,12 +115,16 @@ def _calibration(mode_name, *, latency_ns=0):
         measurement_request_fingerprints=["f" * 64] * 20,
         warmup_raw_inference_latency_ns=[latency_ns] * 5,
         warmup_sampled_target_latency_ns=[sampled_ns] * 5,
-        warmup_synthetic_delay_ns=[synthetic_ns] * 5,
-        warmup_effective_inference_latency_ns=[effective_ns] * 5,
+        warmup_requested_synthetic_delay_ns=[synthetic_ns] * 5,
+        warmup_observed_synthetic_delay_ns=[synthetic_ns] * 5,
+        warmup_observed_effective_latency_ns=[effective_ns] * 5,
+        warmup_latency_overshoot_ns=[0] * 5,
         measurement_raw_inference_latency_ns=[latency_ns] * 20,
         measurement_sampled_target_latency_ns=[sampled_ns] * 20,
-        measurement_synthetic_delay_ns=[synthetic_ns] * 20,
-        measurement_effective_inference_latency_ns=[effective_ns] * 20,
+        measurement_requested_synthetic_delay_ns=[synthetic_ns] * 20,
+        measurement_observed_synthetic_delay_ns=[synthetic_ns] * 20,
+        measurement_observed_effective_latency_ns=[effective_ns] * 20,
+        measurement_latency_overshoot_ns=[0] * 20,
     )
 
 
@@ -218,8 +222,10 @@ class FakeWorker:
             ),
             sampled_target_latency_ns=job.sampled_target_latency_ns,
             raw_inference_latency_ns=call.latency_ns,
-            synthetic_delay_ns=(completed_ns - job.submitted_monotonic_ns - call.latency_ns),
-            effective_inference_latency_ns=completed_ns - job.submitted_monotonic_ns,
+            requested_synthetic_delay_ns=(completed_ns - job.submitted_monotonic_ns - call.latency_ns),
+            observed_synthetic_delay_ns=(completed_ns - job.submitted_monotonic_ns - call.latency_ns),
+            observed_effective_latency_ns=completed_ns - job.submitted_monotonic_ns,
+            latency_overshoot_ns=0,
         )
 
     def reset_generation(self):

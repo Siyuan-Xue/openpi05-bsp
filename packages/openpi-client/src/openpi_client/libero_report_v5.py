@@ -589,8 +589,10 @@ def _latency_diagnostics(
     manifest: Mapping[str, Any],
 ) -> Mapping[str, Any]:
     raw_durations = []  # type: List[int]
-    synthetic_delays = []  # type: List[int]
-    effective_durations = []  # type: List[int]
+    requested_delays = []  # type: List[int]
+    observed_synthetic_delays = []  # type: List[int]
+    observed_effective_durations = []  # type: List[int]
+    latency_overshoots = []  # type: List[int]
     stall_durations = []  # type: List[int]
     underflow_durations = []  # type: List[int]
     episode_durations = []  # type: List[int]
@@ -611,24 +613,46 @@ def _latency_diagnostics(
         for event in events:
             if type(event) is not dict:
                 raise ComparisonErrorV5("inference latency must remain a JSON object")
-            effective = duration(
-                event.get("effective_inference_latency_ns"),
-                label="effective inference latency",
+            observed_effective = duration(
+                event.get("observed_effective_latency_ns"),
+                label="observed effective inference latency",
             )
             raw = duration(
                 event.get("raw_inference_latency_ns"),
                 label="raw inference latency",
             )
-            synthetic = duration(
-                event.get("synthetic_delay_ns"),
-                label="synthetic inference delay",
+            requested = duration(
+                event.get("requested_synthetic_delay_ns"),
+                label="requested synthetic inference delay",
+            )
+            observed_synthetic = duration(
+                event.get("observed_synthetic_delay_ns"),
+                label="observed synthetic inference delay",
+            )
+            overshoot = duration(
+                event.get("latency_overshoot_ns"),
+                label="inference latency overshoot",
             )
             recorded = duration(event.get("duration_ns"), label="inference latency")
-            if raw + synthetic != effective or recorded != effective:
-                raise ComparisonErrorV5("inference latency breakdown does not match effective latency")
+            sampled = duration(
+                event.get("sampled_target_latency_ns"),
+                label="sampled target inference latency",
+            )
+            scheduled_effective = max(raw, sampled)
+            if (
+                requested != scheduled_effective - raw
+                or raw + observed_synthetic != observed_effective
+                or recorded != observed_effective
+                or observed_effective < scheduled_effective
+                or overshoot != observed_effective - scheduled_effective
+                or observed_synthetic != requested + overshoot
+            ):
+                raise ComparisonErrorV5("inference latency breakdown does not match observed latency")
             raw_durations.append(raw)
-            synthetic_delays.append(synthetic)
-            effective_durations.append(effective)
+            requested_delays.append(requested)
+            observed_synthetic_delays.append(observed_synthetic)
+            observed_effective_durations.append(observed_effective)
+            latency_overshoots.append(overshoot)
         stalls = record.get("control_stalls")
         underflows = record.get("action_underflows")
         if not isinstance(stalls, list) or not isinstance(underflows, list):
@@ -674,28 +698,47 @@ def _latency_diagnostics(
         return ordered[rank - 1]
 
     calibration = manifest["latency_calibration"]
-    calibration_p95 = calibration["empirical_effective_p95_ns"]
-    effective_total = sum(effective_durations)
+    calibration_p95 = calibration["empirical_observed_effective_p95_ns"]
+    observed_effective_total = sum(observed_effective_durations)
     stall_total = sum(stall_durations)
-    hidden_ns = max(0, effective_total - stall_total)
+    hidden_ns = max(0, observed_effective_total - stall_total)
     episode_total = sum(episode_durations)
     return {
-        "inference_latency_count": len(effective_durations),
-        "inference_latency_ns_total": effective_total,
-        "inference_latency_ns_mean": (effective_total / len(effective_durations) if effective_durations else None),
-        "inference_latency_ns_median": (statistics.median(effective_durations) if effective_durations else None),
-        "inference_latency_ns_min": min(effective_durations) if effective_durations else None,
-        "inference_latency_ns_max": max(effective_durations) if effective_durations else None,
+        "inference_latency_count": len(observed_effective_durations),
+        "observed_inference_latency_ns_total": observed_effective_total,
+        "observed_inference_latency_ns_mean": (
+            observed_effective_total / len(observed_effective_durations) if observed_effective_durations else None
+        ),
+        "observed_inference_latency_ns_median": (
+            statistics.median(observed_effective_durations) if observed_effective_durations else None
+        ),
+        "observed_inference_latency_ns_min": (
+            min(observed_effective_durations) if observed_effective_durations else None
+        ),
+        "observed_inference_latency_ns_max": (
+            max(observed_effective_durations) if observed_effective_durations else None
+        ),
         "raw_inference_latency_ns_total": sum(raw_durations),
         "raw_inference_latency_ns_mean": (sum(raw_durations) / len(raw_durations) if raw_durations else None),
         "raw_inference_latency_ns_p95": p95(raw_durations),
-        "synthetic_delay_ns_total": sum(synthetic_delays),
-        "synthetic_delay_ns_mean": (sum(synthetic_delays) / len(synthetic_delays) if synthetic_delays else None),
-        "effective_inference_latency_ns_total": effective_total,
-        "effective_inference_latency_ns_mean": (
-            effective_total / len(effective_durations) if effective_durations else None
+        "requested_synthetic_delay_ns_total": sum(requested_delays),
+        "requested_synthetic_delay_ns_mean": (
+            sum(requested_delays) / len(requested_delays) if requested_delays else None
         ),
-        "effective_inference_latency_ns_p95": p95(effective_durations),
+        "observed_synthetic_delay_ns_total": sum(observed_synthetic_delays),
+        "observed_synthetic_delay_ns_mean": (
+            sum(observed_synthetic_delays) / len(observed_synthetic_delays) if observed_synthetic_delays else None
+        ),
+        "observed_effective_inference_latency_ns_total": observed_effective_total,
+        "observed_effective_inference_latency_ns_mean": (
+            observed_effective_total / len(observed_effective_durations) if observed_effective_durations else None
+        ),
+        "observed_effective_inference_latency_ns_p95": p95(observed_effective_durations),
+        "latency_overshoot_ns_total": sum(latency_overshoots),
+        "latency_overshoot_ns_mean": (
+            sum(latency_overshoots) / len(latency_overshoots) if latency_overshoots else None
+        ),
+        "latency_overshoot_ns_p95": p95(latency_overshoots),
         "control_stall_count": len(stall_durations),
         "control_stall_ns_total": stall_total,
         "control_stall_ns_mean": (stall_total / len(stall_durations) if stall_durations else None),
@@ -705,7 +748,7 @@ def _latency_diagnostics(
             sum(underflow_durations) / len(underflow_durations) if underflow_durations else None
         ),
         "latency_hidden_ns": hidden_ns,
-        "latency_hidden_ratio": (hidden_ns / effective_total if effective_total else None),
+        "latency_hidden_ratio": (hidden_ns / observed_effective_total if observed_effective_total else None),
         "control_steps_total": sum(control_steps),
         "control_steps_mean": (sum(control_steps) / len(control_steps) if control_steps else None),
         "episode_wall_time_ns_total": episode_total,

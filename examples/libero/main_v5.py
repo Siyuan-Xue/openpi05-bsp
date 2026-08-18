@@ -613,7 +613,7 @@ def _outcome_timing_v5(
     pending: _PendingRequestV5,
     outcome: Any,
     ledger: _AttemptLedgerV5,
-) -> Tuple[int, int, int, int, int, int, int]:
+) -> Tuple[int, int, int, int, int, int, int, int, int]:
     if getattr(outcome, "job", None) is not pending.job:
         raise _eval.PolicyFailure("worker returned an outcome for a different job")
     if getattr(outcome, "stale", False) or getattr(outcome, "cancelled", False):
@@ -631,28 +631,51 @@ def _outcome_timing_v5(
         raise _eval.PolicyFailure("worker outcome has invalid monotonic timestamps")
     effective_ns = completed_ns - submitted_ns
     raw_ns = getattr(outcome, "raw_inference_latency_ns", None)
-    synthetic_ns = getattr(outcome, "synthetic_delay_ns", None)
-    reported_effective_ns = getattr(outcome, "effective_inference_latency_ns", None)
+    requested_delay_ns = getattr(outcome, "requested_synthetic_delay_ns", None)
+    observed_delay_ns = getattr(outcome, "observed_synthetic_delay_ns", None)
+    observed_effective_ns = getattr(outcome, "observed_effective_latency_ns", None)
+    overshoot_ns = getattr(outcome, "latency_overshoot_ns", None)
     sampled_target_ns = getattr(outcome, "sampled_target_latency_ns", None)
-    if raw_ns is None and synthetic_ns is None and reported_effective_ns is None:
-        raw_ns, synthetic_ns, reported_effective_ns = effective_ns, 0, effective_ns
+    if (
+        raw_ns is None
+        and requested_delay_ns is None
+        and observed_delay_ns is None
+        and observed_effective_ns is None
+        and overshoot_ns is None
+    ):
+        raw_ns, requested_delay_ns, observed_delay_ns, observed_effective_ns, overshoot_ns = (
+            effective_ns,
+            0,
+            0,
+            effective_ns,
+            0,
+        )
     if sampled_target_ns is None:
         sampled_target_ns = 0
     if (
         isinstance(raw_ns, bool)
         or not isinstance(raw_ns, int)
         or raw_ns < 0
-        or isinstance(synthetic_ns, bool)
-        or not isinstance(synthetic_ns, int)
-        or synthetic_ns < 0
-        or isinstance(reported_effective_ns, bool)
-        or not isinstance(reported_effective_ns, int)
-        or reported_effective_ns != effective_ns
-        or raw_ns + synthetic_ns != reported_effective_ns
+        or isinstance(requested_delay_ns, bool)
+        or not isinstance(requested_delay_ns, int)
+        or requested_delay_ns < 0
+        or isinstance(observed_delay_ns, bool)
+        or not isinstance(observed_delay_ns, int)
+        or observed_delay_ns < 0
+        or isinstance(observed_effective_ns, bool)
+        or not isinstance(observed_effective_ns, int)
+        or observed_effective_ns != effective_ns
+        or raw_ns + observed_delay_ns != observed_effective_ns
+        or isinstance(overshoot_ns, bool)
+        or not isinstance(overshoot_ns, int)
+        or overshoot_ns < 0
         or isinstance(sampled_target_ns, bool)
         or not isinstance(sampled_target_ns, int)
         or sampled_target_ns != pending.trace.sampled_target_latency_ns
-        or reported_effective_ns != max(raw_ns, sampled_target_ns)
+        or requested_delay_ns != max(raw_ns, sampled_target_ns) - raw_ns
+        or observed_effective_ns < max(raw_ns, sampled_target_ns)
+        or overshoot_ns != observed_effective_ns - max(raw_ns, sampled_target_ns)
+        or observed_delay_ns != requested_delay_ns + overshoot_ns
     ):
         raise _eval.PolicyFailure("worker outcome has invalid latency breakdown")
     return (
@@ -660,8 +683,10 @@ def _outcome_timing_v5(
         completed_ns,
         ledger.offset(completed_ns),
         raw_ns,
-        synthetic_ns,
-        reported_effective_ns,
+        requested_delay_ns,
+        observed_delay_ns,
+        observed_effective_ns,
+        overshoot_ns,
         sampled_target_ns,
     )
 
@@ -716,8 +741,10 @@ def _complete_request_v5(
         completed_ns,
         completed_offset_ns,
         raw_inference_latency_ns,
-        synthetic_delay_ns,
-        effective_inference_latency_ns,
+        requested_synthetic_delay_ns,
+        observed_synthetic_delay_ns,
+        observed_effective_latency_ns,
+        latency_overshoot_ns,
         sampled_target_latency_ns,
     ) = _outcome_timing_v5(pending, outcome, ledger)
     if activation_now_ns < completed_ns:
@@ -736,8 +763,10 @@ def _complete_request_v5(
                 duration_ns=completed_ns - submitted_ns,
                 outcome="policy_failure",
                 raw_inference_latency_ns=raw_inference_latency_ns,
-                synthetic_delay_ns=synthetic_delay_ns,
-                effective_inference_latency_ns=effective_inference_latency_ns,
+                requested_synthetic_delay_ns=requested_synthetic_delay_ns,
+                observed_synthetic_delay_ns=observed_synthetic_delay_ns,
+                observed_effective_latency_ns=observed_effective_latency_ns,
+                latency_overshoot_ns=latency_overshoot_ns,
                 sampled_target_latency_ns=sampled_target_latency_ns,
             )
         )
@@ -777,8 +806,10 @@ def _complete_request_v5(
                 duration_ns=completed_ns - submitted_ns,
                 outcome="policy_failure",
                 raw_inference_latency_ns=raw_inference_latency_ns,
-                synthetic_delay_ns=synthetic_delay_ns,
-                effective_inference_latency_ns=effective_inference_latency_ns,
+                requested_synthetic_delay_ns=requested_synthetic_delay_ns,
+                observed_synthetic_delay_ns=observed_synthetic_delay_ns,
+                observed_effective_latency_ns=observed_effective_latency_ns,
+                latency_overshoot_ns=latency_overshoot_ns,
                 sampled_target_latency_ns=sampled_target_latency_ns,
             )
         )
@@ -807,8 +838,10 @@ def _complete_request_v5(
             duration_ns=completed_ns - submitted_ns,
             outcome="success",
             raw_inference_latency_ns=raw_inference_latency_ns,
-            synthetic_delay_ns=synthetic_delay_ns,
-            effective_inference_latency_ns=effective_inference_latency_ns,
+            requested_synthetic_delay_ns=requested_synthetic_delay_ns,
+            observed_synthetic_delay_ns=observed_synthetic_delay_ns,
+            observed_effective_latency_ns=observed_effective_latency_ns,
+            latency_overshoot_ns=latency_overshoot_ns,
             sampled_target_latency_ns=sampled_target_latency_ns,
         )
     )

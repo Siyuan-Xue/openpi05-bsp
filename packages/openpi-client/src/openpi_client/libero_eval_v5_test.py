@@ -72,12 +72,16 @@ def _calibration(
         measurement_request_fingerprints=["7" * 64] * 20,
         warmup_raw_inference_latency_ns=warmup_raw,
         warmup_sampled_target_latency_ns=warmup_sampled,
-        warmup_synthetic_delay_ns=[200_000_000] * 5,
-        warmup_effective_inference_latency_ns=warmup_sampled,
+        warmup_requested_synthetic_delay_ns=[200_000_000] * 5,
+        warmup_observed_synthetic_delay_ns=[200_000_000] * 5,
+        warmup_observed_effective_latency_ns=warmup_sampled,
+        warmup_latency_overshoot_ns=[0] * 5,
         measurement_raw_inference_latency_ns=measurement_raw,
         measurement_sampled_target_latency_ns=measurement_sampled,
-        measurement_synthetic_delay_ns=[200_000_000] * 20,
-        measurement_effective_inference_latency_ns=measurement_sampled,
+        measurement_requested_synthetic_delay_ns=[200_000_000] * 20,
+        measurement_observed_synthetic_delay_ns=[200_000_000] * 20,
+        measurement_observed_effective_latency_ns=measurement_sampled,
+        measurement_latency_overshoot_ns=[0] * 20,
     )
 
 

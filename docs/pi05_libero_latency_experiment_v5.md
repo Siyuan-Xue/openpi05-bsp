@@ -47,11 +47,17 @@ namespace / seed / suite / task_id / trial_index / request_ordinal
 worker 在 WebSocket response 返回后、把 outcome 发布给 scheduler 前补足延迟：
 
 ```text
-effective_latency = max(raw_latency, sampled_target)
-synthetic_delay = effective_latency - raw_latency
+scheduled_effective_latency = max(raw_latency, sampled_target)
+requested_synthetic_delay = scheduled_effective_latency - raw_latency
+observed_effective_latency = raw_latency + observed_synthetic_delay
+latency_overshoot = observed_effective_latency - scheduled_effective_latency
 ```
 
-每个 request 都记录 sample key、sampled target、raw、synthetic 和 effective latency。
+真实线程可能略晚于目标 deadline 被操作系统唤醒，因此只要求
+`observed_effective_latency >= scheduled_effective_latency`，不要求二者纳秒级相等。每个
+request 都记录 sample key、sampled target、raw、requested synthetic、observed synthetic、
+observed effective 和 overshoot。Calibration 与报告使用 observed effective；固定 400 ms
+调度预算仍来自理论分布，不被偶发唤醒超调改变。
 该方法模拟“策略结果更晚可用”，不声称模拟低算力 GPU 的显存、功耗或并发能力。
 
 ## Baseline 公平调度

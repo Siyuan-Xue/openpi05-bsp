@@ -207,8 +207,10 @@ class _CalibrationWorker:
             connection=self.connection,
             sampled_target_latency_ns=job.sampled_target_latency_ns,
             raw_inference_latency_ns=duration,
-            synthetic_delay_ns=effective - duration,
-            effective_inference_latency_ns=effective,
+            requested_synthetic_delay_ns=effective - duration,
+            observed_synthetic_delay_ns=effective - duration,
+            observed_effective_latency_ns=effective,
+            latency_overshoot_ns=0,
         )
 
     def reset_generation(self):
@@ -611,8 +613,8 @@ def test_rtc_calibration_uses_one_untimed_bootstrap_then_five_plus_twenty_chaine
             _rtc_response(float(index - 1))["rtc"]["model_actions"],
         )
     assert calibration.bootstrap_request_fingerprint == control.canonical_fingerprint(worker.requests[0])
-    assert len(calibration.warmup_effective_inference_latency_ns) == 5
-    assert len(calibration.measurement_effective_inference_latency_ns) == 20
+    assert len(calibration.warmup_observed_effective_latency_ns) == 5
+    assert len(calibration.measurement_observed_effective_latency_ns) == 20
     assert calibration.derived_delay_ticks == 8
     assert calibration.scheduling_latency_budget_ns == 400_000_000
     assert all(key.namespace.startswith("calibration/") for key in worker.latency_sample_keys)
@@ -638,11 +640,11 @@ def test_bsp_calibration_discards_partial_samples_and_restarts_whole_sequence_af
     assert worker.reset_calls == 1
     assert worker.ready_generations == [1]
     assert len(worker.requests) == 4 + 25
-    assert len(calibration.warmup_effective_inference_latency_ns) == 5
-    assert len(calibration.measurement_effective_inference_latency_ns) == 20
+    assert len(calibration.warmup_observed_effective_latency_ns) == 5
+    assert len(calibration.measurement_observed_effective_latency_ns) == 20
 
 
-def test_calibration_records_raw_sampled_synthetic_and_effective_latency_breakdown():
+def test_calibration_records_requested_and_observed_latency_breakdown():
     request = {"state": np.arange(4, dtype=np.float32)}
     worker = _CalibrationWorker("bsp_spline_async", [80_000_000] * 25)
 
@@ -658,12 +660,62 @@ def test_calibration_records_raw_sampled_synthetic_and_effective_latency_breakdo
     assert set(calibration.measurement_raw_inference_latency_ns) == {80_000_000}
     assert all(value > 0 for value in calibration.measurement_sampled_target_latency_ns)
     assert all(
-        raw + synthetic == effective == max(raw, sampled)
-        for raw, sampled, synthetic, effective in zip(
+        requested == max(raw, sampled) - raw
+        and observed_synthetic == requested
+        and observed_effective == max(raw, sampled)
+        and overshoot == 0
+        for raw, sampled, requested, observed_synthetic, observed_effective, overshoot in zip(
             calibration.measurement_raw_inference_latency_ns,
             calibration.measurement_sampled_target_latency_ns,
-            calibration.measurement_synthetic_delay_ns,
-            calibration.measurement_effective_inference_latency_ns,
+            calibration.measurement_requested_synthetic_delay_ns,
+            calibration.measurement_observed_synthetic_delay_ns,
+            calibration.measurement_observed_effective_latency_ns,
+            calibration.measurement_latency_overshoot_ns,
+        )
+    )
+
+
+def test_calibration_accepts_real_wait_overshoot_and_records_it_separately_from_requested_delay():
+    class OvershootingCalibrationWorker(_CalibrationWorker):
+        def wait(self, job, timeout=None):
+            outcome = super().wait(job, timeout=timeout)
+            overshoot_ns = 500_000
+            requested_delay_ns = outcome.requested_synthetic_delay_ns
+            observed_delay_ns = requested_delay_ns + overshoot_ns
+            observed_effective_ns = outcome.observed_effective_latency_ns + overshoot_ns
+            return dataclasses.replace(
+                outcome,
+                completed_monotonic_ns=outcome.completed_monotonic_ns + overshoot_ns,
+                requested_synthetic_delay_ns=requested_delay_ns,
+                observed_synthetic_delay_ns=observed_delay_ns,
+                observed_effective_latency_ns=observed_effective_ns,
+                latency_overshoot_ns=overshoot_ns,
+            )
+
+    request = {"state": np.arange(4, dtype=np.float32)}
+    worker = OvershootingCalibrationWorker("bsp_spline_async", [80_000_000] * 25)
+
+    calibration = control.calibrate_async_mode(
+        control.EXECUTION_MODES["bsp_spline_async"],
+        request,
+        _observation_identity(request),
+        worker,
+        _checkpoint_identity(bsp=True),
+        control.canonical_fingerprint(_bsp_metadata()),
+    )
+
+    assert set(calibration.measurement_requested_synthetic_delay_ns) == {
+        sampled - 80_000_000 for sampled in calibration.measurement_sampled_target_latency_ns
+    }
+    assert set(calibration.measurement_latency_overshoot_ns) == {500_000}
+    assert all(
+        raw + observed_delay == observed_effective and observed_effective == max(raw, sampled) + overshoot
+        for raw, sampled, observed_delay, observed_effective, overshoot in zip(
+            calibration.measurement_raw_inference_latency_ns,
+            calibration.measurement_sampled_target_latency_ns,
+            calibration.measurement_observed_synthetic_delay_ns,
+            calibration.measurement_observed_effective_latency_ns,
+            calibration.measurement_latency_overshoot_ns,
         )
     )
 
@@ -675,8 +727,8 @@ def test_calibration_rejects_an_inconsistent_effective_latency_breakdown():
             return dataclasses.replace(
                 outcome,
                 raw_inference_latency_ns=80_000_000,
-                synthetic_delay_ns=220_000_000,
-                effective_inference_latency_ns=299_000_000,
+                observed_synthetic_delay_ns=220_000_000,
+                observed_effective_latency_ns=299_000_000,
             )
 
     request = {"state": np.arange(4, dtype=np.float32)}
@@ -920,7 +972,7 @@ def test_calibration_rejects_metadata_change_in_an_unrelated_outer_field():
         )
 
 
-def _schema5_calibration(mode_name, *, empirical_effective_ns=300_000_000):
+def _schema5_calibration(mode_name, *, empirical_observed_effective_ns=300_000_000):
     checkpoint = _checkpoint_identity(bsp=mode_name == "bsp_spline_async")
     return control.LatencyCalibrationV2.create(
         execution_mode=mode_name,
@@ -936,12 +988,16 @@ def _schema5_calibration(mode_name, *, empirical_effective_ns=300_000_000):
         measurement_request_fingerprints=[_OTHER_SHA] * 20,
         warmup_raw_inference_latency_ns=[80_000_000] * 5,
         warmup_sampled_target_latency_ns=[300_000_000] * 5,
-        warmup_synthetic_delay_ns=[220_000_000] * 5,
-        warmup_effective_inference_latency_ns=[300_000_000] * 5,
+        warmup_requested_synthetic_delay_ns=[220_000_000] * 5,
+        warmup_observed_synthetic_delay_ns=[220_000_000] * 5,
+        warmup_observed_effective_latency_ns=[300_000_000] * 5,
+        warmup_latency_overshoot_ns=[0] * 5,
         measurement_raw_inference_latency_ns=[80_000_000] * 20,
-        measurement_sampled_target_latency_ns=[empirical_effective_ns] * 20,
-        measurement_synthetic_delay_ns=[empirical_effective_ns - 80_000_000] * 20,
-        measurement_effective_inference_latency_ns=[empirical_effective_ns] * 20,
+        measurement_sampled_target_latency_ns=[empirical_observed_effective_ns] * 20,
+        measurement_requested_synthetic_delay_ns=[empirical_observed_effective_ns - 80_000_000] * 20,
+        measurement_observed_synthetic_delay_ns=[empirical_observed_effective_ns - 80_000_000] * 20,
+        measurement_observed_effective_latency_ns=[empirical_observed_effective_ns] * 20,
+        measurement_latency_overshoot_ns=[0] * 20,
     )
 
 
@@ -957,13 +1013,13 @@ def test_schema5_exposes_exactly_three_random_latency_async_modes():
 def test_theoretical_budget_is_fixed_at_eight_ticks_when_empirical_p95_is_longer():
     calibration = _schema5_calibration(
         "baseline_rtc",
-        empirical_effective_ns=450_000_000,
+        empirical_observed_effective_ns=450_000_000,
     )
 
     assert calibration.theoretical_p95_latency_ns == 398_691_218
     assert calibration.scheduling_latency_budget_ns == 400_000_000
     assert calibration.derived_delay_ticks == 8
-    assert calibration.empirical_effective_p95_ns == 450_000_000
+    assert calibration.empirical_observed_effective_p95_ns == 450_000_000
     assert calibration.empirical_p95_exceeds_budget
 
 
