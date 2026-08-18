@@ -4,6 +4,7 @@ import time
 import weakref
 from typing import Callable, Dict, Optional
 
+from openpi_client import latency_sampling
 from openpi_client import msgpack_numpy
 from openpi_client import websocket_client_policy
 
@@ -31,6 +32,8 @@ class InferenceJob:
     generation: int
     payload: bytes
     submitted_monotonic_ns: int = 0
+    latency_sample_key: Optional[latency_sampling.LatencySampleKeyV1] = None
+    sampled_target_latency_ns: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -42,6 +45,7 @@ class InferenceOutcome:
     cancelled: bool = False
     completed_monotonic_ns: Optional[int] = None
     connection: Optional[ConnectionSnapshot] = None
+    sampled_target_latency_ns: int = 0
     raw_inference_latency_ns: Optional[int] = None
     synthetic_delay_ns: Optional[int] = None
     effective_inference_latency_ns: Optional[int] = None
@@ -69,6 +73,7 @@ class _Completion:
             cancelled=self.cancelled,
             completed_monotonic_ns=self.completed_monotonic_ns,
             connection=self.connection,
+            sampled_target_latency_ns=job.sampled_target_latency_ns,
             raw_inference_latency_ns=self.raw_inference_latency_ns,
             synthetic_delay_ns=self.synthetic_delay_ns,
             effective_inference_latency_ns=self.effective_inference_latency_ns,
@@ -99,6 +104,7 @@ class AsyncInferenceWorker:
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
         wait_until_ns: Optional[Callable[[int], None]] = None,
         synthetic_latency_target_ms: int = 0,
+        latency_sampler: Optional[latency_sampling.NormalLatencySamplerV1] = None,
     ) -> None:
         if shutdown_timeout_s <= 0:
             raise ValueError("shutdown_timeout_s must be positive")
@@ -110,6 +116,10 @@ class AsyncInferenceWorker:
             or synthetic_latency_target_ms < 0
         ):
             raise ValueError("synthetic_latency_target_ms must be a nonnegative integer")
+        if latency_sampler is not None and synthetic_latency_target_ms != 0:
+            raise ValueError("latency_sampler and synthetic_latency_target_ms are mutually exclusive")
+        if latency_sampler is not None and not isinstance(latency_sampler, latency_sampling.NormalLatencySamplerV1):
+            raise ValueError("latency_sampler must be a NormalLatencySamplerV1")
 
         self._policy_factory = policy_factory
         self._shutdown_timeout_s = shutdown_timeout_s
@@ -117,6 +127,7 @@ class AsyncInferenceWorker:
         self._monotonic_ns = monotonic_ns
         self._wait_until_ns = wait_until_ns or self._default_wait_until_ns
         self._synthetic_latency_target_ns = synthetic_latency_target_ms * 1_000_000
+        self._latency_sampler = latency_sampler
         self._packer = msgpack_numpy.Packer()
 
         self._condition = threading.Condition()
@@ -144,7 +155,12 @@ class AsyncInferenceWorker:
         )
         self._thread.start()
 
-    def submit(self, observation: Dict) -> InferenceJob:  # noqa: UP006
+    def submit(
+        self,
+        observation: Dict,  # noqa: UP006
+        *,
+        latency_sample_key: Optional[latency_sampling.LatencySampleKeyV1] = None,
+    ) -> InferenceJob:
         """Snapshot and enqueue one observation without touching the transport."""
         with self._condition:
             self._raise_fatal_locked()
@@ -158,6 +174,15 @@ class AsyncInferenceWorker:
             ):
                 raise BusyError("Async inference worker already has an outstanding request")
 
+            if self._latency_sampler is not None:
+                if latency_sample_key is None:
+                    raise ValueError("latency_sample_key is required when latency_sampler is configured")
+                sampled_target_latency_ns = self._latency_sampler.sample_target_ns(latency_sample_key)
+            else:
+                if latency_sample_key is not None:
+                    raise ValueError("latency_sample_key requires a configured latency_sampler")
+                sampled_target_latency_ns = self._synthetic_latency_target_ns
+
             payload = self._packer.pack(observation)
             submitted_monotonic_ns = self._monotonic_ns()
             job = InferenceJob(
@@ -165,6 +190,8 @@ class AsyncInferenceWorker:
                 generation=self._generation,
                 payload=payload,
                 submitted_monotonic_ns=submitted_monotonic_ns,
+                latency_sample_key=latency_sample_key,
+                sampled_target_latency_ns=sampled_target_latency_ns,
             )
             self._next_request_id += 1
             self._queued_job = job
@@ -298,9 +325,7 @@ class AsyncInferenceWorker:
 
         self._thread.join(self._shutdown_timeout_s)
         if self._thread.is_alive():
-            raise TimeoutError(
-                f"Async inference worker thread did not stop within {self._shutdown_timeout_s} seconds"
-            )
+            raise TimeoutError(f"Async inference worker thread did not stop within {self._shutdown_timeout_s} seconds")
         with self._condition:
             self._raise_fatal_locked()
 
@@ -459,9 +484,7 @@ class AsyncInferenceWorker:
                 else:
                     raw_completed_monotonic_ns = self._monotonic_ns()
                     raw_inference_latency_ns = raw_completed_monotonic_ns - job.submitted_monotonic_ns
-                    target_completed_monotonic_ns = (
-                        job.submitted_monotonic_ns + self._synthetic_latency_target_ns
-                    )
+                    target_completed_monotonic_ns = job.submitted_monotonic_ns + job.sampled_target_latency_ns
                     if raw_completed_monotonic_ns < target_completed_monotonic_ns:
                         self._wait_until_ns(target_completed_monotonic_ns)
                         completed_monotonic_ns = self._monotonic_ns()
@@ -661,11 +684,7 @@ class AsyncInferenceWorker:
 
     def _acknowledge_cancellation(self, cancel_event: threading.Event) -> None:
         with self._condition:
-            if (
-                not self._closing
-                and self._cancel_pending
-                and cancel_event is self._cancel_event
-            ):
+            if not self._closing and self._cancel_pending and cancel_event is self._cancel_event:
                 self._cancel_event = threading.Event()
                 self._cancel_pending = False
                 self._condition.notify_all()

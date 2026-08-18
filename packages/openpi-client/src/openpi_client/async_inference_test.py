@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from openpi_client import async_inference
+from openpi_client import latency_sampling
 from openpi_client import msgpack_numpy
 
 
@@ -459,6 +460,98 @@ def test_synthetic_latency_never_shortens_a_slower_real_request():
     finally:
         policy.release.set()
         worker.close()
+
+
+def test_sampled_latency_is_snapshotted_on_job_and_outcome():
+    clock = _ManualMonotonicNs(10_000_000)
+    waiter = _LatencyWaiter(clock)
+    policy = _GatePolicy(result={"answer": 9})
+    sampler = latency_sampling.NormalLatencySamplerV1(mean_ns=100_000_000, stddev_ns=1)
+    key = latency_sampling.LatencySampleKeyV1(
+        namespace="formal",
+        seed=42,
+        suite="libero_spatial",
+        task_id=0,
+        trial_index=0,
+        request_ordinal=0,
+    )
+    sampled_target_ns = sampler.sample_target_ns(key)
+    worker = async_inference.AsyncInferenceWorker(
+        _Factory([policy]),
+        monotonic_ns=clock,
+        wait_until_ns=waiter,
+        latency_sampler=sampler,
+    )
+    try:
+        job = worker.submit({"request": "sampled"}, latency_sample_key=key)
+        assert job.latency_sample_key == key
+        assert job.sampled_target_latency_ns == sampled_target_ns
+        assert policy.started.wait(1.0)
+        clock.set(40_000_000)
+        policy.release.set()
+        outcome = worker.wait(job, timeout=1.0)
+
+        assert outcome.sampled_target_latency_ns == sampled_target_ns
+        assert outcome.raw_inference_latency_ns == 30_000_000
+        assert outcome.synthetic_delay_ns == sampled_target_ns - 30_000_000
+        assert outcome.effective_inference_latency_ns == sampled_target_ns
+        assert waiter.deadlines == [10_000_000 + sampled_target_ns]
+    finally:
+        policy.release.set()
+        worker.close()
+
+
+def test_sampled_latency_never_shortens_raw_request():
+    clock = _ManualMonotonicNs(10)
+    waiter = _LatencyWaiter(clock)
+    policy = _GatePolicy(result={"answer": 10})
+    sampler = latency_sampling.NormalLatencySamplerV1(mean_ns=100, stddev_ns=1)
+    key = latency_sampling.LatencySampleKeyV1(
+        namespace="formal",
+        seed=42,
+        suite="libero_spatial",
+        task_id=0,
+        trial_index=0,
+        request_ordinal=0,
+    )
+    worker = async_inference.AsyncInferenceWorker(
+        _Factory([policy]),
+        monotonic_ns=clock,
+        wait_until_ns=waiter,
+        latency_sampler=sampler,
+    )
+    try:
+        job = worker.submit({"request": "slow"}, latency_sample_key=key)
+        assert policy.started.wait(1.0)
+        clock.set(1_000)
+        policy.release.set()
+        outcome = worker.wait(job, timeout=1.0)
+
+        assert waiter.deadlines == []
+        assert outcome.sampled_target_latency_ns == job.sampled_target_latency_ns
+        assert outcome.raw_inference_latency_ns == 990
+        assert outcome.synthetic_delay_ns == 0
+        assert outcome.effective_inference_latency_ns == 990
+    finally:
+        policy.release.set()
+        worker.close()
+
+
+def test_latency_sampler_requires_key_and_is_mutually_exclusive_with_fixed_target():
+    sampler = latency_sampling.NormalLatencySamplerV1()
+    worker = async_inference.AsyncInferenceWorker(_Factory([_GatePolicy()]), latency_sampler=sampler)
+    try:
+        with pytest.raises(ValueError, match="latency_sample_key"):
+            worker.submit({"request": "missing-key"})
+    finally:
+        worker.close()
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        async_inference.AsyncInferenceWorker(
+            _Factory([_GatePolicy()]),
+            latency_sampler=sampler,
+            synthetic_latency_target_ms=100,
+        )
 
 
 @pytest.mark.parametrize("invalid", [True, -1, 1.5, "100"])
@@ -1063,12 +1156,7 @@ def test_close_interrupts_active_receive_and_owner_closes_socket():
         assert policy.cancel_observed.is_set()
         assert policy.closed.is_set()
         assert not worker._thread.is_alive()
-        assert (
-            factory.thread_ids
-            == policy.metadata_thread_ids
-            == policy.infer_thread_ids
-            == policy.close_thread_ids
-        )
+        assert factory.thread_ids == policy.metadata_thread_ids == policy.infer_thread_ids == policy.close_thread_ids
         assert factory.thread_ids[0] != calling_thread_id
     finally:
         policy.release.set()
