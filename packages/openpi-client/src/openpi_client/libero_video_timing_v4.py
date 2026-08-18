@@ -67,7 +67,16 @@ _REQUEST_FIELDS = frozenset(
     )
 )
 _LATENCY_FIELDS = frozenset(
-    ("clock", "request_id", "completed_offset_ns", "duration_ns", "outcome")
+    (
+        "clock",
+        "request_id",
+        "completed_offset_ns",
+        "duration_ns",
+        "outcome",
+        "raw_inference_latency_ns",
+        "synthetic_delay_ns",
+        "effective_inference_latency_ns",
+    )
 )
 _ACTIVATION_FIELDS = frozenset(
     (
@@ -293,15 +302,40 @@ class LatencyEventV4:
     completed_offset_ns: int
     duration_ns: int
     outcome: str
+    raw_inference_latency_ns: Optional[int] = None
+    synthetic_delay_ns: Optional[int] = None
+    effective_inference_latency_ns: Optional[int] = None
 
     def __post_init__(self) -> None:
+        if self.raw_inference_latency_ns is None:
+            object.__setattr__(self, "raw_inference_latency_ns", self.duration_ns)
+        if self.synthetic_delay_ns is None:
+            object.__setattr__(self, "synthetic_delay_ns", 0)
+        if self.effective_inference_latency_ns is None:
+            object.__setattr__(self, "effective_inference_latency_ns", self.duration_ns)
         self._validate()
 
     def _validate(self) -> None:
         _require_nonnegative_integer(self.request_id, name="request_id")
         _require_nonnegative_integer(self.completed_offset_ns, name="completed_offset_ns")
         _require_nonnegative_integer(self.duration_ns, name="duration_ns")
+        raw_ns = _require_nonnegative_integer(
+            self.raw_inference_latency_ns,
+            name="raw_inference_latency_ns",
+        )
+        synthetic_ns = _require_nonnegative_integer(
+            self.synthetic_delay_ns,
+            name="synthetic_delay_ns",
+        )
+        effective_ns = _require_nonnegative_integer(
+            self.effective_inference_latency_ns,
+            name="effective_inference_latency_ns",
+        )
         _require_enum(self.outcome, _LATENCY_OUTCOMES, name="latency outcome")
+        if raw_ns + synthetic_ns != effective_ns:
+            raise ValueError("raw plus synthetic latency must equal effective latency")
+        if self.duration_ns != effective_ns:
+            raise ValueError("duration_ns must equal effective_inference_latency_ns")
         if self.duration_ns > self.completed_offset_ns:
             raise ValueError("latency duration cannot begin before the episode origin")
 
@@ -313,6 +347,9 @@ class LatencyEventV4:
             "completed_offset_ns": self.completed_offset_ns,
             "duration_ns": self.duration_ns,
             "outcome": self.outcome,
+            "raw_inference_latency_ns": self.raw_inference_latency_ns,
+            "synthetic_delay_ns": self.synthetic_delay_ns,
+            "effective_inference_latency_ns": self.effective_inference_latency_ns,
         }
 
     @classmethod
@@ -324,6 +361,9 @@ class LatencyEventV4:
             completed_offset_ns=payload["completed_offset_ns"],
             duration_ns=payload["duration_ns"],
             outcome=payload["outcome"],
+            raw_inference_latency_ns=payload["raw_inference_latency_ns"],
+            synthetic_delay_ns=payload["synthetic_delay_ns"],
+            effective_inference_latency_ns=payload["effective_inference_latency_ns"],
         )
 
 

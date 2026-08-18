@@ -7,7 +7,7 @@ import math
 import numbers
 import re
 from types import MappingProxyType
-from typing import Any, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Protocol, Sequence, Tuple
 
 import numpy as np
 
@@ -1166,13 +1166,42 @@ def _run_probe(
         raise CalibrationPolicyError(str(error)) from error
     if completed_ns < submitted_ns:
         raise CalibrationPolicyError("Calibration completion precedes submission")
+    measured_latency_ns = completed_ns - submitted_ns
+    breakdown = (
+        getattr(outcome, "raw_inference_latency_ns", None),
+        getattr(outcome, "synthetic_delay_ns", None),
+        getattr(outcome, "effective_inference_latency_ns", None),
+    )
+    if any(value is not None for value in breakdown):
+        if any(value is None for value in breakdown):
+            raise CalibrationPolicyError("Calibration latency breakdown must be complete")
+        try:
+            raw_latency_ns = _require_nonbool_int(
+                breakdown[0], label="raw inference latency", minimum=0
+            )
+            synthetic_delay_ns = _require_nonbool_int(
+                breakdown[1], label="synthetic inference delay", minimum=0
+            )
+            effective_latency_ns = _require_nonbool_int(
+                breakdown[2], label="effective inference latency", minimum=0
+            )
+        except ValueError as error:
+            raise CalibrationPolicyError(str(error)) from error
+        if (
+            raw_latency_ns + synthetic_delay_ns != effective_latency_ns
+            or effective_latency_ns != measured_latency_ns
+        ):
+            raise CalibrationPolicyError(
+                "Calibration effective latency does not match its measured breakdown"
+            )
+        measured_latency_ns = effective_latency_ns
     response = getattr(outcome, "result", None)
     if not isinstance(response, Mapping):
         raise CalibrationPolicyError("Calibration response must be a mapping")
     return _ProbeResult(
         response=response,
         request_fingerprint=request_fingerprint,
-        latency_ns=completed_ns - submitted_ns,
+        latency_ns=measured_latency_ns,
     )
 
 

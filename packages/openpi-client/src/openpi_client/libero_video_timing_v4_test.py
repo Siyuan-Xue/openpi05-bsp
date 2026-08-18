@@ -8,6 +8,8 @@ import dataclasses
 from copy import deepcopy
 import operator
 
+import pytest
+
 from openpi_client import libero_eval
 from openpi_client import libero_video_timing_v4 as timing
 
@@ -81,6 +83,37 @@ def _latency(request_id, completed_offset_ns, duration_ns, *, outcome="success")
         duration_ns=duration_ns,
         outcome=outcome,
     )
+
+
+def test_latency_event_records_raw_synthetic_and_effective_durations_separately():
+    event = timing.LatencyEventV4(
+        request_id=3,
+        completed_offset_ns=400_000_000,
+        duration_ns=300_000_000,
+        outcome="success",
+        raw_inference_latency_ns=80_000_000,
+        synthetic_delay_ns=220_000_000,
+        effective_inference_latency_ns=300_000_000,
+    )
+
+    payload = event.to_dict()
+    assert payload["raw_inference_latency_ns"] == 80_000_000
+    assert payload["synthetic_delay_ns"] == 220_000_000
+    assert payload["effective_inference_latency_ns"] == 300_000_000
+    assert timing.LatencyEventV4.from_dict(payload) == event
+
+
+def test_latency_event_rejects_breakdowns_that_do_not_sum_to_effective_latency():
+    with pytest.raises(ValueError, match="raw.*synthetic.*effective"):
+        timing.LatencyEventV4(
+            request_id=3,
+            completed_offset_ns=400_000_000,
+            duration_ns=300_000_000,
+            outcome="success",
+            raw_inference_latency_ns=80_000_000,
+            synthetic_delay_ns=10_000_000,
+            effective_inference_latency_ns=300_000_000,
+        )
 
 
 def _native_activation(plan_id, request_id, control_step, activated_offset_ns, *, activation):
@@ -315,7 +348,13 @@ def test_cross_event_validation_rejects_id_orphan_order_interval_and_seed_mutati
     past_end_latency = (
         latencies[0],
         latencies[1],
-        dataclasses.replace(latencies[2], completed_offset_ns=1_000_000_001, duration_ns=200_000_001),
+        dataclasses.replace(
+            latencies[2],
+            completed_offset_ns=1_000_000_001,
+            duration_ns=200_000_001,
+            raw_inference_latency_ns=200_000_001,
+            effective_inference_latency_ns=200_000_001,
+        ),
     )
     wrong_seed_requests = (
         requests[0],

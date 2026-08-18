@@ -85,6 +85,7 @@ def _manifest(mode_name="baseline_sync_n5"):
         controller_period_ns=50_000_000,
         video_fps=40,
         video_show_inference_waits=True,
+        synthetic_latency_target_ms=300,
         execution_mode=mode_name,
         execution_parameters=mode.to_parameters_dict(),
         latency_calibration=calibration,
@@ -113,6 +114,20 @@ def _manifest(mode_name="baseline_sync_n5"):
         inference_timeout_s=120.0,
         infrastructure_retries=2,
     )
+
+
+def test_manifest_persists_the_frozen_synthetic_latency_condition():
+    manifest = _manifest()
+
+    assert manifest.synthetic_latency_target_ms == 300
+    assert manifest.to_dict()["synthetic_latency_target_ms"] == 300
+    assert evaluation.EvaluationManifestV4.from_dict(manifest.to_dict()) == manifest
+
+
+@pytest.mark.parametrize("invalid", [True, -1, 1.5, 50, 900])
+def test_manifest_rejects_unsupported_synthetic_latency_conditions(invalid):
+    with pytest.raises(ValueError, match="synthetic_latency_target_ms"):
+        dataclasses.replace(_manifest(), synthetic_latency_target_ms=invalid)
 
 
 def _initial_events(identity=None, *, execution_mode="baseline_sync_n5", outcome="success"):
@@ -203,6 +218,7 @@ def test_manifest_has_exactly_the_34_frozen_v4_fields_for_every_mode():
         "controller_period_ns",
         "video_fps",
         "video_show_inference_waits",
+        "synthetic_latency_target_ms",
         "execution_mode",
         "execution_parameters",
         "latency_calibration",
@@ -231,7 +247,7 @@ def test_manifest_has_exactly_the_34_frozen_v4_fields_for_every_mode():
         "inference_timeout_s",
         "infrastructure_retries",
     }
-    assert len(expected_fields) == 34
+    assert len(expected_fields) == 35
     assert {field.name for field in dataclasses.fields(evaluation.EvaluationManifestV4)} == expected_fields
 
     for mode_name in control.EXECUTION_MODES:

@@ -395,6 +395,81 @@ def test_submit_and_completion_timestamps_use_injected_clock_at_exact_seams():
         worker.close()
 
 
+class _LatencyWaiter:
+    def __init__(self, clock):
+        self.clock = clock
+        self.deadlines = []
+
+    def __call__(self, deadline_ns):
+        self.deadlines.append(deadline_ns)
+        if self.clock() < deadline_ns:
+            self.clock.set(deadline_ns)
+
+
+def test_synthetic_latency_completes_target_from_request_submission():
+    clock = _ManualMonotonicNs(10_000_000)
+    waiter = _LatencyWaiter(clock)
+    policy = _GatePolicy(result={"answer": 7})
+    worker = async_inference.AsyncInferenceWorker(
+        _Factory([policy]),
+        monotonic_ns=clock,
+        wait_until_ns=waiter,
+        synthetic_latency_target_ms=100,
+    )
+    try:
+        job = worker.submit({"request": "delayed"})
+        assert policy.started.wait(1.0)
+        clock.set(40_000_000)
+        policy.release.set()
+        outcome = worker.wait(job, timeout=1.0)
+
+        assert waiter.deadlines == [110_000_000]
+        assert outcome.raw_inference_latency_ns == 30_000_000
+        assert outcome.synthetic_delay_ns == 70_000_000
+        assert outcome.effective_inference_latency_ns == 100_000_000
+        assert outcome.completed_monotonic_ns == 110_000_000
+        assert outcome.result == {"answer": 7}
+    finally:
+        policy.release.set()
+        worker.close()
+
+
+def test_synthetic_latency_never_shortens_a_slower_real_request():
+    clock = _ManualMonotonicNs(10_000_000)
+    waiter = _LatencyWaiter(clock)
+    policy = _GatePolicy(result={"answer": 8})
+    worker = async_inference.AsyncInferenceWorker(
+        _Factory([policy]),
+        monotonic_ns=clock,
+        wait_until_ns=waiter,
+        synthetic_latency_target_ms=100,
+    )
+    try:
+        job = worker.submit({"request": "already-slow"})
+        assert policy.started.wait(1.0)
+        clock.set(160_000_000)
+        policy.release.set()
+        outcome = worker.wait(job, timeout=1.0)
+
+        assert waiter.deadlines == []
+        assert outcome.raw_inference_latency_ns == 150_000_000
+        assert outcome.synthetic_delay_ns == 0
+        assert outcome.effective_inference_latency_ns == 150_000_000
+        assert outcome.completed_monotonic_ns == 160_000_000
+    finally:
+        policy.release.set()
+        worker.close()
+
+
+@pytest.mark.parametrize("invalid", [True, -1, 1.5, "100"])
+def test_synthetic_latency_target_requires_nonnegative_integer_milliseconds(invalid):
+    with pytest.raises(ValueError, match="synthetic_latency_target_ms"):
+        async_inference.AsyncInferenceWorker(
+            _Factory([_GatePolicy()]),
+            synthetic_latency_target_ms=invalid,
+        )
+
+
 def test_current_generation_inference_error_carries_timestamp_and_connection():
     clock = _ManualMonotonicNs(3)
     error = OSError("transport failed")

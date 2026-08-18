@@ -655,6 +655,11 @@ def test_rtc_calibration_rejects_a_p95_above_eight_control_ticks():
         _calibration("baseline_rtc", 400_000_001)
 
 
+def test_rtc_850ms_stress_point_is_an_explicit_capacity_rejection():
+    with pytest.raises(ValueError, match="eight"):
+        _calibration("baseline_rtc", 850_000_000)
+
+
 def test_rtc_calibration_uses_one_untimed_bootstrap_then_five_plus_twenty_chained_guided_calls():
     request = {"state": np.arange(8, dtype=np.float32), "prompt": "pick"}
     durations = [999] + [1000 + index for index in range(25)]
@@ -710,6 +715,58 @@ def test_bsp_calibration_discards_partial_samples_and_restarts_whole_sequence_af
     assert len(worker.requests) == 4 + 25
     assert len(calibration.warmup_latency_ns) == 5
     assert len(calibration.measurement_latency_ns) == 20
+
+
+def test_calibration_uses_and_validates_effective_latency_breakdown():
+    class EffectiveLatencyWorker(_CalibrationWorker):
+        def wait(self, job, timeout=None):
+            outcome = super().wait(job, timeout=timeout)
+            return dataclasses.replace(
+                outcome,
+                raw_inference_latency_ns=80_000_000,
+                synthetic_delay_ns=220_000_000,
+                effective_inference_latency_ns=300_000_000,
+            )
+
+    request = {"state": np.arange(4, dtype=np.float32)}
+    worker = EffectiveLatencyWorker("bsp_spline_async", [300_000_000] * 25)
+
+    calibration = control.calibrate_async_mode(
+        control.EXECUTION_MODES["bsp_spline_async"],
+        request,
+        _observation_identity(request),
+        worker,
+        _checkpoint_identity(bsp=True),
+        control.canonical_fingerprint(_bsp_metadata()),
+    )
+
+    assert calibration.p95_latency_ns == 300_000_000
+    assert set(calibration.measurement_latency_ns) == {300_000_000}
+
+
+def test_calibration_rejects_an_inconsistent_effective_latency_breakdown():
+    class InconsistentLatencyWorker(_CalibrationWorker):
+        def wait(self, job, timeout=None):
+            outcome = super().wait(job, timeout=timeout)
+            return dataclasses.replace(
+                outcome,
+                raw_inference_latency_ns=80_000_000,
+                synthetic_delay_ns=220_000_000,
+                effective_inference_latency_ns=299_000_000,
+            )
+
+    request = {"state": np.arange(4, dtype=np.float32)}
+    worker = InconsistentLatencyWorker("bsp_spline_async", [300_000_000] * 25)
+
+    with pytest.raises(control.CalibrationPolicyError, match="effective latency"):
+        control.calibrate_async_mode(
+            control.EXECUTION_MODES["bsp_spline_async"],
+            request,
+            _observation_identity(request),
+            worker,
+            _checkpoint_identity(bsp=True),
+            control.canonical_fingerprint(_bsp_metadata()),
+        )
 
 
 def test_changed_outcome_metadata_is_fatal_before_a_transport_error_can_trigger_retry():

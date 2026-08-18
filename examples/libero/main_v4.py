@@ -1,17 +1,17 @@
 """Schema-v4 LIBERO evaluation with calibrated single-owner inference."""
 
-# ruff: noqa: SLF001, UP006, UP045 -- Python 3.8 entrypoint reuses narrow v3 helpers.
+# ruff: noqa: SLF001, UP006 -- Python 3.8 entrypoint reuses narrow v3 helpers.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 import dataclasses
 import logging
 import math
 from pathlib import Path
 import subprocess
 import time
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import imageio
 import numpy as np
@@ -37,7 +37,6 @@ EXPECTED_TASKS_PER_SUITE = 10
 _prepare_observation = _environment_helpers._prepare_observation
 _get_benchmark_suite = _environment_helpers._get_benchmark_suite
 _get_libero_env = _environment_helpers._get_libero_env
-_draw_video_overlay = _environment_helpers._draw_video_overlay
 _read_encoded_video = _environment_helpers._read_encoded_video
 
 
@@ -55,6 +54,7 @@ class ArgsV4:
 
     # Frozen schema-v4 execution mode.
     execution_mode: str = "baseline_sync_n5"
+    synthetic_latency_target_ms: int = 0
 
     # Benchmark protocol.  ``all`` selects all four suites.
     task_suite_name: str = "libero_spatial"
@@ -341,6 +341,7 @@ def _validate_args_v4(
         ("eval_seed", args.eval_seed, 0),
         ("train_seed", args.train_seed, 0),
         ("checkpoint_step", args.checkpoint_step, 0),
+        ("synthetic_latency_target_ms", args.synthetic_latency_target_ms, 0),
     )
     for name, value, minimum in integer_fields:
         if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
@@ -372,6 +373,8 @@ def _validate_args_v4(
         raise ValueError("schema-v4 execution requires exactly 20 Hz control and 40 fps video")
     if type(args.video_show_inference_waits) is not bool:
         raise ValueError("video_show_inference_waits must be boolean")
+    if args.synthetic_latency_target_ms not in (0, 100, 200, 300, 850):
+        raise ValueError("synthetic_latency_target_ms must be one of 0, 100, 200, 300, or 850")
     if args.dataset_revision != "v2.0":
         raise ValueError("dataset_revision must be v2.0")
     return suites, task_ids, mode
@@ -578,7 +581,7 @@ def _outcome_timing_v4(
     pending: _PendingRequestV4,
     outcome: Any,
     ledger: _AttemptLedgerV4,
-) -> Tuple[int, int, int]:
+) -> Tuple[int, int, int, int, int, int]:
     if getattr(outcome, "job", None) is not pending.job:
         raise _eval.PolicyFailure("worker returned an outcome for a different job")
     if getattr(outcome, "stale", False) or getattr(outcome, "cancelled", False):
@@ -594,7 +597,33 @@ def _outcome_timing_v4(
         or completed_ns < submitted_ns
     ):
         raise _eval.PolicyFailure("worker outcome has invalid monotonic timestamps")
-    return submitted_ns, completed_ns, ledger.offset(completed_ns)
+    effective_ns = completed_ns - submitted_ns
+    raw_ns = getattr(outcome, "raw_inference_latency_ns", None)
+    synthetic_ns = getattr(outcome, "synthetic_delay_ns", None)
+    reported_effective_ns = getattr(outcome, "effective_inference_latency_ns", None)
+    if raw_ns is None and synthetic_ns is None and reported_effective_ns is None:
+        raw_ns, synthetic_ns, reported_effective_ns = effective_ns, 0, effective_ns
+    if (
+        isinstance(raw_ns, bool)
+        or not isinstance(raw_ns, int)
+        or raw_ns < 0
+        or isinstance(synthetic_ns, bool)
+        or not isinstance(synthetic_ns, int)
+        or synthetic_ns < 0
+        or isinstance(reported_effective_ns, bool)
+        or not isinstance(reported_effective_ns, int)
+        or reported_effective_ns != effective_ns
+        or raw_ns + synthetic_ns != reported_effective_ns
+    ):
+        raise _eval.PolicyFailure("worker outcome has invalid latency breakdown")
+    return (
+        submitted_ns,
+        completed_ns,
+        ledger.offset(completed_ns),
+        raw_ns,
+        synthetic_ns,
+        reported_effective_ns,
+    )
 
 
 def _append_blocking_stall_v4(
@@ -645,9 +674,14 @@ def _complete_request_v4(
         getattr(outcome, "connection", None),
         expected_fingerprint=expected_server_metadata_fingerprint,
     )
-    submitted_ns, completed_ns, completed_offset_ns = _outcome_timing_v4(
-        pending, outcome, ledger
-    )
+    (
+        submitted_ns,
+        completed_ns,
+        completed_offset_ns,
+        raw_inference_latency_ns,
+        synthetic_delay_ns,
+        effective_inference_latency_ns,
+    ) = _outcome_timing_v4(pending, outcome, ledger)
     if activation_now_ns < completed_ns:
         raise _eval.PolicyFailure("controller poll time precedes worker completion")
     error = getattr(outcome, "error", None)
@@ -665,6 +699,9 @@ def _complete_request_v4(
                 completed_offset_ns=completed_offset_ns,
                 duration_ns=completed_ns - submitted_ns,
                 outcome="policy_failure",
+                raw_inference_latency_ns=raw_inference_latency_ns,
+                synthetic_delay_ns=synthetic_delay_ns,
+                effective_inference_latency_ns=effective_inference_latency_ns,
             )
         )
         if pending.trace.intent.dispatch.startswith("blocking"):
@@ -702,6 +739,9 @@ def _complete_request_v4(
                 completed_offset_ns=completed_offset_ns,
                 duration_ns=completed_ns - submitted_ns,
                 outcome="policy_failure",
+                raw_inference_latency_ns=raw_inference_latency_ns,
+                synthetic_delay_ns=synthetic_delay_ns,
+                effective_inference_latency_ns=effective_inference_latency_ns,
             )
         )
         if pending.trace.intent.dispatch.startswith("blocking"):
@@ -728,6 +768,9 @@ def _complete_request_v4(
             completed_offset_ns=completed_offset_ns,
             duration_ns=completed_ns - submitted_ns,
             outcome="success",
+            raw_inference_latency_ns=raw_inference_latency_ns,
+            synthetic_delay_ns=synthetic_delay_ns,
+            effective_inference_latency_ns=effective_inference_latency_ns,
         )
     )
     if pending.trace.intent.dispatch.startswith("blocking"):
@@ -1149,7 +1192,39 @@ def _run_attempt_v4(
         raise
 
 
-def _build_video_frames_v4(
+def _cumulative_wait_line_v4(cumulative_wait_ns: int) -> Tuple[str, ...]:
+    if (
+        isinstance(cumulative_wait_ns, bool)
+        or not isinstance(cumulative_wait_ns, int)
+        or cumulative_wait_ns < 0
+    ):
+        raise ValueError("cumulative_wait_ns must be a nonnegative integer")
+    centiseconds = (cumulative_wait_ns + 5_000_000) // 10_000_000
+    return (
+        f"Cumulative inference wait: {centiseconds // 100}.{centiseconds % 100:02d} s",
+    )
+
+
+def _draw_cumulative_wait_overlay_v4(frame: Any, lines: Tuple[str, ...]) -> Any:
+    """Draw one persistent line without covering the frame with a solid box."""
+    if not isinstance(lines, tuple) or len(lines) != 1 or not isinstance(lines[0], str):
+        raise ValueError("cumulative wait overlay requires exactly one text line")
+    from PIL import Image
+    from PIL import ImageDraw
+
+    image = Image.fromarray(np.asarray(frame).copy())
+    draw = ImageDraw.Draw(image)
+    draw.text(
+        (6, 4),
+        lines[0],
+        fill=(255, 255, 255),
+        stroke_width=1,
+        stroke_fill=(32, 32, 32),
+    )
+    return np.asarray(image).copy()
+
+
+def _iter_video_frames_v4(
     control_frames: Sequence[Any],
     stalls: Sequence[_timing.ControlStallV4],
     *,
@@ -1158,14 +1233,14 @@ def _build_video_frames_v4(
     control_hz: int = _timing.CONTROL_HZ,
     video_fps: int = _timing.DEFAULT_VIDEO_FPS,
     overlay_renderer: Optional[Callable[[Any, Tuple[str, ...]], Any]] = None,
-) -> Tuple[Any, ...]:
-    renderer = _draw_video_overlay if overlay_renderer is None else overlay_renderer
-    held_frames = _timing.expand_control_frames_v4(
-        control_frames,
+) -> Iterator[Any]:
+    renderer = (
+        _draw_cumulative_wait_overlay_v4 if overlay_renderer is None else overlay_renderer
+    )
+    hold_count = _timing.validate_video_frequencies_v4(
         control_hz=control_hz,
         video_fps=video_fps,
     )
-    hold_count = video_fps // control_hz
     frame_count = len(control_frames)
     source_by_step = {}  # type: Dict[int, Any]
     for value in stall_source_frames:
@@ -1193,21 +1268,33 @@ def _build_video_frames_v4(
     if include_stalls and set(source_by_step) - set(stall_frames_by_step):
         raise ValueError("every retained stall source must correspond to an included stall")
 
-    video_frames = []  # type: List[Any]
+    cumulative_wait_ns = 0
     for control_step, frame in enumerate(control_frames):
         stall_entry = stall_frames_by_step.get(control_step)
         if stall_entry is not None:
             stall, stall_frame_count = stall_entry
             if stall_frame_count:
                 source = source_by_step.get(control_step, frame)
-                overlay = _timing.render_overlay_v4(
-                    source,
-                    _timing.stall_overlay_lines_v4(stall),
+                for frame_index in range(stall_frame_count):
+                    displayed_wait_ns = cumulative_wait_ns + min(
+                        frame_index * _timing.NANOSECONDS_PER_SECOND // video_fps,
+                        stall.duration_ns,
+                    )
+                    yield _timing.render_overlay_v4(
+                        source,
+                        _cumulative_wait_line_v4(displayed_wait_ns),
+                        renderer=renderer,
+                    )
+                cumulative_wait_ns += stall.duration_ns
+        for _ in range(hold_count):
+            if include_stalls:
+                yield _timing.render_overlay_v4(
+                    frame,
+                    _cumulative_wait_line_v4(cumulative_wait_ns),
                     renderer=renderer,
                 )
-                video_frames.extend(overlay for _ in range(stall_frame_count))
-        held_start = control_step * hold_count
-        video_frames.extend(held_frames[held_start : held_start + hold_count])
+            else:
+                yield frame
 
     trailing = stall_frames_by_step.get(frame_count)
     if trailing is not None:
@@ -1215,13 +1302,40 @@ def _build_video_frames_v4(
         if stall_frame_count:
             if frame_count not in source_by_step:
                 raise ValueError("trailing stall requires a request-time source frame")
-            overlay = _timing.render_overlay_v4(
-                source_by_step[frame_count],
-                _timing.stall_overlay_lines_v4(stall),
-                renderer=renderer,
-            )
-            video_frames.extend(overlay for _ in range(stall_frame_count))
-    return tuple(video_frames)
+            for frame_index in range(stall_frame_count):
+                displayed_wait_ns = cumulative_wait_ns + min(
+                    frame_index * _timing.NANOSECONDS_PER_SECOND // video_fps,
+                    stall.duration_ns,
+                )
+                yield _timing.render_overlay_v4(
+                    source_by_step[frame_count],
+                    _cumulative_wait_line_v4(displayed_wait_ns),
+                    renderer=renderer,
+                )
+
+
+def _build_video_frames_v4(
+    control_frames: Sequence[Any],
+    stalls: Sequence[_timing.ControlStallV4],
+    *,
+    stall_source_frames: Sequence[Tuple[int, Any]] = (),
+    include_stalls: bool,
+    control_hz: int = _timing.CONTROL_HZ,
+    video_fps: int = _timing.DEFAULT_VIDEO_FPS,
+    overlay_renderer: Optional[Callable[[Any, Tuple[str, ...]], Any]] = None,
+) -> Tuple[Any, ...]:
+    """Materialize the streaming path only for focused tests and diagnostics."""
+    return tuple(
+        _iter_video_frames_v4(
+            control_frames,
+            stalls,
+            stall_source_frames=stall_source_frames,
+            include_stalls=include_stalls,
+            control_hz=control_hz,
+            video_fps=video_fps,
+            overlay_renderer=overlay_renderer,
+        )
+    )
 
 
 def _persist_episode_artifacts_v4(
@@ -1230,7 +1344,7 @@ def _persist_episode_artifacts_v4(
     video_selector: _eval.VideoSelectorV4,
     *,
     video_show_inference_waits: bool,
-    video_encoder: Optional[Callable[..., Any]] = None,
+    video_writer_factory: Optional[Callable[..., Any]] = None,
 ) -> Tuple[_eval.EpisodeRecordV4, Optional[_eval.ArtifactErrorV4]]:
     replay_frames = record.replay_frames
     stall_source_frames = record.stall_source_frames
@@ -1240,7 +1354,7 @@ def _persist_episode_artifacts_v4(
     if video_path is None:
         return persisted, None
 
-    encoder = imageio.mimwrite if video_encoder is None else video_encoder
+    writer_factory = imageio.get_writer if video_writer_factory is None else video_writer_factory
     artifact_error = None  # type: Optional[_eval.ArtifactErrorV4]
     try:
         planned = _timing.build_video_timing_audit_v4(
@@ -1252,7 +1366,7 @@ def _persist_episode_artifacts_v4(
             stalls=persisted.control_stalls,
             include_stalls=video_show_inference_waits,
         )
-        frames = _build_video_frames_v4(
+        frames = _iter_video_frames_v4(
             replay_frames,
             persisted.control_stalls,
             stall_source_frames=(
@@ -1261,24 +1375,32 @@ def _persist_episode_artifacts_v4(
             include_stalls=video_show_inference_waits,
         )
         padding = 0
-        if not frames:
-            if planned.video_frame_count:
-                raise ValueError("non-empty planned video expanded to zero frames")
-            source = dict(stall_source_frames).get(0)
-            if source is None:
-                raise ValueError("zero-step selected episode has no request-time frame")
-            if video_show_inference_waits and persisted.control_stalls:
-                source = _timing.render_overlay_v4(
-                    source,
-                    _timing.stall_overlay_lines_v4(persisted.control_stalls[0]),
-                    renderer=_draw_video_overlay,
-                )
-            frames = (source,)
-            padding = 1
-        expected_count = planned.video_frame_count + padding
-        if len(frames) != expected_count:
-            raise ValueError("expanded frame count does not match the v4 timing audit")
-        encoder(video_path, [np.asarray(frame) for frame in frames], fps=_eval.VIDEO_FPS)
+        encoded_input_count = 0
+        stream = writer_factory(video_path, fps=_eval.VIDEO_FPS)
+        try:
+            for frame in frames:
+                stream.append_data(np.asarray(frame))
+                encoded_input_count += 1
+            if encoded_input_count == 0:
+                if planned.video_frame_count:
+                    raise ValueError("non-empty planned video expanded to zero frames")
+                source = dict(stall_source_frames).get(0)
+                if source is None:
+                    raise ValueError("zero-step selected episode has no request-time frame")
+                if video_show_inference_waits:
+                    source = _timing.render_overlay_v4(
+                        source,
+                        _cumulative_wait_line_v4(0),
+                        renderer=_draw_cumulative_wait_overlay_v4,
+                    )
+                stream.append_data(np.asarray(source))
+                encoded_input_count = 1
+                padding = 1
+            expected_count = planned.video_frame_count + padding
+            if encoded_input_count != expected_count:
+                raise ValueError("expanded frame count does not match the v4 timing audit")
+        finally:
+            stream.close()
         encoded_fps, encoded_count, encoded_duration_s = _read_encoded_video(video_path)
         audit = _eval.build_video_artifact_audit_v4(
             episode=persisted,
@@ -1335,6 +1457,7 @@ def _make_manifest_v4(
         controller_period_ns=_control.CONTROL_PERIOD_NS,
         video_fps=40,
         video_show_inference_waits=args.video_show_inference_waits,
+        synthetic_latency_target_ms=args.synthetic_latency_target_ms,
         execution_mode=mode.name,
         execution_parameters=mode.to_parameters_dict(),
         latency_calibration=calibration,
@@ -1587,6 +1710,8 @@ def eval_libero_v4(args: ArgsV4) -> Dict[str, Any]:
         shutdown_timeout_s=args.worker_shutdown_timeout_s,
         recv_poll_interval_s=args.recv_poll_interval_s,
         monotonic_ns=clock.monotonic_ns,
+        wait_until_ns=clock.wait_until_ns,
+        synthetic_latency_target_ms=args.synthetic_latency_target_ms,
     )
     primary_error = None  # type: Optional[BaseException]
     try:

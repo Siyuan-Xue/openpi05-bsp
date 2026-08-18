@@ -42,6 +42,9 @@ class InferenceOutcome:
     cancelled: bool = False
     completed_monotonic_ns: Optional[int] = None
     connection: Optional[ConnectionSnapshot] = None
+    raw_inference_latency_ns: Optional[int] = None
+    synthetic_delay_ns: Optional[int] = None
+    effective_inference_latency_ns: Optional[int] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -52,6 +55,9 @@ class _Completion:
     cancelled: bool = False
     completed_monotonic_ns: Optional[int] = None
     connection: Optional[ConnectionSnapshot] = None
+    raw_inference_latency_ns: Optional[int] = None
+    synthetic_delay_ns: Optional[int] = None
+    effective_inference_latency_ns: Optional[int] = None
     observed: bool = False
 
     def for_job(self, job: InferenceJob) -> InferenceOutcome:
@@ -63,6 +69,9 @@ class _Completion:
             cancelled=self.cancelled,
             completed_monotonic_ns=self.completed_monotonic_ns,
             connection=self.connection,
+            raw_inference_latency_ns=self.raw_inference_latency_ns,
+            synthetic_delay_ns=self.synthetic_delay_ns,
+            effective_inference_latency_ns=self.effective_inference_latency_ns,
         )
 
 
@@ -88,16 +97,26 @@ class AsyncInferenceWorker:
         shutdown_timeout_s: float = 1.0,
         recv_poll_interval_s: float = 0.05,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
+        wait_until_ns: Optional[Callable[[int], None]] = None,
+        synthetic_latency_target_ms: int = 0,
     ) -> None:
         if shutdown_timeout_s <= 0:
             raise ValueError("shutdown_timeout_s must be positive")
         if recv_poll_interval_s <= 0:
             raise ValueError("recv_poll_interval_s must be positive")
+        if (
+            isinstance(synthetic_latency_target_ms, bool)
+            or not isinstance(synthetic_latency_target_ms, int)
+            or synthetic_latency_target_ms < 0
+        ):
+            raise ValueError("synthetic_latency_target_ms must be a nonnegative integer")
 
         self._policy_factory = policy_factory
         self._shutdown_timeout_s = shutdown_timeout_s
         self._recv_poll_interval_s = recv_poll_interval_s
         self._monotonic_ns = monotonic_ns
+        self._wait_until_ns = wait_until_ns or self._default_wait_until_ns
+        self._synthetic_latency_target_ns = synthetic_latency_target_ms * 1_000_000
         self._packer = msgpack_numpy.Packer()
 
         self._condition = threading.Condition()
@@ -425,6 +444,9 @@ class AsyncInferenceWorker:
 
                 result = None
                 error = None
+                raw_inference_latency_ns = None
+                synthetic_delay_ns = None
+                effective_inference_latency_ns = None
                 try:
                     result = policy.infer_packed(
                         job.payload,
@@ -435,7 +457,18 @@ class AsyncInferenceWorker:
                     error = caught_error
                     completed_monotonic_ns = self._monotonic_ns()
                 else:
-                    completed_monotonic_ns = self._monotonic_ns()
+                    raw_completed_monotonic_ns = self._monotonic_ns()
+                    raw_inference_latency_ns = raw_completed_monotonic_ns - job.submitted_monotonic_ns
+                    target_completed_monotonic_ns = (
+                        job.submitted_monotonic_ns + self._synthetic_latency_target_ns
+                    )
+                    if raw_completed_monotonic_ns < target_completed_monotonic_ns:
+                        self._wait_until_ns(target_completed_monotonic_ns)
+                        completed_monotonic_ns = self._monotonic_ns()
+                    else:
+                        completed_monotonic_ns = raw_completed_monotonic_ns
+                    synthetic_delay_ns = completed_monotonic_ns - raw_completed_monotonic_ns
+                    effective_inference_latency_ns = completed_monotonic_ns - job.submitted_monotonic_ns
 
                 with self._condition:
                     cancelled = (
@@ -460,6 +493,9 @@ class AsyncInferenceWorker:
                                 result,
                                 completed_monotonic_ns=completed_monotonic_ns,
                                 connection=connection,
+                                raw_inference_latency_ns=raw_inference_latency_ns,
+                                synthetic_delay_ns=synthetic_delay_ns,
+                                effective_inference_latency_ns=effective_inference_latency_ns,
                             )
                     self._active_job = None
                     retire = cancelled or error is not None
@@ -522,13 +558,27 @@ class AsyncInferenceWorker:
         *,
         completed_monotonic_ns: int,
         connection: ConnectionSnapshot,
+        raw_inference_latency_ns: int,
+        synthetic_delay_ns: int,
+        effective_inference_latency_ns: int,
     ) -> None:
         self._completions[job.request_id] = _Completion(
             result=result,
             completed_monotonic_ns=completed_monotonic_ns,
             connection=connection,
+            raw_inference_latency_ns=raw_inference_latency_ns,
+            synthetic_delay_ns=synthetic_delay_ns,
+            effective_inference_latency_ns=effective_inference_latency_ns,
         )
         self._condition.notify_all()
+
+    @staticmethod
+    def _default_wait_until_ns(deadline_ns: int) -> None:
+        while True:
+            remaining_ns = deadline_ns - time.monotonic_ns()
+            if remaining_ns <= 0:
+                return
+            time.sleep(remaining_ns / 1_000_000_000)
 
     def _publish_error_locked(
         self,

@@ -36,6 +36,20 @@ empty output directory. Formal commands omit `--args.code-sha`: the evaluator
 records the clean checkout HEAD automatically. Selected videos are audited in
 `video_audit.jsonl`.
 
+## Schema v4 async latency experiment
+
+The four-mode evaluator is `examples/libero/main_v4.py`. It keeps the schema-v3
+20 Hz/40 FPS artifact guarantees while adding baseline RTC, continuous BSP
+scheduling, a single-owner asynchronous WebSocket worker, and auditable
+synthetic result-availability latency. The v4 video overlay is one persistent
+`Cumulative inference wait: X.XX s` line with no solid background, and selected
+videos are streamed to the encoder one frame at a time.
+
+Do not mix v3 and v4 artifacts or compare runs with different synthetic latency
+targets. The complete capacity-scan, formal-run, server-gate, and interpretation
+contract is in
+[`docs/pi05_libero_latency_experiment_v4.md`](../../docs/pi05_libero_latency_experiment_v4.md).
+
 ## With Docker (recommended)
 
 The default Compose path is headless EGL and does not require an X server or

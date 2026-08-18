@@ -22,7 +22,6 @@ from typing import Sequence
 from typing import Tuple
 
 from openpi_client import libero_artifacts
-from openpi_client import libero_control_v4
 from openpi_client import libero_eval_v4
 from openpi_client import libero_report as _legacy_bootstrap
 
@@ -70,6 +69,7 @@ _ROLLOUT_MANIFEST_FIELDS = (
     "controller_period_ns",
     "video_fps",
     "video_show_inference_waits",
+    "synthetic_latency_target_ms",
     "code_sha",
     "dataset_revision",
     "container_digest",
@@ -691,7 +691,19 @@ def _latency_diagnostics(
     records: Sequence[Mapping[str, Any]],
     manifest: Mapping[str, Any],
 ) -> Mapping[str, Any]:
-    durations = []  # type: List[int]
+    raw_durations = []  # type: List[int]
+    synthetic_delays = []  # type: List[int]
+    effective_durations = []  # type: List[int]
+    stall_durations = []  # type: List[int]
+    underflow_durations = []  # type: List[int]
+    episode_durations = []  # type: List[int]
+    control_steps = []  # type: List[int]
+
+    def duration(value: Any, *, label: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ComparisonErrorV4("{} must be a nonnegative integer".format(label))
+        return value
+
     for record in records:
         events = record.get("inference_latencies")
         if not isinstance(events, list):
@@ -699,31 +711,116 @@ def _latency_diagnostics(
         for event in events:
             if type(event) is not dict:
                 raise ComparisonErrorV4("inference latency must remain a JSON object")
-            duration = event.get("duration_ns")
-            if (
-                isinstance(duration, bool)
-                or not isinstance(duration, int)
-                or duration < 0
-            ):
+            effective = duration(
+                event.get("effective_inference_latency_ns"),
+                label="effective inference latency",
+            )
+            raw = duration(
+                event.get("raw_inference_latency_ns"),
+                label="raw inference latency",
+            )
+            synthetic = duration(
+                event.get("synthetic_delay_ns"),
+                label="synthetic inference delay",
+            )
+            recorded = duration(event.get("duration_ns"), label="inference latency")
+            if raw + synthetic != effective or recorded != effective:
                 raise ComparisonErrorV4(
-                    "inference latency duration_ns must be nonnegative"
+                    "inference latency breakdown does not match effective latency"
                 )
-            durations.append(duration)
+            raw_durations.append(raw)
+            synthetic_delays.append(synthetic)
+            effective_durations.append(effective)
+        stalls = record.get("control_stalls")
+        underflows = record.get("action_underflows")
+        if not isinstance(stalls, list) or not isinstance(underflows, list):
+            raise ComparisonErrorV4("stall and underflow events must remain JSON lists")
+        for stall in stalls:
+            if type(stall) is not dict:
+                raise ComparisonErrorV4("control stall must remain a JSON object")
+            stall_durations.append(
+                duration(stall.get("duration_ns"), label="control stall duration")
+            )
+        for underflow in underflows:
+            if type(underflow) is not dict:
+                raise ComparisonErrorV4("action underflow must remain a JSON object")
+            underflow_durations.append(
+                duration(underflow.get("duration_ns"), label="action underflow duration")
+            )
+        episode_durations.append(
+            duration(record.get("episode_duration_ns"), label="episode wall time")
+        )
+        control_steps.append(duration(record.get("steps"), label="control steps"))
+
+    def p95(values: Sequence[int]) -> Optional[int]:
+        if not values:
+            return None
+        ordered = sorted(values)
+        rank = (95 * len(ordered) + 99) // 100
+        return ordered[rank - 1]
+
     calibration = manifest["latency_calibration"]
     calibration_p95 = None
     if calibration is not None:
         calibration_p95 = calibration["p95_latency_ns"]
+    effective_total = sum(effective_durations)
+    stall_total = sum(stall_durations)
+    hidden_ns = max(0, effective_total - stall_total)
+    episode_total = sum(episode_durations)
     return {
-        "inference_latency_count": len(durations),
-        "inference_latency_ns_total": sum(durations),
+        "inference_latency_count": len(effective_durations),
+        "inference_latency_ns_total": effective_total,
         "inference_latency_ns_mean": (
-            sum(durations) / len(durations) if durations else None
+            effective_total / len(effective_durations) if effective_durations else None
         ),
         "inference_latency_ns_median": (
-            statistics.median(durations) if durations else None
+            statistics.median(effective_durations) if effective_durations else None
         ),
-        "inference_latency_ns_min": min(durations) if durations else None,
-        "inference_latency_ns_max": max(durations) if durations else None,
+        "inference_latency_ns_min": min(effective_durations) if effective_durations else None,
+        "inference_latency_ns_max": max(effective_durations) if effective_durations else None,
+        "raw_inference_latency_ns_total": sum(raw_durations),
+        "raw_inference_latency_ns_mean": (
+            sum(raw_durations) / len(raw_durations) if raw_durations else None
+        ),
+        "raw_inference_latency_ns_p95": p95(raw_durations),
+        "synthetic_delay_ns_total": sum(synthetic_delays),
+        "synthetic_delay_ns_mean": (
+            sum(synthetic_delays) / len(synthetic_delays) if synthetic_delays else None
+        ),
+        "effective_inference_latency_ns_total": effective_total,
+        "effective_inference_latency_ns_mean": (
+            effective_total / len(effective_durations) if effective_durations else None
+        ),
+        "effective_inference_latency_ns_p95": p95(effective_durations),
+        "control_stall_count": len(stall_durations),
+        "control_stall_ns_total": stall_total,
+        "control_stall_ns_mean": (
+            stall_total / len(stall_durations) if stall_durations else None
+        ),
+        "action_underflow_count": len(underflow_durations),
+        "action_underflow_ns_total": sum(underflow_durations),
+        "action_underflow_ns_mean": (
+            sum(underflow_durations) / len(underflow_durations)
+            if underflow_durations
+            else None
+        ),
+        "latency_hidden_ns": hidden_ns,
+        "latency_hidden_ratio": (
+            hidden_ns / effective_total if effective_total else None
+        ),
+        "control_steps_total": sum(control_steps),
+        "control_steps_mean": (
+            sum(control_steps) / len(control_steps) if control_steps else None
+        ),
+        "episode_wall_time_ns_total": episode_total,
+        "episode_wall_time_ns_mean": (
+            episode_total / len(episode_durations) if episode_durations else None
+        ),
+        "episode_throughput_per_minute": (
+            len(episode_durations) * 60_000_000_000 / episode_total
+            if episode_total
+            else None
+        ),
         "calibration_p95_latency_ns": calibration_p95,
     }
 
@@ -796,6 +893,9 @@ def compare_checkpoint_v4(
     return {
         "schema_version": 4,
         "checkpoint_step": next(iter(classified.values()))["checkpoint_step"],
+        "synthetic_latency_target_ms": next(iter(classified.values()))[
+            "synthetic_latency_target_ms"
+        ],
         "success_rates": success_rates,
         "primary_paired_deltas": primary_deltas,
         "diagnostics": {
@@ -815,6 +915,10 @@ def compare_checkpoint_v4(
 def _render_report_v4(checkpoints: Sequence[Mapping[str, Any]]) -> str:
     lines = [
         "# LIBERO schema-v4 four-mode comparison",
+        "",
+        "Synthetic latency target: {} ms.".format(
+            checkpoints[0]["synthetic_latency_target_ms"]
+        ),
         "",
         (
             "| step | baseline sync | baseline RTC | BSP sync | BSP async | "
@@ -875,6 +979,9 @@ def _learning_rows_v4(
         rows.append(
             {
                 "checkpoint_step": checkpoint["checkpoint_step"],
+                "synthetic_latency_target_ms": checkpoint[
+                    "synthetic_latency_target_ms"
+                ],
                 "baseline_sync_n5_success_rate": rates["baseline_sync_n5"],
                 "baseline_rtc_success_rate": rates["baseline_rtc"],
                 "bsp_spline_sync_success_rate": rates["bsp_spline_sync"],
@@ -939,6 +1046,13 @@ def write_five_checkpoint_report_v4(
         )
         for step in steps
     ]
+    latency_targets = {
+        checkpoint["synthetic_latency_target_ms"] for checkpoint in checkpoints
+    }
+    if len(latency_targets) != 1:
+        raise ComparisonErrorV4(
+            "One report cannot mix synthetic latency target conditions"
+        )
     report = {
         "schema_version": 4,
         "protocol": {
@@ -948,6 +1062,9 @@ def write_five_checkpoint_report_v4(
             "tasks_per_suite": TASKS_PER_SUITE_V4,
             "trials_per_task": TRIALS_PER_TASK_V4,
             "episodes_per_run": EPISODES_PER_RUN_V4,
+            "synthetic_latency_target_ms": checkpoints[0][
+                "synthetic_latency_target_ms"
+            ],
             "primary_deltas": [
                 "baseline_rtc_minus_baseline_sync_n5",
                 "bsp_spline_async_minus_bsp_spline_sync",

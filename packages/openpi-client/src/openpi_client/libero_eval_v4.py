@@ -18,7 +18,6 @@ import re
 from types import MappingProxyType
 from typing import Any
 from typing import Dict
-from typing import List
 from typing import Optional
 from typing import Tuple
 
@@ -73,6 +72,7 @@ _MANIFEST_FIELDS = frozenset(
         "controller_period_ns",
         "video_fps",
         "video_show_inference_waits",
+        "synthetic_latency_target_ms",
         "execution_mode",
         "execution_parameters",
         "latency_calibration",
@@ -342,6 +342,7 @@ class EvaluationManifestV4:
     controller_period_ns: int
     video_fps: int
     video_show_inference_waits: bool
+    synthetic_latency_target_ms: int
     execution_mode: str
     execution_parameters: Mapping[str, Any]
     latency_calibration: Optional[_control.LatencyCalibrationV1]
@@ -414,6 +415,10 @@ class EvaluationManifestV4:
         )
         if type(self.video_show_inference_waits) is not bool:
             raise ValueError("video_show_inference_waits must be boolean")
+        if self.synthetic_latency_target_ms not in (0, 100, 200, 300, 850):
+            raise ValueError(
+                "synthetic_latency_target_ms must be one of 0, 100, 200, 300, or 850"
+            )
         try:
             mode = _control.EXECUTION_MODES[self.execution_mode]
         except (KeyError, TypeError) as error:
@@ -534,6 +539,7 @@ class EvaluationManifestV4:
             "controller_period_ns": self.controller_period_ns,
             "video_fps": self.video_fps,
             "video_show_inference_waits": self.video_show_inference_waits,
+            "synthetic_latency_target_ms": self.synthetic_latency_target_ms,
             "execution_mode": self.execution_mode,
             "execution_parameters": _thaw_json(self.execution_parameters),
             "latency_calibration": (

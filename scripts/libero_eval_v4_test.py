@@ -300,6 +300,36 @@ def test_dummy_phase_is_paced_and_excluded_from_episode_timeline():
     assert result.control_stalls[0].duration_ns == 125 * NS_PER_MS
 
 
+def test_video_wait_display_switch_cannot_change_rollout_actions_or_result():
+    outcomes = []
+    action_traces = []
+    for show_waits in (False, True):
+        clock = ManualClock()
+        worker = FakeWorker(clock, [_ScriptedCall(80 * NS_PER_MS, _rtc_response())])
+        environment = FakeEnvironment(done_after_real_steps=3)
+        outcomes.append(
+            _run(
+                clock,
+                worker,
+                environment,
+                args=_args(video_show_inference_waits=show_waits),
+            )
+        )
+        action_traces.append(tuple(action.copy() for action in environment.actions))
+
+    assert len(action_traces[0]) == len(action_traces[1])
+    assert all(
+        np.array_equal(before, after)
+        for before, after in zip(  # noqa: B905 -- LIBERO client runs on Python 3.8.
+            action_traces[0], action_traces[1]
+        )
+    )
+    assert outcomes[0].success == outcomes[1].success
+    assert outcomes[0].failure_kind == outcomes[1].failure_kind
+    assert outcomes[0].steps == outcomes[1].steps
+    assert outcomes[0].episode_duration_ns == outcomes[1].episode_duration_ns
+
+
 @pytest.mark.parametrize(
     ("second_latency_ms", "expected_stalls"),
     (
@@ -778,7 +808,7 @@ def test_metadata_change_on_result_is_run_fatal_before_another_action():
     assert not environment.actions
 
 
-def test_v4_video_frames_hold_control_twice_and_insert_reason_driven_stalls():
+def test_v4_video_frames_hold_control_twice_and_show_persistent_cumulative_wait():
     stalls = (
         timing.ControlStallV4(0, 0, 0, 25 * NS_PER_MS, "synchronous_inference"),
         timing.ControlStallV4(1, 1, 50 * NS_PER_MS, 50 * NS_PER_MS, "async_action_underflow"),
@@ -787,7 +817,7 @@ def test_v4_video_frames_hold_control_twice_and_insert_reason_driven_stalls():
 
     def renderer(frame, lines):
         rendered.append(lines)
-        return "{}:{}".format(frame, lines[0])
+        return f"{frame}:{lines[0]}"
 
     frames = main_v4._build_video_frames_v4(
         ("frame-0", "frame-1"),
@@ -798,18 +828,37 @@ def test_v4_video_frames_hold_control_twice_and_insert_reason_driven_stalls():
     )
 
     assert rendered == [
-        ("Synchronous inference", "Control stalled: 0.03 s"),
-        ("Waiting for policy actions", "Control stalled: 0.05 s"),
+        ("Cumulative inference wait: 0.00 s",),
+        ("Cumulative inference wait: 0.03 s",),
+        ("Cumulative inference wait: 0.03 s",),
+        ("Cumulative inference wait: 0.03 s",),
+        ("Cumulative inference wait: 0.05 s",),
+        ("Cumulative inference wait: 0.08 s",),
+        ("Cumulative inference wait: 0.08 s",),
     ]
     assert frames == (
-        "wait-0:Synchronous inference",
-        "frame-0",
-        "frame-0",
-        "wait-1:Waiting for policy actions",
-        "wait-1:Waiting for policy actions",
-        "frame-1",
-        "frame-1",
+        "wait-0:Cumulative inference wait: 0.00 s",
+        "frame-0:Cumulative inference wait: 0.03 s",
+        "frame-0:Cumulative inference wait: 0.03 s",
+        "wait-1:Cumulative inference wait: 0.03 s",
+        "wait-1:Cumulative inference wait: 0.05 s",
+        "frame-1:Cumulative inference wait: 0.08 s",
+        "frame-1:Cumulative inference wait: 0.08 s",
     )
+
+
+def test_cumulative_wait_overlay_uses_text_stroke_without_a_black_rectangle():
+    frame = np.full((80, 240, 3), 127, dtype=np.uint8)
+
+    rendered = main_v4._draw_cumulative_wait_overlay_v4(
+        frame,
+        ("Cumulative inference wait: 0.00 s",),
+    )
+
+    assert np.array_equal(rendered[0, 220], frame[0, 220])
+    assert np.array_equal(rendered[30, 220], frame[30, 220])
+    assert np.array_equal(frame, np.full((80, 240, 3), 127, dtype=np.uint8))
+    assert np.any(rendered != frame)
 
 
 def test_worker_shutdown_failure_preserves_primary_exception():
@@ -918,8 +967,15 @@ def test_selected_zero_frame_video_persists_episode_before_padding_and_audit(
             assert order == [("episode", persisted)]
             return tmp_path / "selected.mp4"
 
-    def encode(path, frames, *, fps):
-        order.append(("encode", (path, tuple(frames), fps)))
+    class StreamingWriter:
+        def __init__(self, path, *, fps):
+            order.append(("open", (path, fps)))
+
+        def append_data(self, frame):
+            order.append(("append", np.asarray(frame).copy()))
+
+        def close(self):
+            order.append(("close", None))
 
     monkeypatch.setattr(main_v4, "_read_encoded_video", lambda _path: (40.0, 1, 0.025))
 
@@ -928,12 +984,12 @@ def test_selected_zero_frame_video_persists_episode_before_padding_and_audit(
         Writer(),
         Selector(),
         video_show_inference_waits=True,
-        video_encoder=encode,
+        video_writer_factory=StreamingWriter,
     )
 
     assert artifact_error is None
     assert persisted.replay_frames == ()
-    assert [entry[0] for entry in order] == ["episode", "encode", "audit"]
+    assert [entry[0] for entry in order] == ["episode", "open", "append", "close", "audit"]
     audit = order[-1][1]
     assert audit.artifact_padding_frame_count == 1
     assert audit.encoded_frame_count == 1
@@ -985,3 +1041,39 @@ def test_eval_entrypoint_closes_single_worker_on_normal_and_exception_exit(
     assert workers[0].reset_calls == 1
     assert workers[0].ready_calls == [(1, args.connection_timeout_s)]
     assert workers[0].close_calls == 1
+
+
+@pytest.mark.parametrize(
+    "execution_mode",
+    ("baseline_sync_n5", "baseline_rtc", "bsp_spline_sync", "bsp_spline_async"),
+)
+def test_all_execution_modes_share_the_worker_latency_injection_point(
+    monkeypatch, execution_mode
+):
+    captured = []
+
+    class Worker:
+        def __init__(self, *args, **kwargs):
+            del args
+            captured.append(kwargs)
+
+        def reset_generation(self):
+            return 1
+
+        def wait_until_ready(self, generation, timeout=None):
+            del generation, timeout
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(main_v4._async, "AsyncInferenceWorker", Worker)
+    monkeypatch.setattr(
+        main_v4,
+        "_evaluate_run_v4",
+        lambda **_kwargs: {"acceptance_complete": True},
+    )
+    args = _args(execution_mode=execution_mode, synthetic_latency_target_ms=300)
+
+    assert main_v4.eval_libero_v4(args) == {"acceptance_complete": True}
+    assert captured[0]["synthetic_latency_target_ms"] == 300
+    assert captured[0]["wait_until_ns"].__self__.__class__ is main_v4._SystemClock

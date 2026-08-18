@@ -99,6 +99,7 @@ def _manifest(mode: str, step: int = 1000) -> Dict[str, Any]:
         "controller_period_ns": 50_000_000,
         "video_fps": 40,
         "video_show_inference_waits": True,
+        "synthetic_latency_target_ms": 300,
         "execution_mode": mode,
         "execution_parameters": spec.to_parameters_dict(),
         "latency_calibration": (
@@ -226,6 +227,9 @@ def _episode(
                 "request_id": 0,
                 "completed_offset_ns": 0,
                 "duration_ns": 0,
+                "raw_inference_latency_ns": 0,
+                "synthetic_delay_ns": 0,
+                "effective_inference_latency_ns": 0,
                 "outcome": "policy_failure",
             }
         ],
@@ -751,6 +755,15 @@ def test_classify_checkpoint_rejects_rollout_seed_mismatch() -> None:
         libero_report_v4.classify_checkpoint_manifests_v4(manifests)
 
 
+def test_classify_checkpoint_rejects_synthetic_latency_condition_mismatch() -> None:
+    manifests = [_manifest(mode) for mode in _MODES]
+    manifests[-1] = copy.deepcopy(manifests[-1])
+    manifests[-1]["synthetic_latency_target_ms"] = 850
+
+    with pytest.raises(libero_report_v4.ComparisonErrorV4, match="rollout identity"):
+        libero_report_v4.classify_checkpoint_manifests_v4(manifests)
+
+
 def test_classify_five_checkpoint_manifests_groups_exact_twenty() -> None:
     manifests = [_manifest(mode, step) for step in _STEPS for mode in _MODES]
 
@@ -807,6 +820,7 @@ def test_compare_checkpoint_emits_four_rates_and_only_two_primary_deltas(
 
     comparison = libero_report_v4.compare_checkpoint_v4(runs_by_mode)
 
+    assert comparison["synthetic_latency_target_ms"] == 300
     assert comparison["success_rates"] == {mode: 0.0 for mode in _MODES}
     assert set(comparison["primary_paired_deltas"]) == {
         "baseline_rtc_minus_baseline_sync_n5",
@@ -823,6 +837,56 @@ def test_compare_checkpoint_emits_four_rates_and_only_two_primary_deltas(
         == 1018
     )
     assert "inference_ms_p95" not in comparison["diagnostics"]["baseline_rtc"]
+
+
+def test_latency_diagnostics_separate_raw_effective_delay_stall_and_underflow() -> None:
+    records = (
+        {
+            "inference_latencies": [
+                {
+                    "duration_ns": 300,
+                    "raw_inference_latency_ns": 80,
+                    "synthetic_delay_ns": 220,
+                    "effective_inference_latency_ns": 300,
+                },
+                {
+                    "duration_ns": 450,
+                    "raw_inference_latency_ns": 450,
+                    "synthetic_delay_ns": 0,
+                    "effective_inference_latency_ns": 450,
+                },
+            ],
+            "control_stalls": [{"duration_ns": 150}],
+            "action_underflows": [{"duration_ns": 150}],
+            "episode_duration_ns": 2_000,
+            "steps": 20,
+        },
+        {
+            "inference_latencies": [],
+            "control_stalls": [],
+            "action_underflows": [],
+            "episode_duration_ns": 1_000,
+            "steps": 10,
+        },
+    )
+    manifest = {"latency_calibration": {"p95_latency_ns": 300}}
+
+    diagnostics = libero_report_v4._latency_diagnostics(records, manifest)
+
+    assert diagnostics["raw_inference_latency_ns_total"] == 530
+    assert diagnostics["synthetic_delay_ns_total"] == 220
+    assert diagnostics["effective_inference_latency_ns_total"] == 750
+    assert diagnostics["effective_inference_latency_ns_p95"] == 450
+    assert diagnostics["control_stall_ns_total"] == 150
+    assert diagnostics["action_underflow_count"] == 1
+    assert diagnostics["action_underflow_ns_total"] == 150
+    assert diagnostics["latency_hidden_ns"] == 600
+    assert diagnostics["latency_hidden_ratio"] == pytest.approx(0.8)
+    assert diagnostics["control_steps_total"] == 30
+    assert diagnostics["control_steps_mean"] == 15
+    assert diagnostics["episode_wall_time_ns_total"] == 3_000
+    assert diagnostics["episode_wall_time_ns_mean"] == 1_500
+    assert diagnostics["episode_throughput_per_minute"] == pytest.approx(40_000_000)
 
 
 @pytest.mark.parametrize("field", ["init_state_fingerprint", "eval_seed"])
@@ -868,6 +932,27 @@ def test_write_five_checkpoint_report_uses_only_v4_suffixed_filenames(
     assert filenames
     assert all(Path(name).stem.endswith("_v4") for name in filenames)
     assert not filenames.intersection(libero_report.OUTPUT_FILENAMES)
+
+
+def test_five_checkpoint_report_cannot_mix_latency_conditions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(libero_report, "BOOTSTRAP_RESAMPLES", 1)
+    mode_records = {mode: _run_data(mode).records for mode in _MODES}
+    runs = [
+        _run_data(mode, step, records=mode_records[mode])
+        for step in _STEPS
+        for mode in _MODES
+    ]
+    for index, run in enumerate(runs):
+        if run.checkpoint_step == 10000:
+            manifest = dict(run.manifest)
+            manifest["synthetic_latency_target_ms"] = 850
+            runs[index] = dataclasses.replace(run, manifest=manifest)
+
+    with pytest.raises(libero_report_v4.ComparisonErrorV4, match="latency target"):
+        libero_report_v4.write_five_checkpoint_report_v4(runs, output_dir=tmp_path)
 
 
 def test_write_report_accepts_one_four_run_checkpoint(
