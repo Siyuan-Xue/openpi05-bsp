@@ -21,10 +21,15 @@ def _sha(label: str) -> str:
     return hashlib.sha256(label.encode()).hexdigest()
 
 
-def _checkpoint(mode: str, *, identity_suffix: str = "") -> control.CheckpointIdentityV1:
+def _checkpoint(
+    mode: str,
+    *,
+    identity_suffix: str = "",
+    code_sha: str = "a" * 40,
+) -> control.CheckpointIdentityV1:
     bsp = mode == "bsp_spline_async"
     return control.CheckpointIdentityV1(
-        code_sha="a" * 40,
+        code_sha=code_sha,
         config_name=("pi05_libero_bsp_lora_h16" if bsp else "pi05_libero_baseline_lora_h16"),
         checkpoint_step=10000,
         checkpoint=("/checkpoints/bsp/10000" if bsp else "/checkpoints/baseline/10000"),
@@ -35,8 +40,13 @@ def _checkpoint(mode: str, *, identity_suffix: str = "") -> control.CheckpointId
     )
 
 
-def _calibration(mode: str, *, identity_suffix: str = "") -> control.LatencyCalibrationV2:
-    checkpoint = _checkpoint(mode, identity_suffix=identity_suffix)
+def _calibration(
+    mode: str,
+    *,
+    identity_suffix: str = "",
+    code_sha: str = "a" * 40,
+) -> control.LatencyCalibrationV2:
+    checkpoint = _checkpoint(mode, identity_suffix=identity_suffix, code_sha=code_sha)
     raw_warmup = [100_000_000] * 5
     target_warmup = [300_000_000] * 5
     raw_measurement = [100_000_000] * 20
@@ -71,9 +81,14 @@ def _calibration(mode: str, *, identity_suffix: str = "") -> control.LatencyCali
     )
 
 
-def _manifest(mode: str, *, identity_suffix: str = "") -> dict:
+def _manifest(
+    mode: str,
+    *,
+    identity_suffix: str = "",
+    code_sha: str = "a" * 40,
+) -> dict:
     spec = control.EXECUTION_MODES[mode]
-    checkpoint = _checkpoint(mode, identity_suffix=identity_suffix)
+    checkpoint = _checkpoint(mode, identity_suffix=identity_suffix, code_sha=code_sha)
     return evaluation.EvaluationManifestV5(
         schema_version=5,
         dataset_fps=10,
@@ -95,7 +110,7 @@ def _manifest(mode: str, *, identity_suffix: str = "") -> dict:
         scheduling_delay_ticks=control.SCHEDULING_DELAY_TICKS,
         execution_mode=mode,
         execution_parameters=spec.to_parameters_dict(),
-        latency_calibration=_calibration(mode, identity_suffix=identity_suffix),
+        latency_calibration=_calibration(mode, identity_suffix=identity_suffix, code_sha=code_sha),
         server_metadata_fingerprint=_sha("server"),
         code_sha=checkpoint.code_sha,
         dataset_revision="v2.0",
@@ -239,6 +254,49 @@ def test_classifier_rejects_baseline_checkpoint_identity_mismatch():
     manifests[1] = _manifest("baseline_rtc", identity_suffix="-wrong")
     with pytest.raises(report.ComparisonErrorV5, match="Baseline family identity"):
         report.classify_checkpoint_manifests_v5(manifests)
+
+
+def test_classifier_allows_only_bsp_to_use_the_phase_fix_code_sha():
+    manifests = [_manifest(mode) for mode in MODES]
+    manifests[2] = _manifest("bsp_spline_async", code_sha="c" * 40)
+
+    classified = report.classify_checkpoint_manifests_v5(manifests)
+
+    assert classified["baseline_async"]["code_sha"] == "a" * 40
+    assert classified["baseline_rtc"]["code_sha"] == "a" * 40
+    assert classified["bsp_spline_async"]["code_sha"] == "c" * 40
+
+    mismatched_baselines = list(manifests)
+    mismatched_baselines[1] = _manifest("baseline_rtc", code_sha="d" * 40)
+    with pytest.raises(report.ComparisonErrorV5, match="Baseline family identity"):
+        report.classify_checkpoint_manifests_v5(mismatched_baselines)
+
+
+def test_compare_explicitly_reports_cross_code_bsp_phase_fix_provenance():
+    runs = _runs()
+    original = runs["bsp_spline_async"]
+    runs["bsp_spline_async"] = report.RunDataV5(
+        path=original.path,
+        manifest=_manifest("bsp_spline_async", code_sha="c" * 40),
+        records=original.records,
+        summary=original.summary,
+        video_audits=original.video_audits,
+        file_sha256=original.file_sha256,
+    )
+
+    comparison = report.compare_checkpoint_v5(runs)
+
+    assert comparison["code_sha_by_mode"] == {
+        "baseline_async": "a" * 40,
+        "baseline_rtc": "a" * 40,
+        "bsp_spline_async": "c" * 40,
+    }
+    assert comparison["cross_code_provenance"] == {
+        "same_binary_all_modes": False,
+        "baseline_pair_same_binary": True,
+        "bsp_protocol_upgrade": "bsp_spline_async_phase_skip_speedup2_v2",
+        "interpretation": "BSP phase-fix rerun compared with archived baseline async/RTC results",
+    }
 
 
 def test_compare_reports_three_required_deltas_and_runtime_diagnostics():

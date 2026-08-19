@@ -41,9 +41,10 @@ _TRIGGERS = frozenset(
         "baseline_async_launch",
         "rtc_launch",
         "bsp_prefetch",
+        "bsp_stale_replan",
     )
 )
-_DISPOSITIONS = frozenset(("activated", "failed", "abandoned"))
+_DISPOSITIONS = frozenset(("activated", "discarded_stale_phase", "failed", "abandoned"))
 _LATENCY_OUTCOMES = frozenset(("success", "policy_failure"))
 _ACTIVATIONS = frozenset(("initial", "blocking_replace", "immediate_swap"))
 _STALL_REASONS = frozenset((STALL_REASON_SYNCHRONOUS_INFERENCE, STALL_REASON_ASYNC_ACTION_UNDERFLOW))
@@ -207,12 +208,45 @@ def _validate_scheduler_context(trigger: str, context: Mapping[str, Any]) -> Non
             raise ValueError("RTC scheduler context must satisfy d <= s and s + d <= 16")
         return
     if trigger == "bsp_prefetch":
-        if set(context) != {"remaining_plan_ns", "budget_ns"}:
-            raise ValueError("BSP prefetch context must contain exactly remaining_plan_ns and budget_ns")
+        if set(context) != {"remaining_plan_ns", "budget_ns", "request_control_step"}:
+            raise ValueError(
+                "BSP prefetch context must contain exactly remaining_plan_ns, budget_ns, and request_control_step"
+            )
         remaining = _require_nonnegative_integer(context["remaining_plan_ns"], name="remaining_plan_ns")
         budget = _require_nonnegative_integer(context["budget_ns"], name="budget_ns")
+        _require_nonnegative_integer(context["request_control_step"], name="request_control_step")
         if remaining > budget:
             raise ValueError("BSP prefetch requires remaining_plan_ns <= budget_ns")
+        return
+    if trigger == "bsp_stale_replan":
+        expected = {
+            "discarded_request_control_step",
+            "discarded_activation_control_step",
+            "executed_prefix_steps",
+            "phase_offset_microindices",
+            "curve_t_max_microindices",
+        }
+        if set(context) != expected:
+            raise ValueError("BSP stale replan context must exactly identify the discarded response")
+        request_step = _require_nonnegative_integer(
+            context["discarded_request_control_step"],
+            name="discarded_request_control_step",
+        )
+        activation_step = _require_nonnegative_integer(
+            context["discarded_activation_control_step"],
+            name="discarded_activation_control_step",
+        )
+        prefix = _require_nonnegative_integer(context["executed_prefix_steps"], name="executed_prefix_steps")
+        phase = _require_nonnegative_integer(
+            context["phase_offset_microindices"],
+            name="phase_offset_microindices",
+        )
+        t_max = _require_nonnegative_integer(
+            context["curve_t_max_microindices"],
+            name="curve_t_max_microindices",
+        )
+        if activation_step - request_step != prefix or phase != prefix * 1_000_000 or phase <= t_max:
+            raise ValueError("BSP stale replan phase identity is inconsistent")
         return
     raise ValueError("Unsupported request trigger: {}".format(trigger))
 
@@ -221,12 +255,48 @@ def _validate_activation_context(context: Mapping[str, Any]) -> None:
     if set(context) == {"action_cursor"}:
         _require_integer(context["action_cursor"], name="action_cursor", minimum=0, maximum=15)
         return
-    if set(context) == {"curve_elapsed_ns"}:
-        elapsed = _require_nonnegative_integer(context["curve_elapsed_ns"], name="curve_elapsed_ns")
-        if elapsed != 0:
-            raise ValueError("BSP activation curve_elapsed_ns must be zero")
+    expected = {
+        "request_control_step",
+        "activation_control_step",
+        "executed_prefix_steps",
+        "phase_offset_microindices",
+        "first_sample_microindices",
+        "remaining_curve_microindices",
+        "remaining_curve_ns",
+        "immediate_prefetch",
+    }
+    if set(context) == expected:
+        request_step = _require_nonnegative_integer(context["request_control_step"], name="request_control_step")
+        activation_step = _require_nonnegative_integer(
+            context["activation_control_step"],
+            name="activation_control_step",
+        )
+        prefix = _require_nonnegative_integer(context["executed_prefix_steps"], name="executed_prefix_steps")
+        phase = _require_nonnegative_integer(
+            context["phase_offset_microindices"],
+            name="phase_offset_microindices",
+        )
+        first_sample = _require_nonnegative_integer(
+            context["first_sample_microindices"],
+            name="first_sample_microindices",
+        )
+        remaining_indices = _require_nonnegative_integer(
+            context["remaining_curve_microindices"],
+            name="remaining_curve_microindices",
+        )
+        remaining_ns = _require_nonnegative_integer(context["remaining_curve_ns"], name="remaining_curve_ns")
+        immediate = _require_integer(context["immediate_prefetch"], name="immediate_prefetch", minimum=0, maximum=1)
+        expected_remaining_ns = (remaining_indices * NANOSECONDS_PER_SECOND + 20_000_000 - 1) // 20_000_000
+        if (
+            activation_step - request_step != prefix
+            or phase != prefix * 1_000_000
+            or first_sample < phase
+            or remaining_ns != expected_remaining_ns
+            or immediate != int(remaining_ns <= 400_000_000)
+        ):
+            raise ValueError("BSP phase-skip activation context is inconsistent")
         return
-    raise ValueError("activation_context must contain exactly action_cursor or curve_elapsed_ns")
+    raise ValueError("activation_context must contain exactly native or phase-skip BSP fields")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -268,6 +338,7 @@ class RequestEventV5:
             "baseline_async_launch": "background",
             "rtc_launch": "background",
             "bsp_prefetch": "background",
+            "bsp_stale_replan": "blocking_replan",
         }[self.trigger]
         if self.dispatch != expected_dispatch:
             raise ValueError("request trigger {} requires dispatch {}".format(self.trigger, expected_dispatch))
@@ -757,6 +828,12 @@ def validate_timing_events_v5(
                 or request.observation_control_step != 0
             ):
                 raise ValueError("first request must be the step-zero blocking initial plan")
+        elif execution_mode == "bsp_spline_async":
+            if (request.dispatch, request.trigger) not in (
+                expected_later_request,
+                ("blocking_replan", "bsp_stale_replan"),
+            ):
+                raise ValueError("request dispatch/trigger does not match BSP execution mode")
         elif (request.dispatch, request.trigger) != expected_later_request:
             raise ValueError("request dispatch/trigger does not match execution mode")
         if request.trigger == "bsp_prefetch":
@@ -764,10 +841,31 @@ def validate_timing_events_v5(
             observed_bsp_budgets.add(budget)
             if budget != calibrated_bsp_budget:
                 raise ValueError("BSP prefetch budget does not match calibrated budget")
+            if request.scheduler_context["request_control_step"] != request.observation_control_step:
+                raise ValueError("BSP prefetch request step must match its observation step")
         previous_submission = request.submitted_offset_ns
         previous_observation_step = request.observation_control_step
     if len(observed_bsp_budgets) > 1:
         raise ValueError("all BSP prefetch requests must record one calibrated budget")
+    for index, request in enumerate(request_records):
+        if request.disposition == "discarded_stale_phase":
+            if (
+                execution_mode != "bsp_spline_async"
+                or request.trigger != "bsp_prefetch"
+                or index + 1 >= len(request_records)
+                or request_records[index + 1].trigger != "bsp_stale_replan"
+            ):
+                raise ValueError("a stale BSP response must be followed by a blocking stale replan")
+        if request.trigger == "bsp_stale_replan":
+            if index == 0 or request_records[index - 1].disposition != "discarded_stale_phase":
+                raise ValueError("a BSP stale replan must immediately follow a discarded response")
+            previous = request_records[index - 1]
+            context = request.scheduler_context
+            if (
+                context["discarded_request_control_step"] != previous.observation_control_step
+                or context["discarded_activation_control_step"] != request.observation_control_step
+            ):
+                raise ValueError("BSP stale replan steps do not match the discarded request")
 
     requests_by_id = {request.request_id: request for request in request_records}
     latencies_by_id: Dict[int, LatencyEventV5] = {}
@@ -800,6 +898,8 @@ def validate_timing_events_v5(
         previous_request_end = latency.completed_offset_ns
         if request.disposition == "activated" and latency.outcome != "success":
             raise ValueError("activated request must have a successful latency")
+        if request.disposition == "discarded_stale_phase" and latency.outcome != "success":
+            raise ValueError("discarded stale response must have a successful latency")
         if request.disposition == "failed" and latency.outcome != "policy_failure":
             raise ValueError("failed request must have a policy_failure latency")
         if request.disposition == "failed" and index != len(request_records) - 1:
@@ -854,8 +954,24 @@ def validate_timing_events_v5(
                 expected_cursor = activation.control_step - request.observation_control_step
                 if cursor != expected_cursor or not 0 <= cursor <= 15:
                     raise ValueError("RTC immediate activation action_cursor is inconsistent")
-        elif activation.activation_context != {"curve_elapsed_ns": 0}:
-            raise ValueError("BSP activation requires curve_elapsed_ns zero")
+        else:
+            context = activation.activation_context
+            if set(context) != {
+                "request_control_step",
+                "activation_control_step",
+                "executed_prefix_steps",
+                "phase_offset_microindices",
+                "first_sample_microindices",
+                "remaining_curve_microindices",
+                "remaining_curve_ns",
+                "immediate_prefetch",
+            }:
+                raise ValueError("BSP activation requires phase-skip audit context")
+            if (
+                context["request_control_step"] != request.observation_control_step
+                or context["activation_control_step"] != activation.control_step
+            ):
+                raise ValueError("BSP activation steps do not match request and activation records")
         activations_by_request[activation.request_id] = activation
         previous_activation_offset = activation.activated_offset_ns
         previous_activation_step = activation.control_step
@@ -866,7 +982,7 @@ def validate_timing_events_v5(
         if request.disposition == "activated" and activation is None:
             raise ValueError("successful activated request must have exactly one plan activation")
         if request.disposition != "activated" and activation is not None:
-            raise ValueError("failed or abandoned request cannot activate a plan")
+            raise ValueError("discarded, failed, or abandoned request cannot activate a plan")
     first_activation = activations_by_request.get(0)
     if first_activation is not None and (
         first_activation.plan_id != 0 or first_activation.control_step != 0 or first_activation.activation != "initial"
@@ -906,11 +1022,25 @@ def validate_timing_events_v5(
         if latency is None:
             raise ValueError("underflow cannot belong to an abandoned request")
         activation = activations_by_request.get(underflow.request_id)
-        expected_end = (
-            activation.activated_offset_ns
-            if latency.outcome == "success" and activation is not None
-            else latency.completed_offset_ns
-        )
+        if request.disposition == "discarded_stale_phase":
+            stale_replan = requests_by_id.get(request.request_id + 1)
+            if stale_replan is None or stale_replan.trigger != "bsp_stale_replan":
+                raise ValueError("discarded underflow is missing its stale replan")
+            stale_latency = latencies_by_id.get(stale_replan.request_id)
+            stale_activation = activations_by_request.get(stale_replan.request_id)
+            if stale_latency is None:
+                raise ValueError("discarded underflow is missing the blocking replan outcome")
+            expected_end = (
+                stale_activation.activated_offset_ns
+                if stale_latency.outcome == "success" and stale_activation is not None
+                else stale_latency.completed_offset_ns
+            )
+        else:
+            expected_end = (
+                activation.activated_offset_ns
+                if latency.outcome == "success" and activation is not None
+                else latency.completed_offset_ns
+            )
         if underflow_end != expected_end:
             raise ValueError("underflow must end at activation or policy-failure completion")
         if activation is not None and activation.control_step != underflow.control_step:

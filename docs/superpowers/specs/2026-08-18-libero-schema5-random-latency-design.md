@@ -79,7 +79,11 @@ prefetch 时刻、延迟样本或时间对齐策略。
 
 BSP async 使用同一 400 ms 理论预算提前请求下一段曲线。结果及时可用时立即安装，
 推理 latency 不产生视频冻结；曲线耗尽但结果未到时才记录真实 underflow 和 stall。
-BSP 的 sidecar、曲线拟合、degree、origin rate、speedup 和解码保持不变。
+BSP 的 sidecar、曲线拟合、degree 与 `origin_hz=10` 身份保持不变。后续相位修复将正式
+执行协议冻结为 `bsp_spline_async_phase_skip_speedup2_v2`：推理时 `speedup=2`，20 Hz
+控制器每个已完成步骤推进一个 curve index；响应按请求至激活间真正完成的控制步跳过
+前段。有效短尾安装后立即再预取，完全过期的响应丢弃并用最新 observation 阻塞重规划。
+这一后续修复不改变 checkpoint、sidecar 或训练目标。
 
 ## 4. 配对正态延迟
 
@@ -197,8 +201,11 @@ Manifest 新增或冻结：
 - `baseline_async` 的执行参数与 policy protocol；
 - sampler 和 action-boundary-jump schema 版本。
 
-正式报告必须恰好接收三个 2000-episode run，且 code SHA、checkpoint step、dataset、seed、
-分布身份、控制/视频频率、suite/task/trial 协议一致。主要比较为：
+正式报告必须恰好接收三个 2000-episode run。`baseline_async` 与 `baseline_rtc` 必须保持
+相同 code SHA；相位修复后的 `bsp_spline_async` 可以使用新 code SHA，但必须使用
+`bsp_spline_async_phase_skip_speedup2_v2`，并在报告中显式记录跨 SHA 的协议升级来源。
+checkpoint step、dataset、seed、分布身份、控制/视频频率和 suite/task/trial 协议仍必须
+一致。主要比较为：
 
 - `baseline_async` 对 `baseline_rtc`：成功率、boundary jump、underflow、stall 和吞吐；
 - `bsp_spline_async` 对两种 Baseline：成功率、jump、延迟隐藏比例和吞吐；
@@ -256,17 +263,12 @@ BSP diagnostics 使用新 clean SHA 对现有 sidecar 做非破坏性 verify，�
 6. MP4、累计文字、帧数、时长、jump和audit回读；
 7. 新 SHA 的 BSP sidecar 非破坏性 verify。
 
-门禁完成后停止并向用户提交证据。不得自动启动小样本扫描或三个正式 2000-episode run；
-正式验收必须再次获得用户明确授权。
+门禁完成后停止并向用户提交证据。不得自动启动小样本扫描或正式 2000-episode run；
+修复后的 BSP 正式验收必须再次获得用户明确授权。
 
-## 11. 最终实验规模
+## 11. 相位修复后的最终实验规模
 
-在后续单独授权后，正式实验串行运行：
-
-```text
-baseline_async       2000 episodes
-baseline_rtc         2000 episodes
-bsp_spline_async     2000 episodes
-```
-
-一次最多一个 policy server 和一个 evaluator。三组完成后只读生成 schema-v5 三输入报告。
+`baseline_async` 和 `baseline_rtc` 的 2000-episode 结果已经保存，不重跑。在后续单独授权后，
+只运行修复后的 `bsp_spline_async` 2000 episodes。一次最多一个 policy server 和一个
+evaluator；完成后用两份 Baseline 归档结果和新 BSP 结果只读生成 schema-v5 三输入报告，
+并明确三者不是同一 code SHA 下的完整重跑。

@@ -65,9 +65,11 @@ _EXECUTION_PARAMETERS_BY_NAME = {
         "parameter_shape": [16, 8],
         "origin_hz": 10,
         "degree": 3,
-        "speedup": 1,
+        "speedup": 2,
+        "effective_curve_rate_hz": 20,
+        "control_freq_hz": 20,
         "alignment": "disabled_delta_eff",
-        "activation_policy": "immediate",
+        "activation_policy": "phase_skip_executed_prefix",
         "prefetch_comparison": "remaining_lte_budget",
     },
 }
@@ -75,7 +77,13 @@ _EXECUTION_PARAMETERS_BY_NAME = {
 _MODE_IDENTITIES = {
     "baseline_async": ("baseline", "baseline_async_h16_v1", 16, True, "baseline_async"),
     "baseline_rtc": ("baseline", "baseline_rtc_h16_v1", 16, True, "rtc"),
-    "bsp_spline_async": ("bsp", "bsp_spline_h8_v1", 8, True, "bsp"),
+    "bsp_spline_async": (
+        "bsp",
+        "bsp_spline_async_phase_skip_speedup2_v2",
+        8,
+        True,
+        "bsp",
+    ),
 }
 
 
@@ -133,6 +141,13 @@ def _require_nonbool_int(value: Any, *, label: str, minimum: Optional[int] = Non
     if minimum is not None and result < minimum:
         raise ValueError("{} must be at least {}".format(label, minimum))
     return result
+
+
+def _to_microindices(value: float) -> int:
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric < 0:
+        raise ValueError("spline phase must be finite and non-negative")
+    return int(round(numeric * 1_000_000))
 
 
 def _require_sha256(value: Any, *, label: str) -> str:
@@ -205,6 +220,7 @@ class RequestIntentV5:
             "baseline_async_launch",
             "rtc_launch",
             "bsp_prefetch",
+            "bsp_stale_replan",
         ):
             raise ValueError("Unsupported request trigger")
         if not isinstance(self.scheduler_context, Mapping):
@@ -226,6 +242,7 @@ class RequestIntentV5:
             "baseline_async_launch": "background",
             "rtc_launch": "background",
             "bsp_prefetch": "background",
+            "bsp_stale_replan": "blocking_replan",
         }[self.trigger]
         if self.dispatch != expected_dispatch:
             raise ValueError("request dispatch does not match its trigger")
@@ -239,11 +256,34 @@ class RequestIntentV5:
             delay = scheduler_context["d"]
             if not 8 <= start <= 16 or not 0 <= delay <= start or start + delay > 16:
                 raise ValueError("RTC launch context violates the action horizon")
-        else:
-            if set(scheduler_context) != {"remaining_plan_ns", "budget_ns"}:
-                raise ValueError("BSP prefetch context must contain exactly remaining time and budget")
+        elif self.trigger == "bsp_prefetch":
+            if set(scheduler_context) != {
+                "remaining_plan_ns",
+                "budget_ns",
+                "request_control_step",
+            }:
+                raise ValueError("BSP prefetch context must contain exactly remaining time, budget, and request step")
             if scheduler_context["remaining_plan_ns"] > scheduler_context["budget_ns"]:
                 raise ValueError("BSP prefetch remaining time must not exceed its budget")
+        else:
+            if set(scheduler_context) != {
+                "discarded_request_control_step",
+                "discarded_activation_control_step",
+                "executed_prefix_steps",
+                "phase_offset_microindices",
+                "curve_t_max_microindices",
+            }:
+                raise ValueError("BSP stale replan context must exactly identify the discarded response")
+            request_step = scheduler_context["discarded_request_control_step"]
+            activation_step = scheduler_context["discarded_activation_control_step"]
+            if (
+                activation_step < request_step
+                or scheduler_context["executed_prefix_steps"] != activation_step - request_step
+                or scheduler_context["phase_offset_microindices"]
+                != scheduler_context["executed_prefix_steps"] * 1_000_000
+                or scheduler_context["phase_offset_microindices"] <= scheduler_context["curve_t_max_microindices"]
+            ):
+                raise ValueError("BSP stale replan phase identity is inconsistent")
         object.__setattr__(self, "scheduler_context", scheduler_context)
         if not isinstance(self.request_overlay, Mapping):
             raise ValueError("request_overlay must be a mapping")
@@ -256,7 +296,12 @@ class ActivationDecisionV5:
     activation_context: Mapping[str, int]
 
     def __post_init__(self) -> None:
-        if self.activation not in ("initial", "blocking_replace", "immediate_swap"):
+        if self.activation not in (
+            "initial",
+            "blocking_replace",
+            "immediate_swap",
+            "discarded_stale_phase",
+        ):
             raise ValueError("Unsupported plan activation")
         if not isinstance(self.activation_context, Mapping):
             raise ValueError("activation_context must be a mapping")
@@ -273,11 +318,57 @@ class ActivationDecisionV5:
             }
         )
         if set(activation_context) == {"action_cursor"}:
-            if activation_context["action_cursor"] > 15:
+            if self.activation == "discarded_stale_phase" or activation_context["action_cursor"] > 15:
                 raise ValueError("native activation action_cursor must be in 0..15")
-        elif set(activation_context) == {"curve_elapsed_ns"}:
-            if activation_context["curve_elapsed_ns"] != 0:
-                raise ValueError("BSP activation curve_elapsed_ns must be zero")
+        elif set(activation_context) == {
+            "request_control_step",
+            "activation_control_step",
+            "executed_prefix_steps",
+            "phase_offset_microindices",
+            "first_sample_microindices",
+            "remaining_curve_microindices",
+            "remaining_curve_ns",
+            "immediate_prefetch",
+        }:
+            expected_remaining_ns = (
+                activation_context["remaining_curve_microindices"] * 1_000_000_000 + 20_000_000 - 1
+            ) // 20_000_000
+            if (
+                self.activation == "discarded_stale_phase"
+                or activation_context["activation_control_step"] < activation_context["request_control_step"]
+                or activation_context["executed_prefix_steps"]
+                != activation_context["activation_control_step"] - activation_context["request_control_step"]
+                or activation_context["phase_offset_microindices"]
+                != activation_context["executed_prefix_steps"] * 1_000_000
+                or activation_context["first_sample_microindices"] < activation_context["phase_offset_microindices"]
+                or activation_context["remaining_curve_ns"] != expected_remaining_ns
+                or activation_context["immediate_prefetch"]
+                != int(activation_context["remaining_curve_ns"] <= SCHEDULING_LATENCY_BUDGET_NS)
+            ):
+                raise ValueError("BSP phase-skip activation context is inconsistent")
+        elif set(activation_context) == {
+            "request_control_step",
+            "activation_control_step",
+            "executed_prefix_steps",
+            "phase_offset_microindices",
+            "first_sample_microindices",
+            "remaining_curve_microindices",
+            "remaining_curve_ns",
+            "curve_t_max_microindices",
+        }:
+            if (
+                self.activation != "discarded_stale_phase"
+                or activation_context["activation_control_step"] < activation_context["request_control_step"]
+                or activation_context["executed_prefix_steps"]
+                != activation_context["activation_control_step"] - activation_context["request_control_step"]
+                or activation_context["phase_offset_microindices"]
+                != activation_context["executed_prefix_steps"] * 1_000_000
+                or activation_context["first_sample_microindices"] != activation_context["phase_offset_microindices"]
+                or activation_context["phase_offset_microindices"] <= activation_context["curve_t_max_microindices"]
+                or activation_context["remaining_curve_microindices"] != 0
+                or activation_context["remaining_curve_ns"] != 0
+            ):
+                raise ValueError("only a stale response may use the discarded BSP context")
         else:
             raise ValueError("activation context must be exactly native or BSP")
         object.__setattr__(self, "activation_context", activation_context)
@@ -1220,7 +1311,7 @@ def validate_server_metadata(mode: ExecutionModeSpec, metadata: Mapping[str, Any
             "action_representation": "bsp",
             "model_action_horizon": 16,
             "model_action_dim": 32,
-            "supported_protocols": ["bsp_spline_h8_v1"],
+            "supported_protocols": ["bsp_spline_async_phase_skip_speedup2_v2"],
         }
     for field, expected_value in expected.items():
         actual = capabilities[field]
@@ -1621,6 +1712,7 @@ class ModeSchedulerV5:
         *,
         at_due: bool,
         request_in_flight: bool,
+        control_step: int = 0,
     ) -> Optional[RequestIntentV5]:
         raise NotImplementedError
 
@@ -1634,7 +1726,7 @@ class ModeSchedulerV5:
     ) -> ActivationDecisionV5:
         raise NotImplementedError
 
-    def take_action(self, now_ns: int) -> ActionDecisionV5:
+    def take_action(self, now_ns: int, *, control_step: int = 0) -> ActionDecisionV5:
         raise NotImplementedError
 
     def _reuse_pending(
@@ -1682,10 +1774,12 @@ class _BaselineAsyncScheduler(ModeSchedulerV5):
         *,
         at_due: bool,
         request_in_flight: bool,
+        control_step: int = 0,
     ) -> Optional[RequestIntentV5]:
         _require_nonbool_int(now_ns, label="now_ns", minimum=0)
         _require_bool(at_due, label="at_due")
         _require_bool(request_in_flight, label="request_in_flight")
+        _require_nonbool_int(control_step, label="control_step", minimum=0)
         pending = self._reuse_pending(request_in_flight=request_in_flight)
         if pending is not None or self._pending_intent is not None:
             return pending
@@ -1734,8 +1828,9 @@ class _BaselineAsyncScheduler(ModeSchedulerV5):
             activation_context={"action_cursor": self._plan.cursor},
         )
 
-    def take_action(self, now_ns: int) -> ActionDecisionV5:
+    def take_action(self, now_ns: int, *, control_step: int = 0) -> ActionDecisionV5:
         _require_nonbool_int(now_ns, label="now_ns", minimum=0)
+        _require_nonbool_int(control_step, label="control_step", minimum=0)
         if self._plan.state is rtc.RtcPlanState.EXHAUSTED:
             return ActionDecisionV5(action=None, underflow=True)
         return ActionDecisionV5(action=self._plan.consume_action(), underflow=False)
@@ -1759,10 +1854,12 @@ class _RtcScheduler(ModeSchedulerV5):
         *,
         at_due: bool,
         request_in_flight: bool,
+        control_step: int = 0,
     ) -> Optional[RequestIntentV5]:
         _require_nonbool_int(now_ns, label="now_ns", minimum=0)
         _require_bool(at_due, label="at_due")
         _require_bool(request_in_flight, label="request_in_flight")
+        _require_nonbool_int(control_step, label="control_step", minimum=0)
         pending = self._reuse_pending(request_in_flight=request_in_flight)
         if pending is not None or self._pending_intent is not None:
             return pending
@@ -1812,15 +1909,12 @@ class _RtcScheduler(ModeSchedulerV5):
             activation_context={"action_cursor": self._plan.cursor},
         )
 
-    def take_action(self, now_ns: int) -> ActionDecisionV5:
+    def take_action(self, now_ns: int, *, control_step: int = 0) -> ActionDecisionV5:
         _require_nonbool_int(now_ns, label="now_ns", minimum=0)
+        _require_nonbool_int(control_step, label="control_step", minimum=0)
         if self._plan.state is rtc.RtcPlanState.EXHAUSTED:
             return ActionDecisionV5(action=None, underflow=True)
         return ActionDecisionV5(action=self._plan.consume_action(), underflow=False)
-
-
-class BspBudgetError(RuntimeError):
-    """The calibrated prefetch budget cannot fit inside a returned curve."""
 
 
 class _BspScheduler(ModeSchedulerV5):
@@ -1830,9 +1924,20 @@ class _BspScheduler(ModeSchedulerV5):
         self.reset()
 
     def reset(self) -> None:
-        self._plan = bsp_spline.BspActionPlan()
+        self._plan = bsp_spline.BspControlActionPlan()
         self._installed_count = 0
         self._pending_intent = None
+        self._pending_request_control_step = None
+        self._stale_replan_context = None
+
+    def _set_bsp_pending(
+        self,
+        intent: RequestIntentV5,
+        *,
+        request_control_step: int,
+    ) -> RequestIntentV5:
+        self._pending_request_control_step = request_control_step
+        return self._set_pending(intent)
 
     def maybe_request(
         self,
@@ -1840,8 +1945,10 @@ class _BspScheduler(ModeSchedulerV5):
         *,
         at_due: bool,
         request_in_flight: bool,
+        control_step: int = 0,
     ) -> Optional[RequestIntentV5]:
-        now = _require_nonbool_int(now_ns, label="now_ns", minimum=0)
+        _require_nonbool_int(now_ns, label="now_ns", minimum=0)
+        step = _require_nonbool_int(control_step, label="control_step", minimum=0)
         _require_bool(at_due, label="at_due")
         _require_bool(request_in_flight, label="request_in_flight")
         pending = self._reuse_pending(request_in_flight=request_in_flight)
@@ -1849,44 +1956,58 @@ class _BspScheduler(ModeSchedulerV5):
             return pending
         if request_in_flight:
             return None
+        if self._stale_replan_context is not None:
+            return self._set_bsp_pending(
+                RequestIntentV5(
+                    dispatch="blocking_replan",
+                    trigger="bsp_stale_replan",
+                    scheduler_context=self._stale_replan_context,
+                    request_overlay={},
+                ),
+                request_control_step=step,
+            )
         if self._plan.spline is None:
-            return self._set_pending(
+            return self._set_bsp_pending(
                 RequestIntentV5(
                     dispatch="blocking_initial",
                     trigger="initial_plan",
                     scheduler_context={},
                     request_overlay={},
-                )
+                ),
+                request_control_step=step,
             )
         if self._asynchronous:
             if self._budget_ns is None:
                 raise AssertionError("asynchronous BSP scheduler is missing its budget")
-            decision = self._plan.prefetch_decision(now, lead_time_ns=self._budget_ns)
+            decision = self._plan.prefetch_decision(step, lead_time_ns=self._budget_ns)
             if not decision.should_prefetch:
                 return None
-            return self._set_pending(
+            return self._set_bsp_pending(
                 RequestIntentV5(
                     dispatch="background",
                     trigger="bsp_prefetch",
                     scheduler_context={
                         "remaining_plan_ns": decision.remaining_time_ns,
                         "budget_ns": self._budget_ns,
+                        "request_control_step": step,
                     },
                     request_overlay={},
-                )
+                ),
+                request_control_step=step,
             )
         if not at_due:
             return None
-        sample = self._plan.sample(now)
+        sample = self._plan.sample(step)
         if not sample.underflow:
             return None
-        return self._set_pending(
+        return self._set_bsp_pending(
             RequestIntentV5(
                 dispatch="blocking_replan",
                 trigger="bsp_curve_exhausted",
                 scheduler_context={},
                 request_overlay={},
-            )
+            ),
+            request_control_step=step,
         )
 
     def install_response(
@@ -1897,34 +2018,78 @@ class _BspScheduler(ModeSchedulerV5):
         now_ns: int,
         control_step: int,
     ) -> ActivationDecisionV5:
-        now, _ = _validate_install_inputs(intent, now_ns=now_ns, control_step=control_step)
+        _, step = _validate_install_inputs(intent, now_ns=now_ns, control_step=control_step)
         self._require_pending(intent)
+        if self._pending_request_control_step is None:
+            raise RuntimeError("BSP scheduler is missing its request control step")
         validate_bsp_response(response)
-        candidate_plan = bsp_spline.BspActionPlan()
-        candidate_plan.install(response["bsp"], activation_time_ns=now)
-        if self._asynchronous:
-            if self._budget_ns is None:
-                raise AssertionError("asynchronous BSP scheduler is missing its budget")
-            usable_duration_ns = candidate_plan.remaining_time_ns(now)
-            if self._budget_ns >= usable_duration_ns:
-                raise BspBudgetError("BSP prefetch budget must be smaller than the curve usable duration")
-        self._plan.install(response["bsp"], activation_time_ns=now)
+        request_step = self._pending_request_control_step
+        installed = self._plan.install(
+            response["bsp"],
+            request_control_step=request_step,
+            activation_control_step=step,
+            control_freq_hz=20,
+        )
+        phase_microindices = _to_microindices(installed.phase_offset_indices)
+        first_microindices = _to_microindices(installed.first_sample_time)
+        curve_t_max_microindices = _to_microindices(bsp_spline.BspSpline.from_response(response["bsp"]).t_max)
+        remaining_microindices = max(0, curve_t_max_microindices - phase_microindices)
+        if installed.stale:
+            self._complete_pending()
+            self._pending_request_control_step = None
+            self._stale_replan_context = {
+                "discarded_request_control_step": request_step,
+                "discarded_activation_control_step": step,
+                "executed_prefix_steps": installed.executed_prefix_steps,
+                "phase_offset_microindices": phase_microindices,
+                "curve_t_max_microindices": curve_t_max_microindices,
+            }
+            return ActivationDecisionV5(
+                activation="discarded_stale_phase",
+                activation_context={
+                    "request_control_step": request_step,
+                    "activation_control_step": step,
+                    "executed_prefix_steps": installed.executed_prefix_steps,
+                    "phase_offset_microindices": phase_microindices,
+                    "first_sample_microindices": first_microindices,
+                    "remaining_curve_microindices": 0,
+                    "remaining_curve_ns": 0,
+                    "curve_t_max_microindices": curve_t_max_microindices,
+                },
+            )
         if self._installed_count == 0:
             activation = "initial"
+        elif intent.dispatch == "blocking_replan":
+            activation = "blocking_replace"
         elif self._asynchronous:
             activation = "immediate_swap"
         else:
             activation = "blocking_replace"
         self._installed_count += 1
         self._complete_pending()
+        self._pending_request_control_step = None
+        self._stale_replan_context = None
+        immediate_prefetch = int(
+            self._asynchronous and self._budget_ns is not None and installed.remaining_time_ns <= self._budget_ns
+        )
         return ActivationDecisionV5(
             activation=activation,
-            activation_context={"curve_elapsed_ns": 0},
+            activation_context={
+                "request_control_step": request_step,
+                "activation_control_step": step,
+                "executed_prefix_steps": installed.executed_prefix_steps,
+                "phase_offset_microindices": phase_microindices,
+                "first_sample_microindices": first_microindices,
+                "remaining_curve_microindices": remaining_microindices,
+                "remaining_curve_ns": installed.remaining_time_ns,
+                "immediate_prefetch": immediate_prefetch,
+            },
         )
 
-    def take_action(self, now_ns: int) -> ActionDecisionV5:
-        now = _require_nonbool_int(now_ns, label="now_ns", minimum=0)
-        sample = self._plan.sample(now)
+    def take_action(self, now_ns: int, *, control_step: int = 0) -> ActionDecisionV5:
+        _require_nonbool_int(now_ns, label="now_ns", minimum=0)
+        step = _require_nonbool_int(control_step, label="control_step", minimum=0)
+        sample = self._plan.sample(step)
         if sample.underflow:
             return ActionDecisionV5(action=None, underflow=True)
         return ActionDecisionV5(action=sample.action, underflow=False)

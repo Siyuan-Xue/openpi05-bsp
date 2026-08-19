@@ -68,7 +68,6 @@ _ROLLOUT_MANIFEST_FIELDS = (
     "theoretical_p95_latency_ns",
     "scheduling_latency_budget_ns",
     "scheduling_delay_ticks",
-    "code_sha",
     "dataset_revision",
     "container_digest",
     "train_seed",
@@ -821,6 +820,18 @@ def compare_checkpoint_v5(
             ordered["bsp_spline_async"],
         ),
     }
+    code_sha_by_mode = {mode: classified[mode]["code_sha"] for mode in EXECUTION_MODE_ORDER_V5}
+    same_binary_all_modes = len(set(code_sha_by_mode.values())) == 1
+    cross_code_provenance = {
+        "same_binary_all_modes": same_binary_all_modes,
+        "baseline_pair_same_binary": (code_sha_by_mode["baseline_async"] == code_sha_by_mode["baseline_rtc"]),
+        "bsp_protocol_upgrade": classified["bsp_spline_async"]["policy_protocol"],
+        "interpretation": (
+            "All three modes were evaluated from one code SHA"
+            if same_binary_all_modes
+            else "BSP phase-fix rerun compared with archived baseline async/RTC results"
+        ),
+    }
     return {
         "schema_version": 5,
         "checkpoint_step": next(iter(classified.values()))["checkpoint_step"],
@@ -829,6 +840,8 @@ def compare_checkpoint_v5(
         "scheduling_latency_budget_ns": next(iter(classified.values()))["scheduling_latency_budget_ns"],
         "scheduling_delay_ticks": next(iter(classified.values()))["scheduling_delay_ticks"],
         "success_rates": success_rates,
+        "code_sha_by_mode": code_sha_by_mode,
+        "cross_code_provenance": cross_code_provenance,
         "primary_paired_deltas": primary_deltas,
         "diagnostics": {
             mode: _latency_diagnostics(ordered[mode].records, classified[mode]) for mode in EXECUTION_MODE_ORDER_V5
@@ -836,6 +849,8 @@ def compare_checkpoint_v5(
         "inputs": {
             mode: {
                 "run_directory": str(ordered[mode].path),
+                "code_sha": classified[mode]["code_sha"],
+                "policy_protocol": classified[mode]["policy_protocol"],
                 "file_sha256": dict(sorted(ordered[mode].file_sha256.items())),
             }
             for mode in EXECUTION_MODE_ORDER_V5
@@ -856,6 +871,11 @@ def _render_report_v5(comparison: Mapping[str, Any]) -> str:
             distribution["seed"],
             distribution["sampler_version"],
         ),
+        "",
+        "Code SHA by mode: `{}`.".format(
+            ", ".join("{}={}".format(mode, comparison["code_sha_by_mode"][mode]) for mode in EXECUTION_MODE_ORDER_V5)
+        ),
+        comparison["cross_code_provenance"]["interpretation"] + ".",
         "",
         "| mode | macro success rate |",
         "|---|---:|",
@@ -977,6 +997,8 @@ def write_three_mode_report_v5(
             "theoretical_p95_latency_ns": comparison["theoretical_p95_latency_ns"],
             "scheduling_latency_budget_ns": comparison["scheduling_latency_budget_ns"],
             "scheduling_delay_ticks": comparison["scheduling_delay_ticks"],
+            "code_sha_by_mode": comparison["code_sha_by_mode"],
+            "cross_code_provenance": comparison["cross_code_provenance"],
             "primary_deltas": [
                 "baseline_rtc_minus_baseline_async",
                 "bsp_spline_async_minus_baseline_async",

@@ -285,6 +285,33 @@ class _AttemptLedgerV5:
             raise _eval.PolicyFailure("two control stalls require different frames at one step")
         self.stall_source_frames[control_step] = frame
 
+    def extend_discarded_underflow_to(
+        self,
+        *,
+        discarded_request_id: int,
+        submitted_ns: int,
+    ) -> None:
+        """Extend the continuous stale-response underflow to an exact time."""
+        if not self.underflows or not self.stalls:
+            raise _eval.PolicyFailure("stale replan is missing its preceding action underflow")
+        underflow = self.underflows[-1]
+        stall = self.stalls[-1]
+        if (
+            underflow.request_id != discarded_request_id
+            or stall.request_id != discarded_request_id
+            or stall.reason != _timing.STALL_REASON_ASYNC_ACTION_UNDERFLOW
+            or stall.started_offset_ns != underflow.started_offset_ns
+            or stall.duration_ns != underflow.duration_ns
+        ):
+            raise _eval.PolicyFailure("stale replan does not follow its action underflow")
+        submitted_offset_ns = self.offset(submitted_ns)
+        existing_end_ns = underflow.started_offset_ns + underflow.duration_ns
+        if submitted_offset_ns < existing_end_ns:
+            raise _eval.PolicyFailure("stale replan submission precedes its response handoff")
+        duration_ns = submitted_offset_ns - underflow.started_offset_ns
+        self.underflows[-1] = dataclasses.replace(underflow, duration_ns=duration_ns)
+        self.stalls[-1] = dataclasses.replace(stall, duration_ns=duration_ns)
+
     def record_activation(self, activation: _timing.PlanActivationV5) -> None:
         self.activations.append(activation)
         if activation.plan_id > 0:
@@ -770,7 +797,12 @@ def _complete_request_v5(
                 sampled_target_latency_ns=sampled_target_latency_ns,
             )
         )
-        if pending.trace.intent.dispatch.startswith("blocking"):
+        if pending.trace.intent.trigger == "bsp_stale_replan":
+            ledger.extend_discarded_underflow_to(
+                discarded_request_id=pending.trace.request_id - 1,
+                submitted_ns=completed_ns,
+            )
+        elif pending.trace.intent.dispatch.startswith("blocking"):
             _append_blocking_stall_v5(
                 pending=pending,
                 ledger=ledger,
@@ -813,7 +845,12 @@ def _complete_request_v5(
                 sampled_target_latency_ns=sampled_target_latency_ns,
             )
         )
-        if pending.trace.intent.dispatch.startswith("blocking"):
+        if pending.trace.intent.trigger == "bsp_stale_replan":
+            ledger.extend_discarded_underflow_to(
+                discarded_request_id=pending.trace.request_id - 1,
+                submitted_ns=completed_ns,
+            )
+        elif pending.trace.intent.dispatch.startswith("blocking"):
             _append_blocking_stall_v5(
                 pending=pending,
                 ledger=ledger,
@@ -845,7 +882,12 @@ def _complete_request_v5(
             sampled_target_latency_ns=sampled_target_latency_ns,
         )
     )
-    if pending.trace.intent.dispatch.startswith("blocking"):
+    if pending.trace.intent.trigger == "bsp_stale_replan":
+        ledger.extend_discarded_underflow_to(
+            discarded_request_id=pending.trace.request_id - 1,
+            submitted_ns=activation_now_ns,
+        )
+    elif pending.trace.intent.dispatch.startswith("blocking"):
         _append_blocking_stall_v5(
             pending=pending,
             ledger=ledger,
@@ -853,6 +895,16 @@ def _complete_request_v5(
             completed_ns=completed_ns,
             due_ns=blocking_due_ns,
         )
+    if activation.activation == "discarded_stale_phase":
+        pending.trace.disposition = "discarded_stale_phase"
+        if underflow_started_ns is not None:
+            _append_underflow_v5(
+                pending=pending,
+                ledger=ledger,
+                started_ns=underflow_started_ns,
+                ended_ns=activation_now_ns,
+            )
+        return None
     ledger.record_activation(
         _timing.PlanActivationV5(
             plan_id=len(ledger.activations),
@@ -940,6 +992,7 @@ def _attempt_request_v5(
             now_ns,
             at_due=at_due,
             request_in_flight=pending_slot.owns_job,
+            control_step=ledger.steps,
         )
     except Exception as error:
         return _return_policy_failure_v5(
@@ -970,6 +1023,11 @@ def _attempt_request_v5(
             ledger=ledger,
             pending_slot=pending_slot,
         )
+        if intent.trigger == "bsp_stale_replan":
+            ledger.extend_discarded_underflow_to(
+                discarded_request_id=pending.trace.request_id - 1,
+                submitted_ns=pending.job.submitted_monotonic_ns,
+            )
     except _eval.PolicyFailure as error:
         return _return_policy_failure_v5(
             error,
@@ -1135,7 +1193,10 @@ def _run_attempt_v5(
                 return result
 
             try:
-                action_decision = scheduler.take_action(_require_nonnegative_clock(clock))
+                action_decision = scheduler.take_action(
+                    _require_nonnegative_clock(clock),
+                    control_step=ledger.steps,
+                )
             except Exception as error:
                 return _return_policy_failure_v5(
                     error,
@@ -1173,8 +1234,30 @@ def _run_attempt_v5(
                 pending_slot.clear()
                 if result is not None:
                     return result
+                if mode.name == "bsp_spline_async":
+                    result = _attempt_request_v5(
+                        now_ns=_require_nonnegative_clock(clock),
+                        at_due=True,
+                        prepared_observation=prepared_observation,
+                        source_frame=image,
+                        pending_slot=pending_slot,
+                        worker=worker,
+                        scheduler=scheduler,
+                        ledger=ledger,
+                        mode=mode,
+                        expected_server_metadata_fingerprint=expected_server_metadata_fingerprint,
+                        pacer=pacer,
+                        clock=clock,
+                        inference_timeout_s=args.inference_timeout_s,
+                        cleanup_timeout_s=args.connection_timeout_s,
+                    )
+                    if result is not None:
+                        return result
                 try:
-                    action_decision = scheduler.take_action(_require_nonnegative_clock(clock))
+                    action_decision = scheduler.take_action(
+                        _require_nonnegative_clock(clock),
+                        control_step=ledger.steps,
+                    )
                 except Exception as error:
                     return _return_policy_failure_v5(
                         error,

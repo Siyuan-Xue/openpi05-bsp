@@ -19,7 +19,7 @@ _SCHEMA_FIELDS = {
 _SCHEMA_VERSION = 1
 _ORIGIN_HZ = 10
 _DEGREE = 3
-_SPEEDUP = 1
+_SPEEDUP = 2
 _ALIGNMENT = "disabled_delta_eff"
 _PARAMETER_SHAPE = (16, 8)
 _ACTION_DIM = 7
@@ -35,6 +35,12 @@ def _require_exact_integer(value: Any, *, name: str, expected: int) -> int:
 
 
 def _require_nonnegative_ns(value: Any, *, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("{} must be a non-negative integer".format(name))
+    return value
+
+
+def _require_nonnegative_integer(value: Any, *, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError("{} must be a non-negative integer".format(name))
     return value
@@ -67,12 +73,8 @@ class BspSpline:
         if set(bsp_mapping) != _SCHEMA_FIELDS:
             raise ValueError("BSP response fields must exactly match schema version 1")
 
-        _require_exact_integer(
-            bsp_mapping["schema_version"], name="schema_version", expected=_SCHEMA_VERSION
-        )
-        origin_hz = _require_exact_integer(
-            bsp_mapping["origin_hz"], name="origin_hz", expected=_ORIGIN_HZ
-        )
+        _require_exact_integer(bsp_mapping["schema_version"], name="schema_version", expected=_SCHEMA_VERSION)
+        origin_hz = _require_exact_integer(bsp_mapping["origin_hz"], name="origin_hz", expected=_ORIGIN_HZ)
         degree = _require_exact_integer(bsp_mapping["degree"], name="degree", expected=_DEGREE)
         speedup = _require_exact_integer(bsp_mapping["speedup"], name="speedup", expected=_SPEEDUP)
         alignment = bsp_mapping["alignment"]
@@ -151,16 +153,12 @@ class BspSpline:
         for recurrence in range(1, self.degree + 1):
             for local_index in range(self.degree, recurrence - 1, -1):
                 knot_index = span - self.degree + local_index
-                denominator = (
-                    self.knots[knot_index + self.degree - recurrence + 1] - self.knots[knot_index]
-                )
+                denominator = self.knots[knot_index + self.degree - recurrence + 1] - self.knots[knot_index]
                 if denominator == 0.0:
                     alpha = 0.0
                 else:
                     alpha = (value - self.knots[knot_index]) / denominator
-                values[local_index] = (
-                    (1.0 - alpha) * values[local_index - 1] + alpha * values[local_index]
-                )
+                values[local_index] = (1.0 - alpha) * values[local_index - 1] + alpha * values[local_index]
         return values[self.degree]
 
 
@@ -281,3 +279,195 @@ class BspActionPlan:
         if now_ns < activation_time_ns:
             raise ValueError("now_ns must not precede activation_time_ns")
         return now_ns - activation_time_ns
+
+
+@dataclasses.dataclass(frozen=True)
+class BspControlInstallDecision:
+    """Auditable result of installing or rejecting a control-step-aligned curve."""
+
+    stale: bool
+    executed_prefix_steps: int
+    phase_offset_indices: float
+    first_sample_time: float
+    remaining_time_ns: int
+
+
+class BspControlActionPlan:
+    """Own a curve whose phase advances only after completed control steps.
+
+    Request latency, underflow waiting, and video encoding never advance this
+    plan.  A replacement curve starts at the phase corresponding to the number
+    of control steps that completed while its request was in flight.
+    """
+
+    def __init__(self) -> None:
+        self._spline = None  # type: Optional[BspSpline]
+        self._activation_control_step = None  # type: Optional[int]
+        self._phase_offset_indices = None  # type: Optional[float]
+        self._control_freq_hz = None  # type: Optional[int]
+        self._high_water_control_step = None  # type: Optional[int]
+
+    @property
+    def spline(self) -> Optional[BspSpline]:
+        return self._spline
+
+    @property
+    def activation_control_step(self) -> Optional[int]:
+        return self._activation_control_step
+
+    def install(
+        self,
+        bsp_mapping: Mapping,
+        *,
+        request_control_step: int,
+        activation_control_step: int,
+        control_freq_hz: int,
+    ) -> BspControlInstallDecision:
+        """Install a candidate at its elapsed-prefix phase, unless fully stale."""
+        request_step = _require_nonnegative_integer(
+            request_control_step,
+            name="request_control_step",
+        )
+        activation_step = _require_nonnegative_integer(
+            activation_control_step,
+            name="activation_control_step",
+        )
+        control_hz = _require_exact_integer(
+            control_freq_hz,
+            name="control_freq_hz",
+            expected=20,
+        )
+        if activation_step < request_step:
+            raise ValueError("activation_control_step must not precede request_control_step")
+        self._require_at_or_after_high_water(activation_step, name="activation_control_step")
+
+        candidate = BspSpline.from_response(bsp_mapping)
+        executed_prefix_steps = activation_step - request_step
+        phase_offset = executed_prefix_steps * candidate.origin_hz * candidate.speedup / control_hz
+        first_sample_time = max(candidate.t_min, phase_offset)
+        stale = phase_offset > candidate.t_max
+        remaining_time_ns = self._remaining_from_phase_ns(phase_offset, candidate)
+        decision = BspControlInstallDecision(
+            stale=stale,
+            executed_prefix_steps=executed_prefix_steps,
+            phase_offset_indices=phase_offset,
+            first_sample_time=first_sample_time,
+            remaining_time_ns=remaining_time_ns,
+        )
+        if stale:
+            return decision
+
+        self._spline = candidate
+        self._activation_control_step = activation_step
+        self._phase_offset_indices = phase_offset
+        self._control_freq_hz = control_hz
+        self._high_water_control_step = activation_step
+        return decision
+
+    def sample(self, control_step: int) -> BspPlanSample:
+        """Sample the phase reached by completed env.step calls."""
+        step = _require_nonnegative_integer(control_step, name="control_step")
+        spline, activation_step, phase_offset, control_hz = self._require_active()
+        self._require_observation_step(step, activation_step)
+        spline_time = self._phase_at_step(
+            step,
+            spline=spline,
+            activation_control_step=activation_step,
+            phase_offset_indices=phase_offset,
+            control_freq_hz=control_hz,
+        )
+        if spline_time > spline.t_max:
+            result = BspPlanSample(action=None, spline_time=spline_time, underflow=True)
+        else:
+            evaluation_time = max(spline.t_min, spline_time)
+            result = BspPlanSample(
+                action=spline.evaluate(evaluation_time),
+                spline_time=evaluation_time,
+                underflow=False,
+            )
+        self._high_water_control_step = step
+        return result
+
+    def remaining_time_ns(self, control_step: int) -> int:
+        """Return remaining curve wall-clock time at the completed-step phase."""
+        step = _require_nonnegative_integer(control_step, name="control_step")
+        spline, activation_step, phase_offset, control_hz = self._require_active()
+        self._require_observation_step(step, activation_step)
+        phase = self._phase_at_step(
+            step,
+            spline=spline,
+            activation_control_step=activation_step,
+            phase_offset_indices=phase_offset,
+            control_freq_hz=control_hz,
+        )
+        result = self._remaining_from_phase_ns(phase, spline)
+        self._high_water_control_step = step
+        return result
+
+    def prefetch_decision(
+        self,
+        control_step: int,
+        *,
+        lead_time_ns: int,
+    ) -> BspPrefetchDecision:
+        """Compare remaining curve time against a caller-owned lead time."""
+        step = _require_nonnegative_integer(control_step, name="control_step")
+        lead = _require_nonnegative_ns(lead_time_ns, name="lead_time_ns")
+        spline, activation_step, phase_offset, control_hz = self._require_active()
+        self._require_observation_step(step, activation_step)
+        phase = self._phase_at_step(
+            step,
+            spline=spline,
+            activation_control_step=activation_step,
+            phase_offset_indices=phase_offset,
+            control_freq_hz=control_hz,
+        )
+        remaining = self._remaining_from_phase_ns(phase, spline)
+        result = BspPrefetchDecision(
+            remaining_time_ns=remaining,
+            should_prefetch=remaining <= lead,
+            underflow=phase > spline.t_max,
+        )
+        self._high_water_control_step = step
+        return result
+
+    def _require_active(self):
+        if (
+            self._spline is None
+            or self._activation_control_step is None
+            or self._phase_offset_indices is None
+            or self._control_freq_hz is None
+        ):
+            raise RuntimeError("BSP control action plan has no installed curve")
+        return (
+            self._spline,
+            self._activation_control_step,
+            self._phase_offset_indices,
+            self._control_freq_hz,
+        )
+
+    def _require_observation_step(self, step: int, activation_step: int) -> None:
+        if step < activation_step:
+            raise ValueError("control_step must not precede activation_control_step")
+        self._require_at_or_after_high_water(step, name="control_step")
+
+    def _require_at_or_after_high_water(self, step: int, *, name: str) -> None:
+        if self._high_water_control_step is not None and step < self._high_water_control_step:
+            raise ValueError("{} must not precede the observed high-water control_step".format(name))
+
+    @staticmethod
+    def _phase_at_step(
+        step: int,
+        *,
+        spline: BspSpline,
+        activation_control_step: int,
+        phase_offset_indices: float,
+        control_freq_hz: int,
+    ) -> float:
+        completed_since_activation = step - activation_control_step
+        return phase_offset_indices + completed_since_activation * spline.origin_hz * spline.speedup / control_freq_hz
+
+    @staticmethod
+    def _remaining_from_phase_ns(phase: float, spline: BspSpline) -> int:
+        remaining_indices = max(0.0, spline.t_max - phase)
+        return int(math.ceil(remaining_indices * _NANOSECONDS_PER_SECOND / (spline.origin_hz * spline.speedup)))

@@ -57,7 +57,7 @@ def _bsp_metadata(extra=None):
             "action_representation": "bsp",
             "model_action_horizon": 16,
             "model_action_dim": 32,
-            "supported_protocols": ["bsp_spline_h8_v1"],
+            "supported_protocols": ["bsp_spline_async_phase_skip_speedup2_v2"],
         },
     }
     if extra is not None:
@@ -88,7 +88,7 @@ def _bsp_sidecar(duration_ticks=9, value=1.0):
         "parameters": parameters,
         "origin_hz": 10,
         "degree": 3,
-        "speedup": 1,
+        "speedup": 2,
         "alignment": "disabled_delta_eff",
     }
 
@@ -316,9 +316,11 @@ def test_frozen_execution_modes_emit_only_the_exact_protocol_parameters():
         "parameter_shape": [16, 8],
         "origin_hz": 10,
         "degree": 3,
-        "speedup": 1,
+        "speedup": 2,
+        "effective_curve_rate_hz": 20,
+        "control_freq_hz": 20,
         "alignment": "disabled_delta_eff",
-        "activation_policy": "immediate",
+        "activation_policy": "phase_skip_executed_prefix",
         "prefetch_comparison": "remaining_lte_budget",
     }
     with pytest.raises(TypeError):
@@ -408,6 +410,7 @@ def test_request_intents_reject_dispatch_trigger_and_exact_context_mismatches(fa
         {},
         {"action_cursor": 16},
         {"curve_elapsed_ns": 1},
+        {"curve_elapsed_ns": 0},
         {"action_cursor": 0, "curve_elapsed_ns": 0},
         {"unexpected": 0},
     ],
@@ -467,70 +470,214 @@ def test_rtc_adapter_uses_plan_launch_gates_q_install_and_nonadvancing_underflow
     )
 
 
-def test_bsp_async_launches_on_budget_equality_and_immediately_restarts_curve_clock():
+def test_bsp_async_launches_on_budget_equality_and_skips_the_executed_prefix():
     scheduler = control.make_scheduler_v5(
         control.EXECUTION_MODES["bsp_spline_async"],
         _schema5_calibration("bsp_spline_async"),
     )
-    initial = scheduler.maybe_request(0, at_due=True, request_in_flight=False)
+    initial = scheduler.maybe_request(0, control_step=0, at_due=True, request_in_flight=False)
     scheduler.install_response(initial, _bsp_response(), now_ns=0, control_step=0)
 
-    assert scheduler.maybe_request(499_999_999, at_due=False, request_in_flight=False) is None
-    prefetch = scheduler.maybe_request(500_000_000, at_due=True, request_in_flight=False)
+    assert (
+        scheduler.maybe_request(
+            49_999_999,
+            control_step=0,
+            at_due=False,
+            request_in_flight=False,
+        )
+        is None
+    )
+    prefetch = scheduler.maybe_request(
+        50_000_000,
+        control_step=1,
+        at_due=True,
+        request_in_flight=False,
+    )
     assert prefetch.dispatch == "background"
     assert prefetch.trigger == "bsp_prefetch"
     assert dict(prefetch.scheduler_context) == {
         "remaining_plan_ns": 400_000_000,
         "budget_ns": 400_000_000,
+        "request_control_step": 1,
     }
 
     activation = scheduler.install_response(
         prefetch,
         _bsp_response(value=7),
-        now_ns=525_000_000,
-        control_step=11,
+        now_ns=75_000_000,
+        control_step=7,
     )
     assert activation.activation == "immediate_swap"
-    assert dict(activation.activation_context) == {"curve_elapsed_ns": 0}
+    assert activation.activation_context["executed_prefix_steps"] == 6
+    assert activation.activation_context["first_sample_microindices"] == 6_000_000
     np.testing.assert_array_equal(
-        scheduler.take_action(525_000_000).action,
+        scheduler.take_action(75_000_000, control_step=7).action,
         np.full(7, 7, dtype=np.float32),
     )
 
 
-def test_bsp_async_rejects_budget_equal_to_a_new_curves_usable_duration():
+def test_bsp_async_accepts_a_curve_shorter_than_the_budget_and_immediately_prefetches():
     scheduler = control.make_scheduler_v5(
         control.EXECUTION_MODES["bsp_spline_async"],
         _schema5_calibration("bsp_spline_async"),
     )
-    initial = scheduler.maybe_request(0, at_due=True, request_in_flight=False)
-
-    with pytest.raises(control.BspBudgetError, match="usable"):
-        scheduler.install_response(
-            initial,
-            _bsp_response(duration_ticks=4),
-            now_ns=0,
+    initial = scheduler.maybe_request(0, control_step=0, at_due=True, request_in_flight=False)
+    activation = scheduler.install_response(
+        initial,
+        _bsp_response(duration_ticks=4),
+        now_ns=0,
+        control_step=0,
+    )
+    assert activation.activation_context["remaining_curve_ns"] == 200_000_000
+    assert activation.activation_context["immediate_prefetch"] == 1
+    assert (
+        scheduler.maybe_request(
+            1,
             control_step=0,
-        )
+            at_due=False,
+            request_in_flight=False,
+        ).trigger
+        == "bsp_prefetch"
+    )
 
     later = control.make_scheduler_v5(
         control.EXECUTION_MODES["bsp_spline_async"],
         _schema5_calibration("bsp_spline_async"),
     )
-    first = later.maybe_request(0, at_due=True, request_in_flight=False)
+    first = later.maybe_request(0, control_step=0, at_due=True, request_in_flight=False)
     later.install_response(first, _bsp_response(value=3), now_ns=0, control_step=0)
-    prefetch = later.maybe_request(500_000_000, at_due=True, request_in_flight=False)
-    with pytest.raises(control.BspBudgetError, match="usable"):
-        later.install_response(
-            prefetch,
-            _bsp_response(duration_ticks=4, value=9),
-            now_ns=525_000_000,
-            control_step=11,
-        )
-    np.testing.assert_array_equal(
-        later.take_action(525_000_000).action,
-        np.full(7, 3, dtype=np.float32),
+    prefetch = later.maybe_request(
+        50_000_000,
+        control_step=1,
+        at_due=True,
+        request_in_flight=False,
     )
+    replacement = later.install_response(
+        prefetch,
+        _bsp_response(duration_ticks=4, value=9),
+        now_ns=75_000_000,
+        control_step=3,
+    )
+    assert replacement.activation_context["remaining_curve_ns"] == 100_000_000
+    assert replacement.activation_context["immediate_prefetch"] == 1
+    np.testing.assert_array_equal(
+        later.take_action(75_000_000, control_step=3).action,
+        np.full(7, 9, dtype=np.float32),
+    )
+
+
+def test_bsp_async_uses_control_steps_to_skip_elapsed_prefix_and_immediately_prefetches_short_tail():
+    scheduler = control.make_scheduler_v5(
+        control.EXECUTION_MODES["bsp_spline_async"],
+        _schema5_calibration("bsp_spline_async"),
+    )
+    initial = scheduler.maybe_request(
+        0,
+        control_step=0,
+        at_due=True,
+        request_in_flight=False,
+    )
+    first_activation = scheduler.install_response(initial, _bsp_response(), now_ns=1, control_step=0)
+    assert first_activation.activation == "initial"
+    assert not scheduler.take_action(2, control_step=0).underflow
+
+    prefetch = scheduler.maybe_request(
+        10_000_000_000,
+        control_step=1,
+        at_due=True,
+        request_in_flight=False,
+    )
+    assert prefetch.trigger == "bsp_prefetch"
+    assert dict(prefetch.scheduler_context) == {
+        "remaining_plan_ns": 400_000_000,
+        "budget_ns": 400_000_000,
+        "request_control_step": 1,
+    }
+
+    activation = scheduler.install_response(
+        prefetch,
+        _bsp_response(value=7),
+        now_ns=20_000_000_000,
+        control_step=7,
+    )
+    assert activation.activation == "immediate_swap"
+    assert dict(activation.activation_context) == {
+        "request_control_step": 1,
+        "activation_control_step": 7,
+        "executed_prefix_steps": 6,
+        "phase_offset_microindices": 6_000_000,
+        "first_sample_microindices": 6_000_000,
+        "remaining_curve_microindices": 3_000_000,
+        "remaining_curve_ns": 150_000_000,
+        "immediate_prefetch": 1,
+    }
+    np.testing.assert_array_equal(
+        scheduler.take_action(30_000_000_000, control_step=7).action,
+        np.full(7, 7, dtype=np.float32),
+    )
+    immediate = scheduler.maybe_request(
+        40_000_000_000,
+        control_step=7,
+        at_due=False,
+        request_in_flight=False,
+    )
+    assert immediate.trigger == "bsp_prefetch"
+    assert immediate.scheduler_context["remaining_plan_ns"] == 150_000_000
+
+
+def test_bsp_async_discards_expired_response_and_requires_latest_observation_blocking_replan():
+    scheduler = control.make_scheduler_v5(
+        control.EXECUTION_MODES["bsp_spline_async"],
+        _schema5_calibration("bsp_spline_async"),
+    )
+    initial = scheduler.maybe_request(0, control_step=0, at_due=True, request_in_flight=False)
+    scheduler.install_response(initial, _bsp_response(value=3), now_ns=0, control_step=0)
+    scheduler.take_action(0, control_step=0)
+    prefetch = scheduler.maybe_request(1, control_step=1, at_due=True, request_in_flight=False)
+
+    discarded = scheduler.install_response(
+        prefetch,
+        _bsp_response(value=9),
+        now_ns=2,
+        control_step=11,
+    )
+
+    assert discarded.activation == "discarded_stale_phase"
+    assert discarded.activation_context["executed_prefix_steps"] == 10
+    assert discarded.activation_context["phase_offset_microindices"] == 10_000_000
+    replan = scheduler.maybe_request(3, control_step=11, at_due=False, request_in_flight=False)
+    assert replan.dispatch == "blocking_replan"
+    assert replan.trigger == "bsp_stale_replan"
+    assert replan.scheduler_context["discarded_request_control_step"] == 1
+    assert replan.scheduler_context["discarded_activation_control_step"] == 11
+
+    replacement = scheduler.install_response(
+        replan,
+        _bsp_response(value=5),
+        now_ns=4,
+        control_step=11,
+    )
+    assert replacement.activation == "blocking_replace"
+    assert replacement.activation_context["executed_prefix_steps"] == 0
+    np.testing.assert_array_equal(
+        scheduler.take_action(100_000_000_000, control_step=11).action,
+        np.full(7, 5, dtype=np.float32),
+    )
+
+
+def test_formal_bsp_scheduler_samples_continuous_curve_and_ignores_legacy_eight_action_values():
+    scheduler = control.make_scheduler_v5(
+        control.EXECUTION_MODES["bsp_spline_async"],
+        _schema5_calibration("bsp_spline_async"),
+    )
+    intent = scheduler.maybe_request(0, control_step=0, at_due=True, request_in_flight=False)
+    response = _bsp_response(value=6)
+    response["actions"][:] = -12345
+
+    scheduler.install_response(intent, response, now_ns=0, control_step=0)
+    action = scheduler.take_action(1, control_step=0).action
+
+    np.testing.assert_array_equal(action, np.full(7, 6, dtype=np.float32))
 
 
 @pytest.mark.parametrize(

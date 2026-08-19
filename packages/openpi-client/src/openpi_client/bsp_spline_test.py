@@ -20,7 +20,7 @@ def _response(parameters=None):
         "parameters": _parameters() if parameters is None else parameters,
         "origin_hz": 10,
         "degree": 3,
-        "speedup": 1,
+        "speedup": 2,
         "alignment": "disabled_delta_eff",
     }
 
@@ -133,7 +133,7 @@ def test_decode_eight_includes_both_endpoints():
         ("degree", 2),
         ("speedup", True),
         ("speedup", 1.0),
-        ("speedup", 2),
+        ("speedup", 1),
         ("alignment", "aligned"),
     ],
 )
@@ -207,10 +207,10 @@ def test_plan_uses_activation_clock_and_immediately_swaps_without_alignment_or_l
 
     old_sample = plan.sample(activation_time_ns + 50_000_000)
 
-    assert old_sample.spline_time == pytest.approx(0.5)
+    assert old_sample.spline_time == pytest.approx(1.0)
     np.testing.assert_allclose(
         old_sample.action,
-        np.arange(7, dtype=np.float32) * 10 + np.float32(113.0 / 96.0),
+        bsp_spline.BspSpline.from_response(_response()).evaluate(1.0),
         rtol=1e-6,
         atol=1e-6,
     )
@@ -232,8 +232,8 @@ def test_plan_clamps_only_below_t_min_and_keeps_the_right_endpoint_actionable():
     plan.install(_constant_response(7.0, shifted_knots), activation_time_ns=activation_time_ns)
 
     below = plan.sample(activation_time_ns)
-    endpoint = plan.sample(activation_time_ns + 1_100_000_000)
-    exhausted = plan.sample(activation_time_ns + 1_100_000_001)
+    endpoint = plan.sample(activation_time_ns + 550_000_000)
+    exhausted = plan.sample(activation_time_ns + 550_000_001)
 
     assert below.spline_time == 2.0
     assert not below.underflow
@@ -251,15 +251,15 @@ def test_plan_exposes_deterministic_remaining_time_and_calibrated_prefetch_decis
     plan = bsp_spline.BspActionPlan()
     plan.install(_constant_response(1.0), activation_time_ns=activation_time_ns)
 
-    early = plan.prefetch_decision(activation_time_ns + 800_000_000, lead_time_ns=99_999_999)
-    due = plan.prefetch_decision(activation_time_ns + 800_000_000, lead_time_ns=100_000_000)
-    endpoint = plan.prefetch_decision(activation_time_ns + 900_000_000, lead_time_ns=0)
-    exhausted = plan.prefetch_decision(activation_time_ns + 900_000_001, lead_time_ns=0)
+    early = plan.prefetch_decision(activation_time_ns + 400_000_000, lead_time_ns=49_999_999)
+    due = plan.prefetch_decision(activation_time_ns + 400_000_000, lead_time_ns=50_000_000)
+    endpoint = plan.prefetch_decision(activation_time_ns + 450_000_000, lead_time_ns=0)
+    exhausted = plan.prefetch_decision(activation_time_ns + 450_000_001, lead_time_ns=0)
 
-    assert early.remaining_time_ns == 100_000_000
+    assert early.remaining_time_ns == 50_000_000
     assert not early.should_prefetch
     assert not early.underflow
-    assert due.remaining_time_ns == 100_000_000
+    assert due.remaining_time_ns == 50_000_000
     assert due.should_prefetch
     assert not due.underflow
     assert endpoint.remaining_time_ns == 0
@@ -314,17 +314,17 @@ def test_plan_rejects_cross_method_rewind_without_reverting_prefetch_state():
     plan = bsp_spline.BspActionPlan()
     plan.install(_constant_response(1.0), activation_time_ns=activation_time_ns)
 
-    assert plan.remaining_time_ns(activation_time_ns + 300_000_000) == 600_000_000
+    assert plan.remaining_time_ns(activation_time_ns + 150_000_000) == 300_000_000
     with pytest.raises(ValueError, match="high-water"):
-        plan.prefetch_decision(activation_time_ns + 200_000_000, lead_time_ns=600_000_000)
+        plan.prefetch_decision(activation_time_ns + 100_000_000, lead_time_ns=300_000_000)
 
-    equal = plan.prefetch_decision(activation_time_ns + 300_000_000, lead_time_ns=600_000_000)
-    later = plan.prefetch_decision(activation_time_ns + 400_000_000, lead_time_ns=500_000_000)
+    equal = plan.prefetch_decision(activation_time_ns + 150_000_000, lead_time_ns=300_000_000)
+    later = plan.prefetch_decision(activation_time_ns + 200_000_000, lead_time_ns=250_000_000)
     assert equal.should_prefetch
     assert later.should_prefetch
     with pytest.raises(ValueError, match="high-water"):
-        plan.remaining_time_ns(activation_time_ns + 399_999_999)
-    assert not plan.sample(activation_time_ns + 400_000_000).underflow
+        plan.remaining_time_ns(activation_time_ns + 199_999_999)
+    assert not plan.sample(activation_time_ns + 200_000_000).underflow
 
 
 def test_plan_rejects_install_before_high_water_and_allows_immediate_swap_at_high_water():
@@ -397,3 +397,114 @@ def test_plan_requires_an_installed_curve_before_sampling_or_prefetching():
         plan.sample(0)
     with pytest.raises(RuntimeError, match="installed"):
         plan.prefetch_decision(0, lead_time_ns=0)
+
+
+def test_control_plan_skips_six_executed_steps_and_advances_one_index_per_step():
+    plan = bsp_spline.BspControlActionPlan()
+
+    installed = plan.install(
+        _response(),
+        request_control_step=100,
+        activation_control_step=106,
+        control_freq_hz=20,
+    )
+
+    assert not installed.stale
+    assert installed.executed_prefix_steps == 6
+    assert installed.phase_offset_indices == pytest.approx(6.0)
+    assert installed.first_sample_time == pytest.approx(6.0)
+    assert installed.remaining_time_ns == 150_000_000
+    first = plan.sample(106)
+    second = plan.sample(107)
+    assert first.spline_time == pytest.approx(6.0)
+    assert second.spline_time == pytest.approx(7.0)
+    np.testing.assert_array_equal(first.action, bsp_spline.BspSpline.from_response(_response()).evaluate(6.0))
+    np.testing.assert_array_equal(second.action, bsp_spline.BspSpline.from_response(_response()).evaluate(7.0))
+
+
+def test_control_plan_uses_completed_steps_not_wall_clock_or_underflow_wait():
+    plan = bsp_spline.BspControlActionPlan()
+    plan.install(
+        _constant_response(4.0),
+        request_control_step=20,
+        activation_control_step=20,
+        control_freq_hz=20,
+    )
+
+    first = plan.sample(20)
+    repeated = plan.sample(20)
+
+    assert first.spline_time == repeated.spline_time == 0.0
+    assert plan.remaining_time_ns(20) == 450_000_000
+
+
+def test_control_plan_prefetches_at_eight_remaining_indices_and_accepts_shorter_tail():
+    plan = bsp_spline.BspControlActionPlan()
+    plan.install(
+        _constant_response(1.0),
+        request_control_step=0,
+        activation_control_step=0,
+        control_freq_hz=20,
+    )
+
+    before = plan.prefetch_decision(0, lead_time_ns=400_000_000)
+    due = plan.prefetch_decision(1, lead_time_ns=400_000_000)
+
+    assert before.remaining_time_ns == 450_000_000
+    assert not before.should_prefetch
+    assert due.remaining_time_ns == 400_000_000
+    assert due.should_prefetch
+
+    installed = plan.install(
+        _constant_response(2.0),
+        request_control_step=1,
+        activation_control_step=7,
+        control_freq_hz=20,
+    )
+    assert not installed.stale
+    assert installed.remaining_time_ns == 150_000_000
+    assert plan.prefetch_decision(7, lead_time_ns=400_000_000).should_prefetch
+
+
+def test_control_plan_rejects_expired_candidate_transactionally():
+    plan = bsp_spline.BspControlActionPlan()
+    plan.install(
+        _constant_response(3.0),
+        request_control_step=0,
+        activation_control_step=0,
+        control_freq_hz=20,
+    )
+    previous = plan.sample(1)
+
+    discarded = plan.install(
+        _constant_response(9.0),
+        request_control_step=1,
+        activation_control_step=11,
+        control_freq_hz=20,
+    )
+
+    assert discarded.stale
+    assert discarded.phase_offset_indices == pytest.approx(10.0)
+    assert discarded.first_sample_time == pytest.approx(10.0)
+    assert discarded.remaining_time_ns == 0
+    np.testing.assert_array_equal(plan.sample(1).action, previous.action)
+
+
+def test_control_plan_allows_closed_endpoint_once_then_reports_underflow():
+    plan = bsp_spline.BspControlActionPlan()
+    plan.install(
+        _constant_response(8.0),
+        request_control_step=0,
+        activation_control_step=0,
+        control_freq_hz=20,
+    )
+
+    endpoint = plan.sample(9)
+    exhausted = plan.sample(10)
+
+    assert endpoint.spline_time == 9.0
+    assert not endpoint.underflow
+    np.testing.assert_array_equal(endpoint.action, np.full(7, 8.0, dtype=np.float32))
+    assert exhausted.spline_time == 10.0
+    assert exhausted.underflow
+    assert exhausted.action is None

@@ -50,7 +50,7 @@ def _metadata_payload(*, revision="same", policy_variant="baseline"):
         ]
     else:
         representation = "bsp"
-        protocols = ["bsp_spline_h8_v1"]
+        protocols = ["bsp_spline_async_phase_skip_speedup2_v2"]
     return msgpack_numpy.packb(
         {
             "server_revision": revision,
@@ -74,10 +74,19 @@ def _rtc_response(offset=0.0):
     }
 
 
-def _bsp_response(offset=0.0):
+def _bsp_response(offset=0.0, *, duration_ticks=None):
     parameters = np.zeros((16, 8), dtype=np.float32)
     parameters[:, :7] = offset
-    parameters[:, 7] = np.arange(16, dtype=np.float32)
+    if duration_ticks is None:
+        parameters[:, 7] = np.arange(16, dtype=np.float32)
+    else:
+        parameters[:, 7] = np.concatenate(
+            (
+                np.zeros(4, dtype=np.float32),
+                np.linspace(0, duration_ticks, 10, dtype=np.float32)[1:9],
+                np.full(4, duration_ticks, dtype=np.float32),
+            )
+        )
     return {
         "actions": np.full((8, 7), offset, dtype=np.float32),
         "bsp": {
@@ -85,7 +94,7 @@ def _bsp_response(offset=0.0):
             "parameters": parameters,
             "origin_hz": 10,
             "degree": 3,
-            "speedup": 1,
+            "speedup": 2,
             "alignment": "disabled_delta_eff",
         },
     }
@@ -242,6 +251,15 @@ class FakeWorker:
 
     def close(self):
         self.close_calls += 1
+
+
+class _StaleReplanSubmissionOverheadWorker(FakeWorker):
+    """Make the stale-response-to-replan handoff consume measurable wall time."""
+
+    def submit(self, request, *, latency_sample_key=None):
+        if len(self.jobs) == 2:
+            self.clock.advance_to(self.clock.monotonic_ns() + NS_PER_MS)
+        return super().submit(request, latency_sample_key=latency_sample_key)
 
 
 class FakeEnvironment:
@@ -424,7 +442,7 @@ def test_every_baseline_sync_request_has_schema_one_rtc_envelope_and_fresh_seed(
     assert np.array_equal(environment.actions[0], _rtc_response()["actions"][0])
     assert np.array_equal(environment.actions[7], _rtc_response()["actions"][7])
     assert np.array_equal(environment.actions[8], _rtc_response(100.0)["actions"][0])
-    assert result.success
+    assert result.success, result.error
 
 
 def test_malformed_initial_result_is_a_complete_audited_policy_failure():
@@ -464,8 +482,8 @@ class _BackgroundScheduler(control.ModeSchedulerV5):
         self.action_index = 0
         self._pending_intent = None
 
-    def maybe_request(self, now_ns, *, at_due, request_in_flight):
-        del now_ns, at_due
+    def maybe_request(self, now_ns, *, at_due, request_in_flight, control_step=0):
+        del now_ns, at_due, control_step
         if request_in_flight or self._pending_intent is not None:
             return None
         if self.phase == 0:
@@ -501,8 +519,8 @@ class _BackgroundScheduler(control.ModeSchedulerV5):
         self.phase = 2
         return control.ActivationDecisionV5("immediate_swap", {"action_cursor": 0})
 
-    def take_action(self, now_ns):
-        del now_ns
+    def take_action(self, now_ns, *, control_step=0):
+        del now_ns, control_step
         self.action_index += 1
         return control.ActionDecisionV5(
             action=np.full(7, self.action_index, dtype=np.float32),
@@ -617,10 +635,10 @@ def test_blocking_wait_failure_keeps_pending_owned_until_reset_acknowledgement()
 
 
 class _TakeActionFailureScheduler(_BackgroundScheduler):
-    def take_action(self, now_ns):
+    def take_action(self, now_ns, *, control_step=0):
         if self.phase == 1 and self.action_index == 1:
             raise ValueError("active background policy failure")
-        return super().take_action(now_ns)
+        return super().take_action(now_ns, control_step=control_step)
 
 
 def test_policy_failure_return_gate_abandons_and_acknowledges_active_background_job():
@@ -697,7 +715,7 @@ def test_real_rtc_scheduler_bootstraps_then_installs_guided_result():
     assert np.array_equal(environment.actions[8], _rtc_response(1000.0)["actions"][0])
 
 
-def test_real_bsp_async_underflow_waits_then_swaps_at_zero_curve_elapsed():
+def test_real_bsp_async_arrival_skips_elapsed_prefix_then_immediately_prefetches_short_tail():
     clock = ManualClock()
     payload = _metadata_payload(policy_variant="bsp")
     worker = FakeWorker(
@@ -705,10 +723,11 @@ def test_real_bsp_async_underflow_waits_then_swaps_at_zero_curve_elapsed():
         [
             _ScriptedCall(0, _bsp_response(), metadata_payload=payload),
             _ScriptedCall(500 * NS_PER_MS, _bsp_response(3.0), metadata_payload=payload),
+            _ScriptedCall(500 * NS_PER_MS, _bsp_response(5.0), metadata_payload=payload),
         ],
         connect_payload=payload,
     )
-    environment = FakeEnvironment(done_after_real_steps=26)
+    environment = FakeEnvironment(done_after_real_steps=14)
     calibration = _calibration("bsp_spline_async", latency_ns=50 * NS_PER_MS)
 
     result = _run(
@@ -720,23 +739,136 @@ def test_real_bsp_async_underflow_waits_then_swaps_at_zero_curve_elapsed():
         max_steps=30,
     )
 
-    assert result.success
+    assert result.success, result.error
     assert result.inference_requests[1].trigger == "bsp_prefetch"
     assert result.inference_requests[1].scheduler_context == {
         "remaining_plan_ns": 400 * NS_PER_MS,
         "budget_ns": 400 * NS_PER_MS,
+        "request_control_step": 4,
     }
-    assert result.action_underflows[0].started_offset_ns == 1_250 * NS_PER_MS
-    assert result.action_underflows[0].duration_ns == 50 * NS_PER_MS
-    assert result.plan_activations[1].activation_context == {"curve_elapsed_ns": 0}
+    assert result.action_underflows == ()
+    assert result.plan_activations[1].activation_context == {
+        "request_control_step": 4,
+        "activation_control_step": 13,
+        "executed_prefix_steps": 9,
+        "phase_offset_microindices": 9_000_000,
+        "first_sample_microindices": 9_000_000,
+        "remaining_curve_microindices": 3_000_000,
+        "remaining_curve_ns": 150 * NS_PER_MS,
+        "immediate_prefetch": 1,
+    }
+    assert result.inference_requests[2].trigger == "bsp_prefetch"
+    assert result.inference_requests[2].disposition == "abandoned"
+    assert np.allclose(environment.actions[-1], 3.0)
+
+
+def test_real_bsp_async_discards_stale_short_curve_and_blocks_on_latest_observation():
+    clock = ManualClock()
+    payload = _metadata_payload(policy_variant="bsp")
+    worker = _StaleReplanSubmissionOverheadWorker(
+        clock,
+        [
+            _ScriptedCall(0, _bsp_response(), metadata_payload=payload),
+            _ScriptedCall(
+                550 * NS_PER_MS,
+                _bsp_response(3.0, duration_ticks=4),
+                metadata_payload=payload,
+            ),
+            _ScriptedCall(50 * NS_PER_MS, _bsp_response(5.0), metadata_payload=payload),
+        ],
+        connect_payload=payload,
+    )
+    environment = FakeEnvironment(done_after_real_steps=14)
+    calibration = _calibration("bsp_spline_async", latency_ns=50 * NS_PER_MS)
+
+    result = _run(
+        clock,
+        worker,
+        environment,
+        args=_args(execution_mode="bsp_spline_async"),
+        scheduler=control.make_scheduler_v5(control.EXECUTION_MODES["bsp_spline_async"], calibration),
+        max_steps=30,
+    )
+
+    assert result.success, result.error
+    assert [request.trigger for request in result.inference_requests] == [
+        "initial_plan",
+        "bsp_prefetch",
+        "bsp_stale_replan",
+    ]
+    assert [request.disposition for request in result.inference_requests] == [
+        "activated",
+        "discarded_stale_phase",
+        "activated",
+    ]
+    stale_context = result.inference_requests[2].scheduler_context
+    assert stale_context["discarded_request_control_step"] == 4
+    assert stale_context["discarded_activation_control_step"] == 13
+    assert stale_context["phase_offset_microindices"] == 9_000_000
+    assert stale_context["curve_t_max_microindices"] == 4_000_000
+    assert [activation.activation for activation in result.plan_activations] == [
+        "initial",
+        "blocking_replace",
+    ]
+    assert result.plan_activations[1].control_step == 13
+    assert result.plan_activations[1].activation_context["executed_prefix_steps"] == 0
+    assert len(result.action_underflows) == 1
+    assert result.action_underflows[0].request_id == 1
+    assert result.action_underflows[0].control_step == 13
+    assert result.action_underflows[0].duration_ns == 101 * NS_PER_MS
+    assert result.control_stalls[-1].request_id == 1
+    assert result.control_stalls[-1].duration_ns == 101 * NS_PER_MS
+    assert all(stall.request_id != 2 for stall in result.control_stalls)
+    assert np.allclose(environment.actions[-1], 5.0)
+
+
+def test_real_bsp_async_prefetches_immediately_when_underflow_returns_only_an_endpoint():
+    clock = ManualClock()
+    payload = _metadata_payload(policy_variant="bsp")
+    worker = FakeWorker(
+        clock,
+        [
+            _ScriptedCall(0, _bsp_response(), metadata_payload=payload),
+            _ScriptedCall(
+                550 * NS_PER_MS,
+                _bsp_response(3.0, duration_ticks=9),
+                metadata_payload=payload,
+            ),
+            _ScriptedCall(50 * NS_PER_MS, _bsp_response(5.0), metadata_payload=payload),
+        ],
+        connect_payload=payload,
+    )
+    environment = FakeEnvironment(done_after_real_steps=14)
+    calibration = _calibration("bsp_spline_async", latency_ns=50 * NS_PER_MS)
+
+    result = _run(
+        clock,
+        worker,
+        environment,
+        args=_args(execution_mode="bsp_spline_async"),
+        scheduler=control.make_scheduler_v5(control.EXECUTION_MODES["bsp_spline_async"], calibration),
+        max_steps=30,
+    )
+
+    assert result.success, result.error
+    assert [request.trigger for request in result.inference_requests] == [
+        "initial_plan",
+        "bsp_prefetch",
+        "bsp_prefetch",
+    ]
+    assert result.plan_activations[1].activation_context["first_sample_microindices"] == 9_000_000
+    assert result.plan_activations[1].activation_context["remaining_curve_ns"] == 0
+    assert result.plan_activations[1].activation_context["immediate_prefetch"] == 1
+    assert result.inference_requests[2].observation_control_step == 13
+    assert result.inference_requests[2].disposition == "abandoned"
     assert np.allclose(environment.actions[-1], 3.0)
 
 
 class _UnderflowScheduler(_BackgroundScheduler):
-    def take_action(self, now_ns):
+    def take_action(self, now_ns, *, control_step=0):
         if self.phase == 1 and self.action_index == 1:
             return control.ActionDecisionV5(action=None, underflow=True)
-        return super().take_action(now_ns)
+        return super().take_action(now_ns, control_step=control_step)
 
 
 def test_async_underflow_waits_once_and_reanchors_next_deadline():

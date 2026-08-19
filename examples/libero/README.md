@@ -45,6 +45,15 @@ fixed theoretical scheduling budget is 400 ms (eight 20 Hz ticks); empirical
 calibration remains audit-only. Fixed latency targets and synchronous modes are
 not exposed by the schema-v5 CLI.
 
+The BSP mode uses protocol `bsp_spline_async_phase_skip_speedup2_v2`: knots
+retain their 10 Hz dataset-index origin, inference-time `speedup=2` advances
+the continuous curve at 20 indices/s, and each completed 20 Hz `env.step()`
+advances exactly one index. A background response skips the prefix consumed
+since its request; a response whose computed phase is past `t_max` is audited
+and replaced by a blocking replan from the latest observation. The legacy
+eight-action response preview is validated for transport compatibility but is
+not executed by this formal scheduler.
+
 The v5 video overlay is one persistent `Cumulative inference wait: X.XX s`
 line with no solid background. Only real action-underflow stalls freeze video;
 hidden async latency does not. Selected videos are streamed to the encoder one

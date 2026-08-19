@@ -48,7 +48,7 @@ def _inference_capabilities(
             "baseline_rtc_h16_v1",
         ]
     elif action_representation == "bsp":
-        supported_protocols = ["bsp_spline_h8_v1"]
+        supported_protocols = ["bsp_spline_async_phase_skip_speedup2_v2"]
     else:
         supported_protocols = []
     return {

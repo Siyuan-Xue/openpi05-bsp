@@ -103,11 +103,15 @@ class LiberoOutputs(transforms.DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class BspLiberoOutputs(transforms.DataTransformFn):
-    """Decode unnormalized BSP parameters into eight native LIBERO actions.
+    """Publish unnormalized BSP parameters plus a legacy eight-action preview.
 
     Policy construction places data transforms after quantile unnormalization.
     The model's remaining padded channels are deliberately discarded here;
     channels 0:7 are controls and channel 7 is the knot vector.
+
+    The schema-v5 BSP scheduler consumes only the continuous ``bsp`` payload;
+    ``actions`` remains a transport-compatibility preview and is never used by
+    the formal phase-skip execution path.
     """
 
     def __call__(self, data: dict) -> dict:
@@ -115,9 +119,7 @@ class BspLiberoOutputs(transforms.DataTransformFn):
         settings = _bsp.BspSettings()
         expected_shape = (settings.target_rows, 32)
         if actions.shape != expected_shape:
-            raise ValueError(
-                f"BSP policy output must have padded shape {expected_shape}, got {actions.shape}"
-            )
+            raise ValueError(f"BSP policy output must have padded shape {expected_shape}, got {actions.shape}")
         if not np.isfinite(actions).all():
             raise ValueError("BSP policy output contains non-finite parameters")
         decode_parameters = actions[:, : settings.target_channels]
@@ -133,7 +135,7 @@ class BspLiberoOutputs(transforms.DataTransformFn):
                 "parameters": wire_parameters,
                 "origin_hz": 10,
                 "degree": 3,
-                "speedup": 1,
+                "speedup": 2,
                 "alignment": "disabled_delta_eff",
             },
         }

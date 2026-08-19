@@ -30,6 +30,20 @@ def _identity(init_index=0):
     )
 
 
+def _bsp_activation_context(request_step, activation_step, *, remaining_indices=9):
+    prefix = activation_step - request_step
+    return {
+        "request_control_step": request_step,
+        "activation_control_step": activation_step,
+        "executed_prefix_steps": prefix,
+        "phase_offset_microindices": prefix * 1_000_000,
+        "first_sample_microindices": prefix * 1_000_000,
+        "remaining_curve_microindices": remaining_indices * 1_000_000,
+        "remaining_curve_ns": remaining_indices * 50_000_000,
+        "immediate_prefetch": int(remaining_indices <= 8),
+    }
+
+
 def _checkpoint_identity(*, bsp=False):
     return control.CheckpointIdentityV1(
         code_sha="d" * 40,
@@ -194,7 +208,9 @@ def _initial_events(identity=None, *, execution_mode="baseline_async", outcome="
         ),
     )
     if outcome == "success":
-        activation_context = {"action_cursor": 0} if execution_mode.startswith("baseline") else {"curve_elapsed_ns": 0}
+        activation_context = (
+            {"action_cursor": 0} if execution_mode.startswith("baseline") else _bsp_activation_context(0, 0)
+        )
         activations = (
             timing.PlanActivationV5(
                 plan_id=0,
@@ -588,6 +604,7 @@ def test_bsp_async_episode_validation_binds_prefetch_events_to_calibrated_budget
             {
                 "remaining_plan_ns": control.SCHEDULING_LATENCY_BUDGET_NS,
                 "budget_ns": control.SCHEDULING_LATENCY_BUDGET_NS,
+                "request_control_step": 1,
             },
             "activated",
             sample_keys[1],
@@ -611,14 +628,21 @@ def test_bsp_async_episode_validation_binds_prefetch_events_to_calibrated_budget
             ),
         ),
         plan_activations=(
-            timing.PlanActivationV5(0, 0, 0, sample_targets[0], "initial", {"curve_elapsed_ns": 0}),
+            timing.PlanActivationV5(
+                0,
+                0,
+                0,
+                sample_targets[0],
+                "initial",
+                _bsp_activation_context(0, 0),
+            ),
             timing.PlanActivationV5(
                 1,
                 1,
                 1,
                 sum(sample_targets),
                 "immediate_swap",
-                {"curve_elapsed_ns": 0},
+                _bsp_activation_context(1, 1),
             ),
         ),
         action_seams=(

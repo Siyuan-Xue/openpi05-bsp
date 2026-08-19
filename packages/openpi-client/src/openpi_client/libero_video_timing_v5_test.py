@@ -100,6 +100,96 @@ def _latency(request_id, completed_offset_ns, duration_ns, *, outcome="success")
     )
 
 
+def _bsp_activation_context(request_step, activation_step, *, remaining_indices=9):
+    prefix = activation_step - request_step
+    return {
+        "request_control_step": request_step,
+        "activation_control_step": activation_step,
+        "executed_prefix_steps": prefix,
+        "phase_offset_microindices": prefix * 1_000_000,
+        "first_sample_microindices": prefix * 1_000_000,
+        "remaining_curve_microindices": remaining_indices * 1_000_000,
+        "remaining_curve_ns": remaining_indices * 50_000_000,
+        "immediate_prefetch": int(remaining_indices <= 8),
+    }
+
+
+def test_bsp_phase_skip_timeline_accepts_stale_discard_then_same_step_blocking_replan():
+    requests = (
+        _initial_request(),
+        _request(
+            1,
+            150,
+            observation_control_step=1,
+            trigger="bsp_prefetch",
+            scheduler_context={
+                "remaining_plan_ns": 400_000_000,
+                "budget_ns": 400_000_000,
+                "request_control_step": 1,
+            },
+            disposition="discarded_stale_phase",
+        ),
+        _request(
+            2,
+            176,
+            observation_control_step=7,
+            dispatch="blocking_replan",
+            trigger="bsp_stale_replan",
+            scheduler_context={
+                "discarded_request_control_step": 1,
+                "discarded_activation_control_step": 7,
+                "executed_prefix_steps": 6,
+                "phase_offset_microindices": 6_000_000,
+                "curve_t_max_microindices": 4_000_000,
+            },
+        ),
+    )
+    latencies = (
+        _latency(0, 100, 100),
+        _latency(1, 175, 25),
+        _latency(2, 190, 14),
+    )
+    activations = (
+        timing.PlanActivationV5(
+            0,
+            0,
+            0,
+            100,
+            "initial",
+            _bsp_activation_context(0, 0),
+        ),
+        timing.PlanActivationV5(
+            1,
+            2,
+            7,
+            190,
+            "blocking_replace",
+            _bsp_activation_context(7, 7),
+        ),
+    )
+    stalls = (
+        _stall(0, 0, 0, 100, reason="synchronous_inference"),
+        _stall(1, 7, 160, 30, reason="async_action_underflow"),
+    )
+    underflows = (timing.ActionUnderflowV5(1, 7, 160, 30),)
+
+    normalized = timing.validate_timing_events_v5(
+        requests=requests,
+        latencies=latencies,
+        activations=activations,
+        underflows=underflows,
+        stalls=stalls,
+        steps=8,
+        episode_duration_ns=200,
+        execution_mode="bsp_spline_async",
+        eval_seed=_EVAL_SEED,
+        identity=_IDENTITY,
+        expected_bsp_prefetch_budget_ns=400_000_000,
+    )
+
+    assert normalized[0] == requests
+
+
 def test_request_and_latency_records_expose_paired_sample_identity_and_target():
     request = dataclasses.replace(_initial_request(), sampled_target_latency_ns=300_000_000)
     latency = timing.LatencyEventV5(
@@ -339,7 +429,7 @@ def test_request_context_and_enum_validation_is_exact_and_trigger_aware():
         1,
         1,
         trigger="bsp_prefetch",
-        scheduler_context={"remaining_plan_ns": 50, "budget_ns": 50},
+        scheduler_context={"remaining_plan_ns": 50, "budget_ns": 50, "request_control_step": 0},
     ).to_dict()
     wrong_bsp_context["scheduler_context"]["budget_ns"] = True
     invalid_payloads.append(wrong_bsp_context)
@@ -507,13 +597,13 @@ def test_mode_aware_validation_rejects_invalid_rtc_and_bsp_contexts():
             observation_control_step=1,
             dispatch="background",
             trigger="bsp_prefetch",
-            scheduler_context={"remaining_plan_ns": 50, "budget_ns": 50},
+            scheduler_context={"remaining_plan_ns": 50, "budget_ns": 50, "request_control_step": 1},
         ),
     )
     bsp_latencies = (_latency(0, 100, 100), _latency(1, 175, 25))
     bsp_activations = (
-        timing.PlanActivationV5(0, 0, 0, 100, "initial", {"curve_elapsed_ns": 0}),
-        timing.PlanActivationV5(1, 1, 1, 175, "immediate_swap", {"curve_elapsed_ns": 0}),
+        timing.PlanActivationV5(0, 0, 0, 100, "initial", _bsp_activation_context(0, 0)),
+        timing.PlanActivationV5(1, 1, 1, 175, "immediate_swap", _bsp_activation_context(1, 1)),
     )
     bsp_stalls = (_stall(0, 0, 0, 100, reason="synchronous_inference"),)
     assert (
@@ -535,7 +625,7 @@ def test_mode_aware_validation_rejects_invalid_rtc_and_bsp_contexts():
 
     wrong_budget = dataclasses.replace(
         bsp_requests[1],
-        scheduler_context={"remaining_plan_ns": 50, "budget_ns": 75},
+        scheduler_context={"remaining_plan_ns": 50, "budget_ns": 75, "request_control_step": 1},
     )
     _assert_raises(
         ValueError,
@@ -581,7 +671,7 @@ def test_mode_aware_validation_rejects_invalid_rtc_and_bsp_contexts():
                     0,
                     100,
                     "initial",
-                    {"curve_elapsed_ns": 0},
+                    _bsp_activation_context(0, 0),
                 ),
             ),
             underflows=(),
@@ -603,7 +693,7 @@ def test_mode_aware_validation_rejects_invalid_rtc_and_bsp_contexts():
                 0,
                 100,
                 "initial",
-                {"curve_elapsed_ns": 0},
+                _bsp_activation_context(0, 0),
             ),
         ),
         underflows=(),
@@ -628,7 +718,7 @@ def test_mode_aware_validation_rejects_invalid_rtc_and_bsp_contexts():
                         0,
                         100,
                         "initial",
-                        {"curve_elapsed_ns": 0},
+                        _bsp_activation_context(0, 0),
                     ),
                 ),
                 underflows=(),
@@ -690,12 +780,12 @@ def test_cross_event_chronology_binds_submissions_activation_steps_and_blocking_
             observation_control_step=2,
             dispatch="background",
             trigger="bsp_prefetch",
-            scheduler_context={"remaining_plan_ns": 50, "budget_ns": 50},
+            scheduler_context={"remaining_plan_ns": 50, "budget_ns": 50, "request_control_step": 2},
         ),
     )
     bsp_activations = (
-        timing.PlanActivationV5(0, 0, 0, 100, "initial", {"curve_elapsed_ns": 0}),
-        timing.PlanActivationV5(1, 1, 1, 175, "immediate_swap", {"curve_elapsed_ns": 0}),
+        timing.PlanActivationV5(0, 0, 0, 100, "initial", _bsp_activation_context(0, 0)),
+        timing.PlanActivationV5(1, 1, 1, 175, "immediate_swap", _bsp_activation_context(2, 2)),
     )
     _assert_raises(
         ValueError,

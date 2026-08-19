@@ -41,7 +41,7 @@ def test_bsp_libero_outputs_preserve_legacy_decode_and_capture_raw_parameters_be
     assert sidecar["schema_version"] == 1
     assert sidecar["origin_hz"] == 10
     assert sidecar["degree"] == 3
-    assert sidecar["speedup"] == 1
+    assert sidecar["speedup"] == 2
     assert sidecar["alignment"] == "disabled_delta_eff"
     assert sidecar["parameters"].shape == (16, 8)
     assert sidecar["parameters"].dtype == np.float32
