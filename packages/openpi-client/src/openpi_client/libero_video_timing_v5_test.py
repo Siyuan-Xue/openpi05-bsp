@@ -190,6 +190,95 @@ def test_bsp_phase_skip_timeline_accepts_stale_discard_then_same_step_blocking_r
     assert normalized[0] == requests
 
 
+def test_bsp_stale_discard_with_old_tail_requires_full_blocking_replan_stall():
+    requests = (
+        _initial_request(),
+        _request(
+            1,
+            150,
+            observation_control_step=1,
+            trigger="bsp_prefetch",
+            scheduler_context={
+                "remaining_plan_ns": 400_000_000,
+                "budget_ns": 400_000_000,
+                "request_control_step": 1,
+            },
+            disposition="discarded_stale_phase",
+        ),
+        _request(
+            2,
+            176,
+            observation_control_step=7,
+            dispatch="blocking_replan",
+            trigger="bsp_stale_replan",
+            scheduler_context={
+                "discarded_request_control_step": 1,
+                "discarded_activation_control_step": 7,
+                "executed_prefix_steps": 6,
+                "phase_offset_microindices": 6_000_000,
+                "curve_t_max_microindices": 4_000_000,
+            },
+        ),
+    )
+    latencies = (
+        _latency(0, 100, 100),
+        _latency(1, 175, 25),
+        _latency(2, 190, 14),
+    )
+    activations = (
+        timing.PlanActivationV5(
+            0,
+            0,
+            0,
+            100,
+            "initial",
+            _bsp_activation_context(0, 0),
+        ),
+        timing.PlanActivationV5(
+            1,
+            2,
+            7,
+            190,
+            "blocking_replace",
+            _bsp_activation_context(7, 7),
+        ),
+    )
+    stalls = (
+        _stall(0, 0, 0, 100, reason="synchronous_inference"),
+        _stall(2, 7, 176, 14, reason="synchronous_inference"),
+    )
+
+    normalized = timing.validate_timing_events_v5(
+        requests=requests,
+        latencies=latencies,
+        activations=activations,
+        underflows=(),
+        stalls=stalls,
+        steps=8,
+        episode_duration_ns=200,
+        execution_mode="bsp_spline_async",
+        eval_seed=_EVAL_SEED,
+        identity=_IDENTITY,
+        expected_bsp_prefetch_budget_ns=400_000_000,
+    )
+
+    assert normalized[-1] == stalls
+    with pytest.raises(ValueError, match="without prior underflow requires"):
+        timing.validate_timing_events_v5(
+            requests=requests,
+            latencies=latencies,
+            activations=activations,
+            underflows=(),
+            stalls=stalls[:1],
+            steps=8,
+            episode_duration_ns=200,
+            execution_mode="bsp_spline_async",
+            eval_seed=_EVAL_SEED,
+            identity=_IDENTITY,
+            expected_bsp_prefetch_budget_ns=400_000_000,
+        )
+
+
 def test_request_and_latency_records_expose_paired_sample_identity_and_target():
     request = dataclasses.replace(_initial_request(), sampled_target_latency_ns=300_000_000)
     latency = timing.LatencyEventV5(

@@ -822,6 +822,53 @@ def test_real_bsp_async_discards_stale_short_curve_and_blocks_on_latest_observat
     assert np.allclose(environment.actions[-1], 5.0)
 
 
+def test_real_bsp_async_stale_response_with_old_tail_records_only_blocking_replan_stall():
+    clock = ManualClock()
+    payload = _metadata_payload(policy_variant="bsp")
+    worker = FakeWorker(
+        clock,
+        [
+            _ScriptedCall(0, _bsp_response(), metadata_payload=payload),
+            _ScriptedCall(
+                400 * NS_PER_MS,
+                _bsp_response(3.0, duration_ticks=4),
+                metadata_payload=payload,
+            ),
+            _ScriptedCall(50 * NS_PER_MS, _bsp_response(5.0), metadata_payload=payload),
+        ],
+        connect_payload=payload,
+    )
+    environment = FakeEnvironment(done_after_real_steps=14)
+    calibration = _calibration("bsp_spline_async", latency_ns=50 * NS_PER_MS)
+
+    result = _run(
+        clock,
+        worker,
+        environment,
+        args=_args(execution_mode="bsp_spline_async"),
+        scheduler=control.make_scheduler_v5(control.EXECUTION_MODES["bsp_spline_async"], calibration),
+        max_steps=30,
+    )
+
+    assert result.success, result.error
+    assert [request.trigger for request in result.inference_requests[:3]] == [
+        "initial_plan",
+        "bsp_prefetch",
+        "bsp_stale_replan",
+    ]
+    assert [request.disposition for request in result.inference_requests[:3]] == [
+        "activated",
+        "discarded_stale_phase",
+        "activated",
+    ]
+    assert result.action_underflows == ()
+    stale_replan_stall = next(stall for stall in result.control_stalls if stall.request_id == 2)
+    assert stale_replan_stall.reason == "synchronous_inference"
+    assert stale_replan_stall.control_step == 11
+    assert stale_replan_stall.duration_ns == 50 * NS_PER_MS
+    assert np.allclose(environment.actions[-1], 5.0)
+
+
 def test_real_bsp_async_prefetches_immediately_when_underflow_returns_only_an_endpoint():
     clock = ManualClock()
     payload = _metadata_payload(policy_variant="bsp")

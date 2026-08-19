@@ -290,19 +290,23 @@ class _AttemptLedgerV5:
         *,
         discarded_request_id: int,
         submitted_ns: int,
-    ) -> None:
-        """Extend the continuous stale-response underflow to an exact time."""
-        if not self.underflows or not self.stalls:
-            raise _eval.PolicyFailure("stale replan is missing its preceding action underflow")
-        underflow = self.underflows[-1]
-        stall = self.stalls[-1]
-        if (
-            underflow.request_id != discarded_request_id
-            or stall.request_id != discarded_request_id
-            or stall.reason != _timing.STALL_REASON_ASYNC_ACTION_UNDERFLOW
-            or stall.started_offset_ns != underflow.started_offset_ns
-            or stall.duration_ns != underflow.duration_ns
-        ):
+    ) -> bool:
+        """Extend a matching stale-response underflow, if one actually occurred."""
+        underflow = self.underflows[-1] if self.underflows else None
+        stall = self.stalls[-1] if self.stalls else None
+        underflow_matches = underflow is not None and underflow.request_id == discarded_request_id
+        stall_matches = (
+            stall is not None
+            and stall.request_id == discarded_request_id
+            and stall.reason == _timing.STALL_REASON_ASYNC_ACTION_UNDERFLOW
+        )
+        if underflow_matches != stall_matches:
+            raise _eval.PolicyFailure("stale replan has an incomplete action-underflow audit")
+        if not underflow_matches:
+            return False
+        assert underflow is not None
+        assert stall is not None
+        if stall.started_offset_ns != underflow.started_offset_ns or stall.duration_ns != underflow.duration_ns:
             raise _eval.PolicyFailure("stale replan does not follow its action underflow")
         submitted_offset_ns = self.offset(submitted_ns)
         existing_end_ns = underflow.started_offset_ns + underflow.duration_ns
@@ -311,6 +315,7 @@ class _AttemptLedgerV5:
         duration_ns = submitted_offset_ns - underflow.started_offset_ns
         self.underflows[-1] = dataclasses.replace(underflow, duration_ns=duration_ns)
         self.stalls[-1] = dataclasses.replace(stall, duration_ns=duration_ns)
+        return True
 
     def record_activation(self, activation: _timing.PlanActivationV5) -> None:
         self.activations.append(activation)
@@ -727,7 +732,7 @@ def _append_blocking_stall_v5(
     due_ns: Optional[int],
 ) -> None:
     trace = pending.trace
-    full_interval = trace.intent.dispatch == "blocking_initial"
+    full_interval = trace.intent.dispatch == "blocking_initial" or trace.intent.trigger == "bsp_stale_replan"
     if full_interval:
         stall_started_ns = submitted_ns
     else:
@@ -744,6 +749,31 @@ def _append_blocking_stall_v5(
         )
     )
     ledger.record_stall_source(trace.observation_control_step, trace.source_frame)
+
+
+def _record_blocking_wait_v5(
+    *,
+    pending: _PendingRequestV5,
+    ledger: _AttemptLedgerV5,
+    submitted_ns: int,
+    completed_ns: int,
+    due_ns: Optional[int],
+    underflow_extension_end_ns: int,
+) -> None:
+    if not pending.trace.intent.dispatch.startswith("blocking"):
+        return
+    if pending.trace.intent.trigger == "bsp_stale_replan" and ledger.extend_discarded_underflow_to(
+        discarded_request_id=pending.trace.request_id - 1,
+        submitted_ns=underflow_extension_end_ns,
+    ):
+        return
+    _append_blocking_stall_v5(
+        pending=pending,
+        ledger=ledger,
+        submitted_ns=submitted_ns,
+        completed_ns=completed_ns,
+        due_ns=due_ns,
+    )
 
 
 def _complete_request_v5(
@@ -797,19 +827,14 @@ def _complete_request_v5(
                 sampled_target_latency_ns=sampled_target_latency_ns,
             )
         )
-        if pending.trace.intent.trigger == "bsp_stale_replan":
-            ledger.extend_discarded_underflow_to(
-                discarded_request_id=pending.trace.request_id - 1,
-                submitted_ns=completed_ns,
-            )
-        elif pending.trace.intent.dispatch.startswith("blocking"):
-            _append_blocking_stall_v5(
-                pending=pending,
-                ledger=ledger,
-                submitted_ns=submitted_ns,
-                completed_ns=completed_ns,
-                due_ns=blocking_due_ns,
-            )
+        _record_blocking_wait_v5(
+            pending=pending,
+            ledger=ledger,
+            submitted_ns=submitted_ns,
+            completed_ns=completed_ns,
+            due_ns=blocking_due_ns,
+            underflow_extension_end_ns=completed_ns,
+        )
         if underflow_started_ns is not None:
             _append_underflow_v5(
                 pending=pending,
@@ -845,19 +870,14 @@ def _complete_request_v5(
                 sampled_target_latency_ns=sampled_target_latency_ns,
             )
         )
-        if pending.trace.intent.trigger == "bsp_stale_replan":
-            ledger.extend_discarded_underflow_to(
-                discarded_request_id=pending.trace.request_id - 1,
-                submitted_ns=completed_ns,
-            )
-        elif pending.trace.intent.dispatch.startswith("blocking"):
-            _append_blocking_stall_v5(
-                pending=pending,
-                ledger=ledger,
-                submitted_ns=submitted_ns,
-                completed_ns=completed_ns,
-                due_ns=blocking_due_ns,
-            )
+        _record_blocking_wait_v5(
+            pending=pending,
+            ledger=ledger,
+            submitted_ns=submitted_ns,
+            completed_ns=completed_ns,
+            due_ns=blocking_due_ns,
+            underflow_extension_end_ns=completed_ns,
+        )
         if underflow_started_ns is not None:
             _append_underflow_v5(
                 pending=pending,
@@ -882,19 +902,14 @@ def _complete_request_v5(
             sampled_target_latency_ns=sampled_target_latency_ns,
         )
     )
-    if pending.trace.intent.trigger == "bsp_stale_replan":
-        ledger.extend_discarded_underflow_to(
-            discarded_request_id=pending.trace.request_id - 1,
-            submitted_ns=activation_now_ns,
-        )
-    elif pending.trace.intent.dispatch.startswith("blocking"):
-        _append_blocking_stall_v5(
-            pending=pending,
-            ledger=ledger,
-            submitted_ns=submitted_ns,
-            completed_ns=completed_ns,
-            due_ns=blocking_due_ns,
-        )
+    _record_blocking_wait_v5(
+        pending=pending,
+        ledger=ledger,
+        submitted_ns=submitted_ns,
+        completed_ns=completed_ns,
+        due_ns=blocking_due_ns,
+        underflow_extension_end_ns=activation_now_ns,
+    )
     if activation.activation == "discarded_stale_phase":
         pending.trace.disposition = "discarded_stale_phase"
         if underflow_started_ns is not None:

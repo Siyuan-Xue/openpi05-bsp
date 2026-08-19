@@ -1081,11 +1081,11 @@ def validate_timing_events_v5(
                 raise ValueError("synchronous stall must lie within its request interval")
             if stall.control_step != request.observation_control_step:
                 raise ValueError("blocking stall control_step must match its request step")
-            full_interval_required = request.dispatch == "blocking_initial"
+            full_interval_required = request.dispatch == "blocking_initial" or request.trigger == "bsp_stale_replan"
             if full_interval_required and (
                 stall.started_offset_ns != request.submitted_offset_ns or stall.duration_ns != latency.duration_ns
             ):
-                raise ValueError("initial stalls must equal the full request")
+                raise ValueError("initial and stale-replan stalls must equal the full request")
             if not full_interval_required and (stall.duration_ns == 0 or stall_end != latency.completed_offset_ns):
                 raise ValueError("later baseline synchronous stall must be an exact positive suffix")
         stalls_by_request[stall.request_id] = stall
@@ -1103,8 +1103,18 @@ def validate_timing_events_v5(
                 raise ValueError("background stall exists exactly when its request underflows")
             if stall is not None and stall.reason != STALL_REASON_ASYNC_ACTION_UNDERFLOW:
                 raise ValueError("background request stalls only for async action underflow")
-        elif stall is not None and stall.reason != STALL_REASON_SYNCHRONOUS_INFERENCE:
-            raise ValueError("blocking replan stalls use synchronous_inference")
+        else:
+            if request.trigger == "bsp_stale_replan":
+                previous = requests_by_id.get(request.request_id - 1)
+                previous_underflow = (
+                    previous is not None
+                    and previous.disposition == "discarded_stale_phase"
+                    and previous.request_id in underflows_by_request
+                )
+                if not previous_underflow and stall is None:
+                    raise ValueError("a stale replan without prior underflow requires a full synchronous stall")
+            if stall is not None and stall.reason != STALL_REASON_SYNCHRONOUS_INFERENCE:
+                raise ValueError("blocking replan stalls use synchronous_inference")
 
     return (
         request_records,
