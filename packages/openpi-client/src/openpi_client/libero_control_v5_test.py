@@ -39,6 +39,7 @@ def _native_metadata(extra=None):
             "model_action_dim": 32,
             "supported_protocols": [
                 "baseline_h16_n5_v1",
+                "baseline_sync_n5_h16_full_v2",
                 "baseline_async_h16_v1",
                 "baseline_rtc_h16_v1",
             ],
@@ -57,7 +58,10 @@ def _bsp_metadata(extra=None):
             "action_representation": "bsp",
             "model_action_horizon": 16,
             "model_action_dim": 32,
-            "supported_protocols": ["bsp_spline_async_phase_skip_speedup2_v2"],
+            "supported_protocols": [
+                "bsp_spline_sync_speedup2_phase0_v2",
+                "bsp_spline_async_phase_skip_speedup2_v2",
+            ],
         },
     }
     if extra is not None:
@@ -281,11 +285,13 @@ def test_pacer_waits_through_early_wakeups_and_rejects_starts_before_due_time():
         pacer.mark_action_started(49)
 
 
-def test_frozen_execution_modes_emit_only_the_exact_protocol_parameters():
+def test_frozen_execution_modes_preserve_async_parameters_and_add_exact_sync_parameters():
     assert tuple(control.EXECUTION_MODES) == (
         "baseline_async",
         "baseline_rtc",
         "bsp_spline_async",
+        "baseline_sync",
+        "bsp_spline_sync",
     )
     assert control.EXECUTION_MODES["baseline_async"].to_parameters_dict() == {
         "action_representation": "native",
@@ -322,6 +328,27 @@ def test_frozen_execution_modes_emit_only_the_exact_protocol_parameters():
         "alignment": "disabled_delta_eff",
         "activation_policy": "phase_skip_executed_prefix",
         "prefetch_comparison": "remaining_lte_budget",
+    }
+    assert control.EXECUTION_MODES["baseline_sync"].to_parameters_dict() == {
+        "action_representation": "native",
+        "dispatch": "synchronous",
+        "model_action_horizon": 16,
+        "execution_horizon": 16,
+        "num_inference_steps": 5,
+        "activation_policy": "blocking_replace_after_full_chunk",
+    }
+    assert control.EXECUTION_MODES["bsp_spline_sync"].to_parameters_dict() == {
+        "action_representation": "bsp",
+        "dispatch": "synchronous",
+        "parameter_shape": [16, 8],
+        "origin_hz": 10,
+        "degree": 3,
+        "speedup": 2,
+        "effective_curve_rate_hz": 20,
+        "control_freq_hz": 20,
+        "alignment": "disabled_delta_eff",
+        "activation_policy": "blocking_replace_from_curve_start",
+        "replan_policy": "after_closed_curve_endpoint",
     }
     with pytest.raises(TypeError):
         control.EXECUTION_MODES["extra"] = control.EXECUTION_MODES["baseline_rtc"]
@@ -1169,13 +1196,104 @@ def _schema5_calibration(mode_name, *, empirical_observed_effective_ns=300_000_0
     )
 
 
-def test_schema5_exposes_exactly_three_random_latency_async_modes():
+def test_schema5_preserves_three_async_modes_and_adds_two_random_latency_sync_modes():
     assert set(control.EXECUTION_MODES) == {
         "baseline_async",
         "baseline_rtc",
         "bsp_spline_async",
+        "baseline_sync",
+        "bsp_spline_sync",
     }
     assert control.EXECUTION_MODES["baseline_async"].policy_protocol == "baseline_async_h16_v1"
+    assert control.EXECUTION_MODES["baseline_sync"].policy_protocol == "baseline_sync_n5_h16_full_v2"
+    assert control.EXECUTION_MODES["bsp_spline_sync"].policy_protocol == "bsp_spline_sync_speedup2_phase0_v2"
+
+
+def test_baseline_sync_executes_all_sixteen_actions_before_blocking_replan():
+    scheduler = control.make_scheduler_v5(control.EXECUTION_MODES["baseline_sync"], None)
+    initial = scheduler.maybe_request(0, control_step=0, at_due=True, request_in_flight=False)
+    assert initial.dispatch == "blocking_initial"
+    assert initial.trigger == "initial_plan"
+    assert initial.request_overlay == {inference.RTC_REQUEST_KEY: {"schema_version": inference.RTC_SCHEMA_VERSION}}
+    response = _rtc_response(offset=100)
+    scheduler.install_response(initial, response, now_ns=1, control_step=0)
+
+    for step in range(16):
+        assert (
+            scheduler.maybe_request(
+                step + 2,
+                control_step=step,
+                at_due=True,
+                request_in_flight=False,
+            )
+            is None
+        )
+        decision = scheduler.take_action(step + 2, control_step=step)
+        assert not decision.underflow
+        np.testing.assert_array_equal(decision.action, response["actions"][step])
+
+    assert scheduler.take_action(20, control_step=16).underflow
+    replan = scheduler.maybe_request(21, control_step=16, at_due=True, request_in_flight=False)
+    assert replan.dispatch == "blocking_replan"
+    assert replan.trigger == "baseline_chunk_exhausted"
+    assert replan.request_overlay == initial.request_overlay
+
+
+def test_bsp_sync_executes_the_closed_continuous_curve_then_replans_from_phase_zero():
+    scheduler = control.make_scheduler_v5(control.EXECUTION_MODES["bsp_spline_sync"], None)
+    initial = scheduler.maybe_request(0, control_step=0, at_due=True, request_in_flight=False)
+    first = _bsp_response(duration_ticks=9, value=3)
+    activation = scheduler.install_response(initial, first, now_ns=300_000_000, control_step=0)
+    assert activation.activation == "initial"
+    assert activation.activation_context["executed_prefix_steps"] == 0
+    assert activation.activation_context["phase_offset_microindices"] == 0
+    assert activation.activation_context["first_sample_microindices"] == 0
+
+    for step in range(10):
+        decision = scheduler.take_action(300_000_001 + step, control_step=step)
+        assert not decision.underflow
+        np.testing.assert_array_equal(decision.action, np.full(7, 3, dtype=np.float32))
+    assert scheduler.take_action(400_000_000, control_step=10).underflow
+
+    replan = scheduler.maybe_request(400_000_001, control_step=10, at_due=True, request_in_flight=False)
+    assert replan.dispatch == "blocking_replan"
+    assert replan.trigger == "bsp_curve_exhausted"
+    second = _bsp_response(duration_ticks=9, value=7)
+    replacement = scheduler.install_response(replan, second, now_ns=900_000_000, control_step=10)
+    assert replacement.activation == "blocking_replace"
+    assert replacement.activation_context["request_control_step"] == 10
+    assert replacement.activation_context["activation_control_step"] == 10
+    assert replacement.activation_context["executed_prefix_steps"] == 0
+    assert replacement.activation_context["phase_offset_microindices"] == 0
+    assert replacement.activation_context["first_sample_microindices"] == 0
+    np.testing.assert_array_equal(
+        scheduler.take_action(900_000_001, control_step=10).action,
+        np.full(7, 7, dtype=np.float32),
+    )
+
+
+def test_bsp_sync_accepts_a_short_curve_without_async_immediate_prefetch():
+    scheduler = control.make_scheduler_v5(control.EXECUTION_MODES["bsp_spline_sync"], None)
+    initial = scheduler.maybe_request(0, control_step=0, at_due=True, request_in_flight=False)
+
+    activation = scheduler.install_response(
+        initial,
+        _bsp_response(duration_ticks=4, value=5),
+        now_ns=300_000_000,
+        control_step=0,
+    )
+
+    assert activation.activation_context["remaining_curve_ns"] == 200_000_000
+    assert activation.activation_context["immediate_prefetch"] == 0
+    assert (
+        scheduler.maybe_request(
+            300_000_001,
+            control_step=0,
+            at_due=False,
+            request_in_flight=False,
+        )
+        is None
+    )
 
 
 def test_theoretical_budget_is_fixed_at_eight_ticks_when_empirical_p95_is_longer():

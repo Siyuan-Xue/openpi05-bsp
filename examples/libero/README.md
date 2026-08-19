@@ -38,12 +38,24 @@ records the clean checkout HEAD automatically. Selected videos are audited in
 
 ## Schema v5 paired random-latency experiment
 
-The three-mode evaluator is `examples/libero/main_v5.py`. It compares plain
-baseline async, continuity-guided baseline RTC, and continuous BSP async under
-the same deterministic paired `Normal(300 ms, 60 ms)` request targets. The
-fixed theoretical scheduling budget is 400 ms (eight 20 Hz ticks); empirical
-calibration remains audit-only. Fixed latency targets and synchronous modes are
-not exposed by the schema-v5 CLI.
+The evaluator is `examples/libero/main_v5.py`. Its original formal experiment
+compares plain baseline async, continuity-guided baseline RTC, and continuous
+BSP async under the same deterministic paired `Normal(300 ms, 60 ms)` request
+targets. It now also exposes `baseline_sync` and `bsp_spline_sync` as a separate
+synchronous extension. The fixed theoretical scheduling budget is 400 ms
+(eight 20 Hz ticks); empirical calibration remains audit-only. Fixed latency
+targets are not exposed by the schema-v5 CLI.
+
+`baseline_sync` blocks for a policy response, then executes the complete
+16-action model chunk before requesting the next one. `bsp_spline_sync` blocks
+for a continuous BSP curve and executes it from `t_min` through its closed
+endpoint before requesting a replacement; because no old curve runs during the
+blocking request, every installed curve has zero phase offset. Both modes use
+the same paired random-latency worker, 20 Hz controller, 40 FPS video, and
+persistent cumulative-wait overlay as the asynchronous modes. The initial
+request is a full stall; later synchronous requests count only the portion that
+overruns the next 20 Hz control deadline, so the overlay remains a control-wait
+measurement rather than a copy of raw inference latency.
 
 The BSP mode uses protocol `bsp_spline_async_phase_skip_speedup2_v2`: knots
 retain their 10 Hz dataset-index origin, inference-time `speedup=2` advances
@@ -59,8 +71,10 @@ line with no solid background. Only real action-underflow stalls freeze video;
 hidden async latency does not. Selected videos are streamed to the encoder one
 frame at a time.
 
-Do not mix v3 and v5 artifacts. The complete sampling, three-mode report,
-server-gate, formal-run approval boundary, and interpretation contract is in
+Do not mix v3 and v5 artifacts. The original three-mode report stays frozen as
+`compare_libero_latency_v5.py`. A separate exact two-input synchronous report
+is available as `compare_libero_sync_v5.py`; the two output sets cannot collide.
+The complete sampling, reporting, server-gate, and interpretation contract is in
 [`docs/pi05_libero_latency_experiment_v5.md`](../../docs/pi05_libero_latency_experiment_v5.md).
 
 ## With Docker (recommended)

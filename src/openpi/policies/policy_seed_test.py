@@ -335,6 +335,7 @@ def test_policy_computes_exact_reserved_capability_metadata_and_rejects_collisio
             "model_action_dim": 32,
             "supported_protocols": [
                 "baseline_h16_n5_v1",
+                "baseline_sync_n5_h16_full_v2",
                 "baseline_async_h16_v1",
                 "baseline_rtc_h16_v1",
             ],
@@ -347,7 +348,10 @@ def test_policy_computes_exact_reserved_capability_metadata_and_rejects_collisio
             "action_representation": "bsp",
             "model_action_horizon": 16,
             "model_action_dim": 32,
-            "supported_protocols": ["bsp_spline_async_phase_skip_speedup2_v2"],
+            "supported_protocols": [
+                "bsp_spline_sync_speedup2_phase0_v2",
+                "bsp_spline_async_phase_skip_speedup2_v2",
+            ],
         },
     }
     with pytest.raises(ValueError, match="reserved"):

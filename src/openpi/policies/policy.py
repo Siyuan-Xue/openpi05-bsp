@@ -44,11 +44,15 @@ def _inference_capabilities(
     if action_representation == "native" and (model_action_horizon, model_action_dim) == (16, 32) and has_rtc_hook:
         supported_protocols = [
             "baseline_h16_n5_v1",
+            "baseline_sync_n5_h16_full_v2",
             "baseline_async_h16_v1",
             "baseline_rtc_h16_v1",
         ]
     elif action_representation == "bsp":
-        supported_protocols = ["bsp_spline_async_phase_skip_speedup2_v2"]
+        supported_protocols = [
+            "bsp_spline_sync_speedup2_phase0_v2",
+            "bsp_spline_async_phase_skip_speedup2_v2",
+        ]
     else:
         supported_protocols = []
     return {

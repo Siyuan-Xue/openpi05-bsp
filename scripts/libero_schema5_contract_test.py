@@ -30,30 +30,39 @@ def test_schema5_replaces_the_v4_runtime_surface_in_place():
         assert (ROOT / new_path).is_file()
 
 
-def test_schema5_cli_and_report_are_exactly_three_mode_random_latency():
+def test_schema5_preserves_three_mode_report_and_adds_two_sync_runtime_modes():
     evaluator = (ROOT / "examples/libero/main_v5.py").read_text()
     control = (ROOT / "packages/openpi-client/src/openpi_client/libero_control_v5.py").read_text()
     report = (ROOT / "packages/openpi-client/src/openpi_client/libero_report_v5.py").read_text()
+    sync_report = (ROOT / "packages/openpi-client/src/openpi_client/libero_report_sync_v5.py").read_text()
 
     assert "synthetic_latency_target_ms" not in evaluator
     assert '"baseline_async"' in control
     assert '"baseline_rtc"' in control
     assert '"bsp_spline_async"' in control
-    assert '"baseline_sync_n5"' not in control
-    assert '"bsp_spline_sync"' not in control
+    assert '"baseline_sync"' in control
+    assert '"bsp_spline_sync"' in control
     assert '"comparison_v5.json"' in report
     assert '"task_metrics_v5.csv"' in report
     assert '"report_v5.md"' in report
     assert "write_three_mode_report_v5" in report
     assert "write_five_checkpoint_report_v5" not in report
+    assert '"sync_comparison_v5.json"' in sync_report
+    assert '"sync_task_metrics_v5.csv"' in sync_report
+    assert '"sync_report_v5.md"' in sync_report
+    assert "write_sync_pair_report_v5" in sync_report
 
 
-def test_runbook_stops_after_server_gate_until_explicit_approval():
+def test_runbook_freezes_sync_extension_without_restarting_existing_modes():
     runbook = (ROOT / "docs/pi05_libero_latency_experiment_v5.md").read_text()
 
-    assert "通过服务器门禁后先停止" in runbook
-    assert "没有用户再次明确批准" in runbook
-    assert "不启动正式 2000-episode" in runbook
+    assert "同步扩展" in runbook
+    assert "baseline_sync_n5_h16_full_v2" in runbook
+    assert "bsp_spline_sync_speedup2_phase0_v2" in runbook
+    assert "完整执行 16 个动作" in runbook
+    assert "从 `t_min` 开始" in runbook
+    assert "本轮只补跑 `baseline_sync`" in runbook
+    assert "不得重启" in runbook
     assert "baseline_async" in runbook
     assert "baseline_rtc" in runbook
     assert "bsp_spline_async" in runbook

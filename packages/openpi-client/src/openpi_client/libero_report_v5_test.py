@@ -12,9 +12,11 @@ from openpi_client import latency_sampling
 from openpi_client import libero_control_v5 as control
 from openpi_client import libero_eval_v5 as evaluation
 from openpi_client import libero_report_v5 as report
+from openpi_client import libero_report_sync_v5 as sync_report
 
 
 MODES = ("baseline_async", "baseline_rtc", "bsp_spline_async")
+SYNC_MODES = ("baseline_sync", "bsp_spline_sync")
 
 
 def _sha(label: str) -> str:
@@ -27,7 +29,7 @@ def _checkpoint(
     identity_suffix: str = "",
     code_sha: str = "a" * 40,
 ) -> control.CheckpointIdentityV1:
-    bsp = mode == "bsp_spline_async"
+    bsp = mode.startswith("bsp_spline")
     return control.CheckpointIdentityV1(
         code_sha=code_sha,
         config_name=("pi05_libero_bsp_lora_h16" if bsp else "pi05_libero_baseline_lora_h16"),
@@ -110,7 +112,11 @@ def _manifest(
         scheduling_delay_ticks=control.SCHEDULING_DELAY_TICKS,
         execution_mode=mode,
         execution_parameters=spec.to_parameters_dict(),
-        latency_calibration=_calibration(mode, identity_suffix=identity_suffix, code_sha=code_sha),
+        latency_calibration=(
+            _calibration(mode, identity_suffix=identity_suffix, code_sha=code_sha)
+            if control.EXECUTION_MODES[mode].asynchronous
+            else None
+        ),
         server_metadata_fingerprint=_sha("server"),
         code_sha=checkpoint.code_sha,
         dataset_revision="v2.0",
@@ -145,6 +151,8 @@ def _records(mode: str) -> list[dict]:
         "baseline_async": 40,
         "baseline_rtc": 45,
         "bsp_spline_async": 48,
+        "baseline_sync": 38,
+        "bsp_spline_sync": 46,
     }[mode]
     for suite in evaluation.SUPPORTED_SUITES:
         for task_id in range(10):
@@ -221,6 +229,20 @@ def _runs() -> dict[str, report.RunDataV5]:
             file_sha256={"manifest.json": _sha(mode)},
         )
         for mode in MODES
+    }
+
+
+def _sync_runs() -> dict[str, report.RunDataV5]:
+    return {
+        mode: report.RunDataV5(
+            path=Path("/runs") / mode,
+            manifest=_manifest(mode),
+            records=_records(mode),
+            summary={},
+            video_audits=(),
+            file_sha256={"manifest.json": _sha(mode)},
+        )
+        for mode in SYNC_MODES
     }
 
 
@@ -389,6 +411,30 @@ def test_writer_refuses_to_mix_with_existing_output(tmp_path):
     (output / "evidence.txt").write_text("preserve")
     with pytest.raises(report.ComparisonErrorV5, match="new or empty"):
         report.write_three_mode_report_v5(list(_runs().values()), output_dir=output)
+
+
+def test_sync_classifier_accepts_only_the_two_sync_modes():
+    classified = sync_report.classify_sync_manifests_v5([_manifest(mode) for mode in reversed(SYNC_MODES)])
+    assert tuple(classified) == SYNC_MODES
+
+    with pytest.raises(report.ComparisonErrorV5, match="exactly two"):
+        sync_report.classify_sync_manifests_v5([_manifest("baseline_sync")])
+    with pytest.raises(report.ComparisonErrorV5, match="sync execution modes"):
+        sync_report.classify_sync_manifests_v5([_manifest("baseline_async"), _manifest("bsp_spline_sync")])
+
+
+def test_sync_writer_is_separate_from_the_existing_three_mode_report(tmp_path):
+    output = tmp_path / "sync-report"
+    result = sync_report.write_sync_pair_report_v5(list(_sync_runs().values()), output_dir=output)
+
+    assert {path.name for path in output.iterdir()} == set(sync_report.SYNC_OUTPUT_FILENAMES_V5)
+    assert result["protocol"]["execution_modes"] == list(SYNC_MODES)
+    assert result["comparison"]["success_rates"] == pytest.approx({"baseline_sync": 0.76, "bsp_spline_sync": 0.92})
+    assert result["comparison"]["paired_delta"]["before_mode"] == "baseline_sync"
+    assert result["comparison"]["paired_delta"]["after_mode"] == "bsp_spline_sync"
+    assert result["comparison"]["diagnostics"]["baseline_sync"]["calibration_p95_latency_ns"] is None
+
+    assert set(report.OUTPUT_FILENAMES_V5).isdisjoint(sync_report.SYNC_OUTPUT_FILENAMES_V5)
 
 
 def test_strict_json_reader_rejects_duplicate_keys(tmp_path):

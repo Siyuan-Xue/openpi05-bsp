@@ -103,7 +103,7 @@ def _manifest(mode_name="baseline_async"):
     mode = control.EXECUTION_MODES[mode_name]
     bsp = mode.policy_variant == "bsp"
     checkpoint_identity = _checkpoint_identity(bsp=bsp)
-    calibration = _calibration(mode_name)
+    calibration = _calibration(mode_name) if mode.asynchronous else None
     return evaluation.EvaluationManifestV5(
         schema_version=5,
         dataset_fps=10,
@@ -367,6 +367,8 @@ def test_manifest_binds_family_protocol_cache_and_async_calibration_identity():
     invalid = (
         lambda: dataclasses.replace(_manifest(), policy_protocol="baseline_rtc_h16_v1"),
         lambda: dataclasses.replace(_manifest(), latency_calibration=_calibration("baseline_rtc")),
+        lambda: dataclasses.replace(_manifest("baseline_sync"), latency_calibration=_calibration("baseline_async")),
+        lambda: dataclasses.replace(_manifest("bsp_spline_async"), latency_calibration=None),
         lambda: dataclasses.replace(_manifest("baseline_rtc"), server_metadata_fingerprint=_OTHER_SHA),
         lambda: dataclasses.replace(_manifest("bsp_spline_async"), bsp_cache_hash=None),
     )

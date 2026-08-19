@@ -72,6 +72,27 @@ _EXECUTION_PARAMETERS_BY_NAME = {
         "activation_policy": "phase_skip_executed_prefix",
         "prefetch_comparison": "remaining_lte_budget",
     },
+    "baseline_sync": {
+        "action_representation": "native",
+        "dispatch": "synchronous",
+        "model_action_horizon": 16,
+        "execution_horizon": 16,
+        "num_inference_steps": 5,
+        "activation_policy": "blocking_replace_after_full_chunk",
+    },
+    "bsp_spline_sync": {
+        "action_representation": "bsp",
+        "dispatch": "synchronous",
+        "parameter_shape": [16, 8],
+        "origin_hz": 10,
+        "degree": 3,
+        "speedup": 2,
+        "effective_curve_rate_hz": 20,
+        "control_freq_hz": 20,
+        "alignment": "disabled_delta_eff",
+        "activation_policy": "blocking_replace_from_curve_start",
+        "replan_policy": "after_closed_curve_endpoint",
+    },
 }
 
 _MODE_IDENTITIES = {
@@ -84,6 +105,8 @@ _MODE_IDENTITIES = {
         True,
         "bsp",
     ),
+    "baseline_sync": ("baseline", "baseline_sync_n5_h16_full_v2", 16, False, None),
+    "bsp_spline_sync": ("bsp", "bsp_spline_sync_speedup2_phase0_v2", 8, False, None),
 }
 
 
@@ -226,8 +249,10 @@ class RequestIntentV5:
             raise ValueError("Unsupported request dispatch")
         if self.trigger not in (
             "initial_plan",
+            "baseline_chunk_exhausted",
             "baseline_async_launch",
             "rtc_launch",
+            "bsp_curve_exhausted",
             "bsp_prefetch",
             "bsp_stale_replan",
         ):
@@ -248,14 +273,16 @@ class RequestIntentV5:
         )
         expected_dispatch = {
             "initial_plan": "blocking_initial",
+            "baseline_chunk_exhausted": "blocking_replan",
             "baseline_async_launch": "background",
             "rtc_launch": "background",
+            "bsp_curve_exhausted": "blocking_replan",
             "bsp_prefetch": "background",
             "bsp_stale_replan": "blocking_replan",
         }[self.trigger]
         if self.dispatch != expected_dispatch:
             raise ValueError("request dispatch does not match its trigger")
-        if self.trigger == "initial_plan":
+        if self.trigger in ("initial_plan", "baseline_chunk_exhausted", "bsp_curve_exhausted"):
             if scheduler_context:
                 raise ValueError("request trigger requires an empty scheduler context")
         elif self.trigger in ("baseline_async_launch", "rtc_launch"):
@@ -349,8 +376,11 @@ class ActivationDecisionV5:
                 != activation_context["executed_prefix_steps"] * 1_000_000
                 or activation_context["first_sample_microindices"] < activation_context["phase_offset_microindices"]
                 or activation_context["remaining_curve_ns"] != expected_remaining_ns
-                or activation_context["immediate_prefetch"]
-                != int(activation_context["remaining_curve_ns"] <= SCHEDULING_LATENCY_BUDGET_NS)
+                or activation_context["immediate_prefetch"] not in (0, 1)
+                or (
+                    activation_context["immediate_prefetch"] == 1
+                    and activation_context["remaining_curve_ns"] > SCHEDULING_LATENCY_BUDGET_NS
+                )
             ):
                 raise ValueError("BSP phase-skip activation context is inconsistent")
         elif set(activation_context) == {
@@ -1308,6 +1338,7 @@ def validate_server_metadata(mode: ExecutionModeSpec, metadata: Mapping[str, Any
             "model_action_dim": 32,
             "supported_protocols": [
                 "baseline_h16_n5_v1",
+                "baseline_sync_n5_h16_full_v2",
                 "baseline_async_h16_v1",
                 "baseline_rtc_h16_v1",
             ],
@@ -1318,7 +1349,10 @@ def validate_server_metadata(mode: ExecutionModeSpec, metadata: Mapping[str, Any
             "action_representation": "bsp",
             "model_action_horizon": 16,
             "model_action_dim": 32,
-            "supported_protocols": ["bsp_spline_async_phase_skip_speedup2_v2"],
+            "supported_protocols": [
+                "bsp_spline_sync_speedup2_phase0_v2",
+                "bsp_spline_async_phase_skip_speedup2_v2",
+            ],
         }
     for field, expected_value in expected.items():
         actual = capabilities[field]
@@ -1763,6 +1797,86 @@ class ModeSchedulerV5:
         self._pending_intent = None
 
 
+class _BaselineSyncScheduler(ModeSchedulerV5):
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self._chunk = None  # type: Optional[rtc.RtcActionChunk]
+        self._cursor = 0
+        self._installed_count = 0
+        self._pending_intent = None
+
+    def maybe_request(
+        self,
+        now_ns: int,
+        *,
+        at_due: bool,
+        request_in_flight: bool,
+        control_step: int = 0,
+    ) -> Optional[RequestIntentV5]:
+        _require_nonbool_int(now_ns, label="now_ns", minimum=0)
+        _require_bool(at_due, label="at_due")
+        _require_bool(request_in_flight, label="request_in_flight")
+        _require_nonbool_int(control_step, label="control_step", minimum=0)
+        pending = self._reuse_pending(request_in_flight=request_in_flight)
+        if pending is not None or self._pending_intent is not None:
+            return pending
+        if request_in_flight:
+            return None
+        if self._chunk is None:
+            dispatch = "blocking_initial"
+            trigger = "initial_plan"
+        elif self._cursor >= 16:
+            dispatch = "blocking_replan"
+            trigger = "baseline_chunk_exhausted"
+        else:
+            return None
+        return self._set_pending(
+            RequestIntentV5(
+                dispatch=dispatch,
+                trigger=trigger,
+                scheduler_context={},
+                request_overlay={
+                    inference.RTC_REQUEST_KEY: {
+                        "schema_version": inference.RTC_SCHEMA_VERSION,
+                    }
+                },
+            )
+        )
+
+    def install_response(
+        self,
+        intent: RequestIntentV5,
+        response: Mapping[str, Any],
+        *,
+        now_ns: int,
+        control_step: int,
+    ) -> ActivationDecisionV5:
+        _validate_install_inputs(intent, now_ns=now_ns, control_step=control_step)
+        self._require_pending(intent)
+        self._chunk = rtc.RtcActionChunk.from_response(response)
+        self._cursor = 0
+        activation = "initial" if self._installed_count == 0 else "blocking_replace"
+        self._installed_count += 1
+        self._complete_pending()
+        return ActivationDecisionV5(
+            activation=activation,
+            activation_context={"action_cursor": 0},
+        )
+
+    def take_action(self, now_ns: int, *, control_step: int = 0) -> ActionDecisionV5:
+        _require_nonbool_int(now_ns, label="now_ns", minimum=0)
+        _require_nonbool_int(control_step, label="control_step", minimum=0)
+        if self._chunk is None:
+            raise rtc.RtcPlanExhaustedError("baseline sync has no installed chunk")
+        if self._cursor >= 16:
+            return ActionDecisionV5(action=None, underflow=True)
+        action = self._chunk.actions[self._cursor]
+        self._cursor += 1
+        return ActionDecisionV5(action=action, underflow=False)
+
+
 class _BaselineAsyncScheduler(ModeSchedulerV5):
     def __init__(self, d_init: int) -> None:
         self._d_init = d_init
@@ -2109,14 +2223,21 @@ def make_scheduler_v5(
 ) -> ModeSchedulerV5:
     _require_known_mode(mode)
     _require_matching_calibration(mode, calibration)
+    if mode.name == "baseline_sync":
+        return _BaselineSyncScheduler()
+    if mode.name == "bsp_spline_sync":
+        return _BspScheduler(asynchronous=False, budget_ns=None)
     if mode.name == "baseline_async":
+        assert calibration is not None
         if calibration.derived_delay_ticks is None:
             raise ValueError("baseline async calibration is missing derived delay ticks")
         return _BaselineAsyncScheduler(calibration.derived_delay_ticks)
     if mode.name == "baseline_rtc":
+        assert calibration is not None
         if calibration.derived_delay_ticks is None:
             raise ValueError("RTC calibration is missing derived delay ticks")
         return _RtcScheduler(calibration.derived_delay_ticks)
+    assert calibration is not None
     if calibration.derived_prefetch_budget_ns is None:
         raise ValueError("BSP calibration is missing its prefetch budget")
     return _BspScheduler(
@@ -2134,6 +2255,10 @@ def _require_matching_calibration(
     mode: ExecutionModeSpec,
     calibration: Optional["LatencyCalibrationV2"],
 ) -> None:
+    if not mode.asynchronous:
+        if calibration is not None:
+            raise ValueError("synchronous modes must not carry latency calibration")
+        return
     if not isinstance(calibration, LatencyCalibrationV2):
         raise ValueError("asynchronous modes require latency calibration")
     calibration._validate()

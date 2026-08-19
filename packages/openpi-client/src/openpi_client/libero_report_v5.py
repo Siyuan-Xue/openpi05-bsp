@@ -697,7 +697,7 @@ def _latency_diagnostics(
         return ordered[rank - 1]
 
     calibration = manifest["latency_calibration"]
-    calibration_p95 = calibration["empirical_observed_effective_p95_ns"]
+    calibration_p95 = calibration["empirical_observed_effective_p95_ns"] if calibration is not None else None
     observed_effective_total = sum(observed_effective_durations)
     stall_total = sum(stall_durations)
     hidden_ns = max(0, observed_effective_total - stall_total)

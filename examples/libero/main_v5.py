@@ -360,7 +360,7 @@ def _validate_args_v5(
     try:
         mode = _control.EXECUTION_MODES[args.execution_mode]
     except (KeyError, TypeError) as error:
-        raise ValueError("execution_mode must be one of the three schema-v5 modes") from error
+        raise ValueError("execution_mode must be one of the five schema-v5 runtime modes") from error
     suite_aliases = {
         "libero_spatial": "libero_spatial",
         "spatial": "libero_spatial",

@@ -425,6 +425,60 @@ def _mixed_async_timeline():
     return requests, latencies, activations, underflows, stalls
 
 
+@pytest.mark.parametrize(
+    ("execution_mode", "trigger", "activation_context"),
+    (
+        ("baseline_sync", "baseline_chunk_exhausted", {"action_cursor": 0}),
+        ("bsp_spline_sync", "bsp_curve_exhausted", _bsp_activation_context(16, 16)),
+    ),
+)
+def test_sync_modes_count_only_the_deadline_overrun_on_later_replans(
+    execution_mode,
+    trigger,
+    activation_context,
+):
+    requests = (
+        _initial_request(),
+        _request(
+            1,
+            900_000_000,
+            observation_control_step=16,
+            dispatch="blocking_replan",
+            trigger=trigger,
+            scheduler_context={},
+        ),
+    )
+    latencies = (
+        _latency(0, 300_000_000, 300_000_000),
+        _latency(1, 1_200_000_000, 300_000_000),
+    )
+    initial_context = {"action_cursor": 0} if execution_mode == "baseline_sync" else _bsp_activation_context(0, 0)
+    activations = (
+        timing.PlanActivationV5(0, 0, 0, 300_000_000, "initial", initial_context),
+        timing.PlanActivationV5(1, 1, 16, 1_200_000_000, "blocking_replace", activation_context),
+    )
+    stalls = (
+        _stall(0, 0, 0, 300_000_000, reason="synchronous_inference"),
+        _stall(1, 16, 950_000_000, 250_000_000, reason="synchronous_inference"),
+    )
+
+    normalized = timing.validate_timing_events_v5(
+        requests=requests,
+        latencies=latencies,
+        activations=activations,
+        underflows=(),
+        stalls=stalls,
+        steps=17,
+        episode_duration_ns=1_250_000_000,
+        execution_mode=execution_mode,
+        eval_seed=_EVAL_SEED,
+        identity=_IDENTITY,
+    )
+
+    assert normalized[0] == requests
+    assert normalized[-1] == stalls
+
+
 def test_event_records_round_trip_exact_fields_and_defensively_copy_contexts():
     scheduler_context = {"s": 8, "d": 8}
     request = _request(3, 40, scheduler_context=scheduler_context)

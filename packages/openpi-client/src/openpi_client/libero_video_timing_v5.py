@@ -38,8 +38,10 @@ _DISPATCHES = frozenset(("blocking_initial", "blocking_replan", "background"))
 _TRIGGERS = frozenset(
     (
         "initial_plan",
+        "baseline_chunk_exhausted",
         "baseline_async_launch",
         "rtc_launch",
+        "bsp_curve_exhausted",
         "bsp_prefetch",
         "bsp_stale_replan",
     )
@@ -48,9 +50,9 @@ _DISPOSITIONS = frozenset(("activated", "discarded_stale_phase", "failed", "aban
 _LATENCY_OUTCOMES = frozenset(("success", "policy_failure"))
 _ACTIVATIONS = frozenset(("initial", "blocking_replace", "immediate_swap"))
 _STALL_REASONS = frozenset((STALL_REASON_SYNCHRONOUS_INFERENCE, STALL_REASON_ASYNC_ACTION_UNDERFLOW))
-_EXECUTION_MODES = frozenset(("baseline_async", "baseline_rtc", "bsp_spline_async"))
-_NATIVE_MODES = frozenset(("baseline_async", "baseline_rtc"))
-_ASYNC_MODES = _EXECUTION_MODES
+_EXECUTION_MODES = frozenset(("baseline_async", "baseline_rtc", "bsp_spline_async", "baseline_sync", "bsp_spline_sync"))
+_NATIVE_MODES = frozenset(("baseline_async", "baseline_rtc", "baseline_sync"))
+_ASYNC_MODES = frozenset(("baseline_async", "baseline_rtc", "bsp_spline_async"))
 
 _REQUEST_FIELDS = frozenset(
     (
@@ -195,7 +197,7 @@ def _context_copy(value: Any, *, label: str) -> Dict[str, Any]:
 
 
 def _validate_scheduler_context(trigger: str, context: Mapping[str, Any]) -> None:
-    if trigger == "initial_plan":
+    if trigger in ("initial_plan", "baseline_chunk_exhausted", "bsp_curve_exhausted"):
         if context:
             raise ValueError("{} scheduler context must be empty".format(trigger))
         return
@@ -292,7 +294,7 @@ def _validate_activation_context(context: Mapping[str, Any]) -> None:
             or phase != prefix * 1_000_000
             or first_sample < phase
             or remaining_ns != expected_remaining_ns
-            or immediate != int(remaining_ns <= 400_000_000)
+            or (immediate == 1 and remaining_ns > 400_000_000)
         ):
             raise ValueError("BSP phase-skip activation context is inconsistent")
         return
@@ -335,8 +337,10 @@ class RequestEventV5:
         )
         expected_dispatch = {
             "initial_plan": "blocking_initial",
+            "baseline_chunk_exhausted": "blocking_replan",
             "baseline_async_launch": "background",
             "rtc_launch": "background",
+            "bsp_curve_exhausted": "blocking_replan",
             "bsp_prefetch": "background",
             "bsp_stale_replan": "blocking_replan",
         }[self.trigger]
@@ -779,6 +783,8 @@ def validate_timing_events_v5(
         "baseline_async": ("background", "baseline_async_launch"),
         "baseline_rtc": ("background", "rtc_launch"),
         "bsp_spline_async": ("background", "bsp_prefetch"),
+        "baseline_sync": ("blocking_replan", "baseline_chunk_exhausted"),
+        "bsp_spline_sync": ("blocking_replan", "bsp_curve_exhausted"),
     }[execution_mode]
     if execution_mode == "bsp_spline_async":
         if expected_bsp_prefetch_budget_ns is None:
@@ -972,6 +978,17 @@ def validate_timing_events_v5(
                 or context["activation_control_step"] != activation.control_step
             ):
                 raise ValueError("BSP activation steps do not match request and activation records")
+            if execution_mode == "bsp_spline_sync" and (
+                context["executed_prefix_steps"] != 0
+                or context["phase_offset_microindices"] != 0
+                or context["first_sample_microindices"] != 0
+                or context["immediate_prefetch"] != 0
+            ):
+                raise ValueError("BSP sync activations must start at phase zero without prefetch")
+            if execution_mode == "bsp_spline_async" and context["immediate_prefetch"] != int(
+                context["remaining_curve_ns"] <= 400_000_000
+            ):
+                raise ValueError("BSP async immediate-prefetch audit is inconsistent")
         activations_by_request[activation.request_id] = activation
         previous_activation_offset = activation.activated_offset_ns
         previous_activation_step = activation.control_step
@@ -1086,6 +1103,8 @@ def validate_timing_events_v5(
                 stall.started_offset_ns != request.submitted_offset_ns or stall.duration_ns != latency.duration_ns
             ):
                 raise ValueError("initial and stale-replan stalls must equal the full request")
+            if not full_interval_required and stall_end != latency.completed_offset_ns:
+                raise ValueError("blocking-replan stall must end at request completion")
             if not full_interval_required and (stall.duration_ns == 0 or stall_end != latency.completed_offset_ns):
                 raise ValueError("later baseline synchronous stall must be an exact positive suffix")
         stalls_by_request[stall.request_id] = stall

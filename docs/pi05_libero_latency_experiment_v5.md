@@ -197,3 +197,52 @@ latency hiding ratio、control steps、episode wall time、吞吐和视频 timin
 列出 code SHA，并把这次 BSP 结果标记为相位修复后的协议升级重跑，不能说成三组使用同一
 二进制。结论只限于随机延迟下的延迟隐藏、轨迹衔接和吞吐；由于 underflow 时仿真暂停，
 不能直接解释为真机动力学改善。
+
+## 同步扩展与本轮补跑边界
+
+在不修改已经完成的 `baseline_async`、`baseline_rtc` 和
+`bsp_spline_async` 三个正式结果的前提下，schema-v5 新增两个独立同步运行模式：
+
+| 模式 | 协议 | 阻塞后的执行语义 |
+|---|---|---|
+| `baseline_sync` | `baseline_sync_n5_h16_full_v2` | 完整执行 16 个动作后才阻塞请求下一块 |
+| `bsp_spline_sync` | `bsp_spline_sync_speedup2_phase0_v2` | 连续执行整条闭合曲线；每次替换从 `t_min` 开始 |
+
+两种同步模式仍使用确定性配对 `Normal(300 ms, 60 ms)` 延迟注入点，但不运行异步
+calibration，manifest 中的 `latency_calibration` 必须为 `null`。每次请求都发生在动作块或
+曲线完全耗尽之后。初始请求的完整 effective inference latency 是 control stall；后续请求
+会立即开始，只有超过下一个 20 Hz 控制截止点的部分才是真实 control stall。例如目标延迟
+300 ms 时，若请求利用了下一步前约 50 ms 的空档，录像约显示 250 ms 停顿。控制频率仍为
+20 Hz、视频仍为 40 FPS，视频持续显示单行
+`Cumulative inference wait: X.XX s`；冻结时长不放大，也不新增 `env.step()`。
+
+`baseline_sync` 不得复用 async/RTC 的“执行第 8 步时后台预取”门禁，也不得只执行前
+8 个动作。它在一次响应中依次执行索引 `0..15`，第 16 个动作完成后才请求下一块。
+`bsp_spline_sync` 保持与 async BSP 相同的 `origin_hz=10`、`speedup=2`、20 indices/s
+连续曲线尺度，但不做后台请求、相位跳过或过期响应处理；请求期间没有旧路径执行，故新
+曲线固定从 `t_min` 开始，phase offset 为 0。
+
+原三模式 reporter 仍严格只接收：
+
+```text
+baseline_async / baseline_rtc / bsp_spline_async
+```
+
+同步比较使用独立入口：
+
+```bash
+python scripts/compare_libero_sync_v5.py \
+  /path/to/baseline-sync-run \
+  /path/to/bsp-spline-sync-run \
+  --output-dir /new/empty/sync-report
+```
+
+它严格只接收 `baseline_sync / bsp_spline_sync`，并生成
+`sync_comparison_v5.json`、`sync_task_metrics_v5.csv` 和 `sync_report_v5.md`，不会覆盖
+原来的三模式报告。
+
+本轮用户已批准实现和服务器门禁；本轮只补跑 `baseline_sync` 的 2000 episodes；
+不得重启已经完成的三个异步/RTC 组，也不得自动启动 `bsp_spline_sync`。新结果通过门禁后
+作为第 4 组完整归档到 `/mnt/data/siyuanxue`，包括 manifest、episodes、summary、
+video audit、全部选中 MP4、日志和校验清单。将来只有另行批准 BSP 同步评测后，才运行
+上述二输入同步 reporter。

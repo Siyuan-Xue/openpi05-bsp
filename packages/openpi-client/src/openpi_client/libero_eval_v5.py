@@ -341,7 +341,7 @@ class EvaluationManifestV5:
     scheduling_delay_ticks: int
     execution_mode: str
     execution_parameters: Mapping[str, Any]
-    latency_calibration: _control.LatencyCalibrationV2
+    latency_calibration: Optional[_control.LatencyCalibrationV2]
     server_metadata_fingerprint: str
     code_sha: str
     dataset_revision: str
@@ -502,15 +502,18 @@ class EvaluationManifestV5:
         if not _json_values_match(self.bsp_parameters, dict(BSP_PARAMETERS)):
             raise ValueError("bsp_parameters must match the frozen LIBERO BSP identity")
         calibration = self.latency_calibration
-        if not isinstance(calibration, _control.LatencyCalibrationV2):
-            raise ValueError("schema-v5 modes require LatencyCalibrationV2")
-        calibration.to_dict()
-        if calibration.execution_mode != self.execution_mode:
-            raise ValueError("calibration execution_mode does not match manifest")
-        if calibration.server_metadata_fingerprint != self.server_metadata_fingerprint:
-            raise ValueError("calibration server fingerprint does not match manifest")
-        if calibration.checkpoint_identity_fingerprint != checkpoint_identity.fingerprint:
-            raise ValueError("calibration checkpoint fingerprint does not match manifest")
+        if mode.asynchronous:
+            if not isinstance(calibration, _control.LatencyCalibrationV2):
+                raise ValueError("asynchronous schema-v5 modes require LatencyCalibrationV2")
+            calibration.to_dict()
+            if calibration.execution_mode != self.execution_mode:
+                raise ValueError("calibration execution_mode does not match manifest")
+            if calibration.server_metadata_fingerprint != self.server_metadata_fingerprint:
+                raise ValueError("calibration server fingerprint does not match manifest")
+            if calibration.checkpoint_identity_fingerprint != checkpoint_identity.fingerprint:
+                raise ValueError("calibration checkpoint fingerprint does not match manifest")
+        elif calibration is not None:
+            raise ValueError("synchronous schema-v5 modes require null latency_calibration")
 
         suites = tuple(self.suites)
         if suites not in tuple((suite,) for suite in SUPPORTED_SUITES) + (SUPPORTED_SUITES,):
@@ -518,13 +521,14 @@ class EvaluationManifestV5:
         task_ids = tuple(_require_integer(value, name="task_id", minimum=0, maximum=9) for value in self.task_ids)
         if not task_ids or task_ids != tuple(sorted(set(task_ids))):
             raise ValueError("task_ids must be non-empty, unique, and sorted")
-        canonical = calibration.canonical_observation_identity
-        if canonical.suite != suites[0]:
-            raise ValueError("calibration canonical observation suite must match suites[0]")
-        if canonical.task_id != task_ids[0]:
-            raise ValueError("calibration canonical observation task_id must match task_ids[0]")
-        if canonical.init_state_index != 0:
-            raise ValueError("calibration canonical observation init_state_index must be zero")
+        if calibration is not None:
+            canonical = calibration.canonical_observation_identity
+            if canonical.suite != suites[0]:
+                raise ValueError("calibration canonical observation suite must match suites[0]")
+            if canonical.task_id != task_ids[0]:
+                raise ValueError("calibration canonical observation task_id must match task_ids[0]")
+            if canonical.init_state_index != 0:
+                raise ValueError("calibration canonical observation init_state_index must be zero")
         _require_integer(self.trials_per_task, name="trials_per_task", minimum=1)
         _require_nonnegative_integer(self.num_steps_wait, name="num_steps_wait")
         if set(self.max_steps_by_suite) != set(suites):
@@ -595,8 +599,11 @@ class EvaluationManifestV5:
         mode = _control.EXECUTION_MODES.get(payload["execution_mode"])
         if mode is not None and not _json_wire_values_match(payload["execution_parameters"], mode.to_parameters_dict()):
             raise ValueError("execution_parameters must use the exact JSON container types")
-        calibration_payload = _require_json_object(payload["latency_calibration"], label="latency_calibration")
-        payload["latency_calibration"] = _control.LatencyCalibrationV2.from_dict(calibration_payload)
+        if payload["latency_calibration"] is None:
+            payload["latency_calibration"] = None
+        else:
+            calibration_payload = _require_json_object(payload["latency_calibration"], label="latency_calibration")
+            payload["latency_calibration"] = _control.LatencyCalibrationV2.from_dict(calibration_payload)
         return cls(**payload)
 
 

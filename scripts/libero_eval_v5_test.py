@@ -45,12 +45,16 @@ def _metadata_payload(*, revision="same", policy_variant="baseline"):
         representation = "native"
         protocols = [
             "baseline_h16_n5_v1",
+            "baseline_sync_n5_h16_full_v2",
             "baseline_async_h16_v1",
             "baseline_rtc_h16_v1",
         ]
     else:
         representation = "bsp"
-        protocols = ["bsp_spline_async_phase_skip_speedup2_v2"]
+        protocols = [
+            "bsp_spline_sync_speedup2_phase0_v2",
+            "bsp_spline_async_phase_skip_speedup2_v2",
+        ]
     return msgpack_numpy.packb(
         {
             "server_revision": revision,
@@ -327,7 +331,7 @@ def _run(clock, worker, environment, *, args=None, scheduler=None, max_steps=20)
     return main_v5._run_attempt_v5(
         environment=environment,
         worker=worker,
-        scheduler=scheduler or control.make_scheduler_v5(mode, _calibration(mode.name)),
+        scheduler=scheduler or control.make_scheduler_v5(mode, _calibration(mode.name) if mode.asynchronous else None),
         initial_state=np.array([1.0], dtype=np.float32),
         identity=_identity(),
         task_description="pick up the block",
@@ -423,11 +427,20 @@ def test_every_baseline_sync_request_has_schema_one_rtc_envelope_and_fresh_seed(
     clock = ManualClock()
     worker = FakeWorker(
         clock,
-        [_ScriptedCall(0, _rtc_response()), _ScriptedCall(0, _rtc_response(100.0))],
+        [
+            _ScriptedCall(300 * NS_PER_MS, _rtc_response()),
+            _ScriptedCall(300 * NS_PER_MS, _rtc_response(100.0)),
+        ],
+        formal_sampling=True,
     )
-    environment = FakeEnvironment(done_after_real_steps=9)
+    environment = FakeEnvironment(done_after_real_steps=17)
 
-    result = _run(clock, worker, environment)
+    result = _run(
+        clock,
+        worker,
+        environment,
+        args=_args(execution_mode="baseline_sync"),
+    )
 
     assert len(worker.requests) == 2
     assert [request[inference.RTC_REQUEST_KEY] for request in worker.requests] == [
@@ -440,8 +453,12 @@ def test_every_baseline_sync_request_has_schema_one_rtc_envelope_and_fresh_seed(
     ]
     assert all("previous_model_actions" not in request[inference.RTC_REQUEST_KEY] for request in worker.requests)
     assert np.array_equal(environment.actions[0], _rtc_response()["actions"][0])
-    assert np.array_equal(environment.actions[7], _rtc_response()["actions"][7])
-    assert np.array_equal(environment.actions[8], _rtc_response(100.0)["actions"][0])
+    assert np.array_equal(environment.actions[15], _rtc_response()["actions"][15])
+    assert np.array_equal(environment.actions[16], _rtc_response(100.0)["actions"][0])
+    assert [stall.request_id for stall in result.control_stalls] == [0, 1]
+    assert all(stall.reason == "synchronous_inference" for stall in result.control_stalls)
+    assert result.control_stalls[0].duration_ns == result.inference_latencies[0].duration_ns
+    assert result.control_stalls[1].duration_ns == result.inference_latencies[1].duration_ns - 50 * NS_PER_MS
     assert result.success, result.error
 
 
