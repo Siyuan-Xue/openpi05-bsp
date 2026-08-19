@@ -150,6 +150,15 @@ def _to_microindices(value: float) -> int:
     return int(round(numeric * 1_000_000))
 
 
+def _remaining_ns_from_microindices(remaining_microindices: int) -> int:
+    remaining = _require_nonbool_int(
+        remaining_microindices,
+        label="remaining_microindices",
+        minimum=0,
+    )
+    return (remaining * 1_000_000_000 + 20_000_000 - 1) // 20_000_000
+
+
 def _require_sha256(value: Any, *, label: str) -> str:
     if not isinstance(value, str) or _SHA256_PATTERN.fullmatch(value) is None:
         raise ValueError("{} must be a lowercase SHA256".format(label))
@@ -330,9 +339,7 @@ class ActivationDecisionV5:
             "remaining_curve_ns",
             "immediate_prefetch",
         }:
-            expected_remaining_ns = (
-                activation_context["remaining_curve_microindices"] * 1_000_000_000 + 20_000_000 - 1
-            ) // 20_000_000
+            expected_remaining_ns = _remaining_ns_from_microindices(activation_context["remaining_curve_microindices"])
             if (
                 self.activation == "discarded_stale_phase"
                 or activation_context["activation_control_step"] < activation_context["request_control_step"]
@@ -2034,6 +2041,7 @@ class _BspScheduler(ModeSchedulerV5):
         first_microindices = _to_microindices(installed.first_sample_time)
         curve_t_max_microindices = _to_microindices(bsp_spline.BspSpline.from_response(response["bsp"]).t_max)
         remaining_microindices = max(0, curve_t_max_microindices - phase_microindices)
+        remaining_curve_ns = _remaining_ns_from_microindices(remaining_microindices)
         if installed.stale:
             self._complete_pending()
             self._pending_request_control_step = None
@@ -2070,7 +2078,7 @@ class _BspScheduler(ModeSchedulerV5):
         self._pending_request_control_step = None
         self._stale_replan_context = None
         immediate_prefetch = int(
-            self._asynchronous and self._budget_ns is not None and installed.remaining_time_ns <= self._budget_ns
+            self._asynchronous and self._budget_ns is not None and remaining_curve_ns <= self._budget_ns
         )
         return ActivationDecisionV5(
             activation=activation,
@@ -2081,7 +2089,7 @@ class _BspScheduler(ModeSchedulerV5):
                 "phase_offset_microindices": phase_microindices,
                 "first_sample_microindices": first_microindices,
                 "remaining_curve_microindices": remaining_microindices,
-                "remaining_curve_ns": installed.remaining_time_ns,
+                "remaining_curve_ns": remaining_curve_ns,
                 "immediate_prefetch": immediate_prefetch,
             },
         )

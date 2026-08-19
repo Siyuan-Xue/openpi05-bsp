@@ -566,6 +566,27 @@ def test_bsp_async_accepts_a_curve_shorter_than_the_budget_and_immediately_prefe
     )
 
 
+def test_bsp_async_canonicalizes_fractional_knot_remaining_time_for_strict_audit():
+    scheduler = control.make_scheduler_v5(
+        control.EXECUTION_MODES["bsp_spline_async"],
+        _schema5_calibration("bsp_spline_async"),
+    )
+    initial = scheduler.maybe_request(0, control_step=0, at_due=True, request_in_flight=False)
+
+    activation = scheduler.install_response(
+        initial,
+        _bsp_response(duration_ticks=9.1234564),
+        now_ns=0,
+        control_step=0,
+    )
+
+    remaining_microindices = activation.activation_context["remaining_curve_microindices"]
+    assert (
+        activation.activation_context["remaining_curve_ns"]
+        == (remaining_microindices * 1_000_000_000 + 20_000_000 - 1) // 20_000_000
+    )
+
+
 def test_bsp_async_uses_control_steps_to_skip_elapsed_prefix_and_immediately_prefetches_short_tail():
     scheduler = control.make_scheduler_v5(
         control.EXECUTION_MODES["bsp_spline_async"],
