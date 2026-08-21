@@ -400,8 +400,8 @@ def test_policy_computes_exact_reserved_capability_metadata_and_rejects_collisio
                 "bsp_spline_sync_speedup2_phase0_v2",
                 "bsp_spline_async_phase_skip_speedup2_v2",
                 "bsp_spline_async_phase_skip_speedup1_v1",
-                "bsp_spline_async_phase_skip_speedup4_v1",
-                "bsp_spline_async_phase_skip_speedup8_v1",
+                "bsp_spline_async_phase_skip_speedup4_delta_accum_v2",
+                "bsp_spline_async_phase_skip_speedup8_delta_accum_v2",
             ],
         },
     }

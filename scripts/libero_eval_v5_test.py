@@ -56,8 +56,8 @@ def _metadata_payload(*, revision="same", policy_variant="baseline"):
             "bsp_spline_sync_speedup2_phase0_v2",
             "bsp_spline_async_phase_skip_speedup2_v2",
             "bsp_spline_async_phase_skip_speedup1_v1",
-            "bsp_spline_async_phase_skip_speedup4_v1",
-            "bsp_spline_async_phase_skip_speedup8_v1",
+            "bsp_spline_async_phase_skip_speedup4_delta_accum_v2",
+            "bsp_spline_async_phase_skip_speedup8_delta_accum_v2",
         ]
     return msgpack_numpy.packb(
         {

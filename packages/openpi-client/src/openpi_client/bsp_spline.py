@@ -394,7 +394,7 @@ class BspControlActionPlan:
         else:
             evaluation_time = max(spline.t_min, spline_time)
             result = BspPlanSample(
-                action=spline.evaluate(evaluation_time),
+                action=self._evaluate_control_action(spline, evaluation_time),
                 spline_time=evaluation_time,
                 underflow=False,
             )
@@ -467,6 +467,23 @@ class BspControlActionPlan:
     def _require_at_or_after_high_water(self, step: int, *, name: str) -> None:
         if self._high_water_control_step is not None and step < self._high_water_control_step:
             raise ValueError("{} must not precede the observed high-water control_step".format(name))
+
+    @staticmethod
+    def _evaluate_control_action(spline: BspSpline, evaluation_time: float) -> np.ndarray:
+        """Accumulate the nominal 2x delta commands consumed by one faster control step."""
+        if spline.speedup <= _DEFAULT_SPEEDUP:
+            return spline.evaluate(evaluation_time)
+        nominal_actions = spline.evaluate(
+            [
+                max(spline.t_min, evaluation_time + offset)
+                for offset in range(spline.speedup // _DEFAULT_SPEEDUP)
+                if evaluation_time + offset <= spline.t_max
+            ]
+        )
+        accumulated = np.empty(_ACTION_DIM, dtype=np.float32)
+        accumulated[:6] = np.sum(nominal_actions[:, :6], axis=0, dtype=np.float64)
+        accumulated[6] = nominal_actions[-1, 6]
+        return accumulated
 
     @staticmethod
     def _phase_at_step(

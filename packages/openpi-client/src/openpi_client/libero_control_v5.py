@@ -204,14 +204,14 @@ _MODE_IDENTITIES = {
     ),
     "bsp_spline_async_native_speedup4": (
         "bsp",
-        "bsp_spline_async_phase_skip_speedup4_v1",
+        "bsp_spline_async_phase_skip_speedup4_delta_accum_v2",
         8,
         True,
         "bsp",
     ),
     "bsp_spline_async_native_speedup8": (
         "bsp",
-        "bsp_spline_async_phase_skip_speedup8_v1",
+        "bsp_spline_async_phase_skip_speedup8_delta_accum_v2",
         8,
         True,
         "bsp",
@@ -1563,8 +1563,8 @@ def validate_server_metadata(mode: ExecutionModeSpec, metadata: Mapping[str, Any
                 "bsp_spline_sync_speedup2_phase0_v2",
                 "bsp_spline_async_phase_skip_speedup2_v2",
                 "bsp_spline_async_phase_skip_speedup1_v1",
-                "bsp_spline_async_phase_skip_speedup4_v1",
-                "bsp_spline_async_phase_skip_speedup8_v1",
+                "bsp_spline_async_phase_skip_speedup4_delta_accum_v2",
+                "bsp_spline_async_phase_skip_speedup8_delta_accum_v2",
             ],
         }
     for field, expected_value in expected.items():

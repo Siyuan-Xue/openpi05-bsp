@@ -63,8 +63,8 @@ def _bsp_metadata(extra=None):
                 "bsp_spline_sync_speedup2_phase0_v2",
                 "bsp_spline_async_phase_skip_speedup2_v2",
                 "bsp_spline_async_phase_skip_speedup1_v1",
-                "bsp_spline_async_phase_skip_speedup4_v1",
-                "bsp_spline_async_phase_skip_speedup8_v1",
+                "bsp_spline_async_phase_skip_speedup4_delta_accum_v2",
+                "bsp_spline_async_phase_skip_speedup8_delta_accum_v2",
             ],
         },
     }
@@ -1351,14 +1351,14 @@ def test_native_bsp_mode_preserves_speedup2_and_declares_dynamic_raw_latency_pre
         (
             "bsp_spline_async_native_speedup4",
             4,
-            "bsp_spline_async_phase_skip_speedup4_v1",
+            "bsp_spline_async_phase_skip_speedup4_delta_accum_v2",
             40,
             2_000_000,
         ),
         (
             "bsp_spline_async_native_speedup8",
             8,
-            "bsp_spline_async_phase_skip_speedup8_v1",
+            "bsp_spline_async_phase_skip_speedup8_delta_accum_v2",
             80,
             4_000_000,
         ),
