@@ -114,6 +114,40 @@ def _bsp_activation_context(request_step, activation_step, *, remaining_indices=
     }
 
 
+@pytest.mark.parametrize(
+    ("execution_mode", "remaining_ns"),
+    (
+        ("bsp_spline_async_native_speedup4", 225_000_000),
+        ("bsp_spline_async_native_speedup8", 112_500_000),
+    ),
+)
+def test_native_high_speedup_timing_uses_mode_phase_rate_and_dynamic_budget(execution_mode, remaining_ns):
+    activation_context = {
+        "request_control_step": 0,
+        "activation_control_step": 0,
+        "executed_prefix_steps": 0,
+        "phase_offset_microindices": 0,
+        "first_sample_microindices": 0,
+        "remaining_curve_microindices": 9_000_000,
+        "remaining_curve_ns": remaining_ns,
+        "immediate_prefetch": 0,
+        "prefetch_budget_ns": 100_000_000,
+    }
+    normalized = timing.validate_timing_events_v5(
+        requests=(_initial_request(),),
+        latencies=(_latency(0, 100, 100),),
+        activations=(timing.PlanActivationV5(0, 0, 0, 100, "initial", activation_context),),
+        underflows=(),
+        stalls=(_stall(0, 0, 0, 100, reason="synchronous_inference"),),
+        steps=0,
+        episode_duration_ns=100,
+        execution_mode=execution_mode,
+        eval_seed=_EVAL_SEED,
+        identity=_IDENTITY,
+    )
+    assert normalized[2][0].activation_context["remaining_curve_ns"] == remaining_ns
+
+
 def test_bsp_phase_skip_timeline_accepts_stale_discard_then_same_step_blocking_replan():
     requests = (
         _initial_request(),

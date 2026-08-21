@@ -63,6 +63,8 @@ def _bsp_metadata(extra=None):
                 "bsp_spline_sync_speedup2_phase0_v2",
                 "bsp_spline_async_phase_skip_speedup2_v2",
                 "bsp_spline_async_phase_skip_speedup1_v1",
+                "bsp_spline_async_phase_skip_speedup4_v1",
+                "bsp_spline_async_phase_skip_speedup8_v1",
             ],
         },
     }
@@ -298,6 +300,8 @@ def test_frozen_execution_modes_preserve_async_parameters_and_add_exact_sync_par
         "bsp_spline_async",
         "bsp_spline_async_speedup1",
         "bsp_spline_async_native",
+        "bsp_spline_async_native_speedup4",
+        "bsp_spline_async_native_speedup8",
         "baseline_sync",
         "bsp_spline_sync",
     )
@@ -1277,8 +1281,7 @@ def _schema5_calibration(mode_name, *, empirical_observed_effective_ns=300_000_0
     )
 
 
-def _native_bsp_calibration(raw_latency_ns=80_000_000):
-    mode_name = "bsp_spline_async_native"
+def _native_bsp_calibration(raw_latency_ns=80_000_000, *, mode_name="bsp_spline_async_native"):
     checkpoint = _checkpoint_identity(bsp=True)
     return control.LatencyCalibrationV2.create(
         execution_mode=mode_name,
@@ -1321,6 +1324,8 @@ def test_schema5_adds_bsp_speedup1_without_replacing_existing_modes():
         "bsp_spline_async",
         "bsp_spline_async_speedup1",
         "bsp_spline_async_native",
+        "bsp_spline_async_native_speedup4",
+        "bsp_spline_async_native_speedup8",
         "baseline_sync",
         "bsp_spline_sync",
     }
@@ -1338,6 +1343,50 @@ def test_native_bsp_mode_preserves_speedup2_and_declares_dynamic_raw_latency_pre
     assert mode.to_parameters_dict()["speedup"] == 2
     assert mode.to_parameters_dict()["latency_injection"] == "disabled_native"
     assert mode.to_parameters_dict()["prefetch_budget_policy"] == "rolling_raw_p95_20_ceil_control_period"
+
+
+@pytest.mark.parametrize(
+    ("mode_name", "speedup", "protocol", "effective_rate_hz", "phase_offset_microindices"),
+    [
+        (
+            "bsp_spline_async_native_speedup4",
+            4,
+            "bsp_spline_async_phase_skip_speedup4_v1",
+            40,
+            2_000_000,
+        ),
+        (
+            "bsp_spline_async_native_speedup8",
+            8,
+            "bsp_spline_async_phase_skip_speedup8_v1",
+            80,
+            4_000_000,
+        ),
+    ],
+)
+def test_native_high_speedup_modes_bind_protocol_request_overlay_and_phase_progression(
+    mode_name, speedup, protocol, effective_rate_hz, phase_offset_microindices
+):
+    mode = control.EXECUTION_MODES[mode_name]
+    parameters = mode.to_parameters_dict()
+    assert mode.policy_protocol == protocol
+    assert parameters["speedup"] == speedup
+    assert parameters["effective_curve_rate_hz"] == effective_rate_hz
+    assert parameters["latency_injection"] == "disabled_native"
+
+    scheduler = control.make_scheduler_v5(
+        mode,
+        _native_bsp_calibration(mode_name=mode_name),
+    )
+    initial = scheduler.maybe_request(0, control_step=0, at_due=True, request_in_flight=False)
+    assert initial.request_overlay == {inference.BSP_EXECUTION_KEY: {"schema_version": 1, "speedup": speedup}}
+    activation = scheduler.install_response(
+        initial,
+        _bsp_response(speedup=speedup),
+        now_ns=80_000_000,
+        control_step=1,
+    )
+    assert activation.activation_context["phase_offset_microindices"] == phase_offset_microindices
 
 
 def test_native_bsp_scheduler_updates_prefetch_budget_from_rolling_raw_p95():

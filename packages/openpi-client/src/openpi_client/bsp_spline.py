@@ -20,6 +20,7 @@ _SCHEMA_VERSION = 1
 _ORIGIN_HZ = 10
 _DEGREE = 3
 _DEFAULT_SPEEDUP = 2
+_SUPPORTED_SPEEDUPS = (1, 2, 4, 8)
 _ALIGNMENT = "disabled_delta_eff"
 _PARAMETER_SHAPE = (16, 8)
 _ACTION_DIM = 7
@@ -76,8 +77,8 @@ class BspSpline:
         _require_exact_integer(bsp_mapping["schema_version"], name="schema_version", expected=_SCHEMA_VERSION)
         origin_hz = _require_exact_integer(bsp_mapping["origin_hz"], name="origin_hz", expected=_ORIGIN_HZ)
         degree = _require_exact_integer(bsp_mapping["degree"], name="degree", expected=_DEGREE)
-        if isinstance(expected_speedup, bool) or expected_speedup not in (1, 2):
-            raise ValueError("expected_speedup must be integer 1 or 2")
+        if isinstance(expected_speedup, bool) or expected_speedup not in _SUPPORTED_SPEEDUPS:
+            raise ValueError("expected_speedup must be integer 1, 2, 4, or 8")
         speedup = _require_exact_integer(
             bsp_mapping["speedup"],
             name="speedup",
@@ -190,8 +191,8 @@ class BspActionPlan:
     """Own one active curve and a nondecreasing caller-supplied clock, but no transport."""
 
     def __init__(self, *, expected_speedup: int = _DEFAULT_SPEEDUP) -> None:
-        if isinstance(expected_speedup, bool) or expected_speedup not in (1, 2):
-            raise ValueError("expected_speedup must be integer 1 or 2")
+        if isinstance(expected_speedup, bool) or expected_speedup not in _SUPPORTED_SPEEDUPS:
+            raise ValueError("expected_speedup must be integer 1, 2, 4, or 8")
         self._expected_speedup = expected_speedup
         self._spline = None  # type: Optional[BspSpline]
         self._activation_time_ns = None  # type: Optional[int]
@@ -310,8 +311,8 @@ class BspControlActionPlan:
     """
 
     def __init__(self, *, expected_speedup: int = _DEFAULT_SPEEDUP) -> None:
-        if isinstance(expected_speedup, bool) or expected_speedup not in (1, 2):
-            raise ValueError("expected_speedup must be integer 1 or 2")
+        if isinstance(expected_speedup, bool) or expected_speedup not in _SUPPORTED_SPEEDUPS:
+            raise ValueError("expected_speedup must be integer 1, 2, 4, or 8")
         self._expected_speedup = expected_speedup
         self._spline = None  # type: Optional[BspSpline]
         self._activation_control_step = None  # type: Optional[int]

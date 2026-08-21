@@ -57,7 +57,7 @@ def pop_inference_seed(observation: Mapping[str, Any]) -> tuple[dict[str, Any], 
 
 
 def pop_bsp_execution(observation: Mapping[str, Any]) -> tuple[dict[str, Any], int | None]:
-    """Remove and strictly validate the optional BSP speedup-one execution envelope."""
+    """Remove and strictly validate an optional non-default BSP execution speedup."""
     inputs = dict(observation)
     if BSP_EXECUTION_KEY not in inputs:
         return inputs, None
@@ -72,9 +72,9 @@ def pop_bsp_execution(observation: Mapping[str, Any]) -> tuple[dict[str, Any], i
         or int(schema_version) != BSP_EXECUTION_SCHEMA_VERSION
     ):
         raise ValueError(f"{BSP_EXECUTION_KEY}.schema_version must be integer 1")
-    if isinstance(speedup, bool) or not isinstance(speedup, numbers.Integral) or int(speedup) != 1:
-        raise ValueError(f"{BSP_EXECUTION_KEY}.speedup must be integer 1")
-    return inputs, 1
+    if isinstance(speedup, bool) or not isinstance(speedup, numbers.Integral) or int(speedup) not in (1, 4, 8):
+        raise ValueError(f"{BSP_EXECUTION_KEY}.speedup must be integer 1, 4, or 8")
+    return inputs, int(speedup)
 
 
 def pop_rtc_context(

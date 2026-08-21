@@ -24,6 +24,7 @@ from typing import Type
 from typing import TypeVar
 
 from openpi_client import latency_sampling
+from openpi_client import libero_control_v5 as _control
 
 
 CONTROL_HZ = 20
@@ -51,18 +52,7 @@ _DISPOSITIONS = frozenset(("activated", "discarded_stale_phase", "failed", "aban
 _LATENCY_OUTCOMES = frozenset(("success", "policy_failure"))
 _ACTIVATIONS = frozenset(("initial", "blocking_replace", "immediate_swap"))
 _STALL_REASONS = frozenset((STALL_REASON_SYNCHRONOUS_INFERENCE, STALL_REASON_ASYNC_ACTION_UNDERFLOW))
-_EXECUTION_MODES = frozenset(
-    (
-        "baseline_async",
-        "baseline_async_recovery",
-        "baseline_rtc",
-        "bsp_spline_async",
-        "bsp_spline_async_speedup1",
-        "bsp_spline_async_native",
-        "baseline_sync",
-        "bsp_spline_sync",
-    )
-)
+_EXECUTION_MODES = frozenset(_control.EXECUTION_MODES)
 _NATIVE_MODES = frozenset(("baseline_async", "baseline_async_recovery", "baseline_rtc", "baseline_sync"))
 _ASYNC_MODES = frozenset(
     (
@@ -72,6 +62,8 @@ _ASYNC_MODES = frozenset(
         "bsp_spline_async",
         "bsp_spline_async_speedup1",
         "bsp_spline_async_native",
+        "bsp_spline_async_native_speedup4",
+        "bsp_spline_async_native_speedup8",
     )
 )
 
@@ -330,7 +322,7 @@ def _validate_activation_context(context: Mapping[str, Any]) -> None:
         )
         matching_rates = tuple(
             rate
-            for rate in (10, 20)
+            for rate in (10, 20, 40, 80)
             if phase * 20 == prefix * rate * 1_000_000
             and remaining_ns
             == (remaining_indices * NANOSECONDS_PER_SECOND + rate * 1_000_000 - 1) // (rate * 1_000_000)
@@ -832,17 +824,19 @@ def validate_timing_events_v5(
         "bsp_spline_async": ("background", "bsp_prefetch"),
         "bsp_spline_async_speedup1": ("background", "bsp_prefetch"),
         "bsp_spline_async_native": ("background", "bsp_prefetch"),
+        "bsp_spline_async_native_speedup4": ("background", "bsp_prefetch"),
+        "bsp_spline_async_native_speedup8": ("background", "bsp_prefetch"),
         "baseline_sync": ("blocking_replan", "baseline_chunk_exhausted"),
         "bsp_spline_sync": ("blocking_replan", "bsp_curve_exhausted"),
     }[execution_mode]
-    if execution_mode in ("bsp_spline_async", "bsp_spline_async_speedup1"):
+    if _control.is_async_bsp_mode_v5(execution_mode) and not _control.is_native_latency_mode_v5(execution_mode):
         if expected_bsp_prefetch_budget_ns is None:
             raise ValueError("asynchronous BSP requires its calibrated prefetch budget")
         calibrated_bsp_budget = _require_nonnegative_integer(
             expected_bsp_prefetch_budget_ns,
             name="expected_bsp_prefetch_budget_ns",
         )
-    elif execution_mode == "bsp_spline_async_native":
+    elif _control.is_native_latency_mode_v5(execution_mode):
         if expected_bsp_prefetch_budget_ns is not None:
             raise ValueError("native asynchronous BSP records rolling budgets instead of one fixed budget")
         calibrated_bsp_budget = None
@@ -879,7 +873,7 @@ def validate_timing_events_v5(
         if verify_sampled_targets:
             expected_target = (
                 0
-                if execution_mode == "bsp_spline_async_native"
+                if _control.is_native_latency_mode_v5(execution_mode)
                 else latency_sampling.NormalLatencySamplerV1().sample_target_ns(expected_sample_key)
             )
             if request.sampled_target_latency_ns != expected_target:
@@ -891,7 +885,7 @@ def validate_timing_events_v5(
                 or request.observation_control_step != 0
             ):
                 raise ValueError("first request must be the step-zero blocking initial plan")
-        elif execution_mode in ("bsp_spline_async", "bsp_spline_async_speedup1", "bsp_spline_async_native"):
+        elif _control.is_async_bsp_mode_v5(execution_mode):
             if (request.dispatch, request.trigger) not in (
                 expected_later_request,
                 ("blocking_replan", "bsp_stale_replan"),
@@ -908,7 +902,7 @@ def validate_timing_events_v5(
         if request.trigger == "bsp_prefetch":
             budget = request.scheduler_context["budget_ns"]
             observed_bsp_budgets.add(budget)
-            if execution_mode == "bsp_spline_async_native":
+            if _control.is_native_latency_mode_v5(execution_mode):
                 control_period_ns = NANOSECONDS_PER_SECOND // CONTROL_HZ
                 if budget < control_period_ns or budget % control_period_ns:
                     raise ValueError("native BSP rolling budget must be a positive whole control period")
@@ -918,12 +912,12 @@ def validate_timing_events_v5(
                 raise ValueError("BSP prefetch request step must match its observation step")
         previous_submission = request.submitted_offset_ns
         previous_observation_step = request.observation_control_step
-    if execution_mode != "bsp_spline_async_native" and len(observed_bsp_budgets) > 1:
+    if not _control.is_native_latency_mode_v5(execution_mode) and len(observed_bsp_budgets) > 1:
         raise ValueError("all BSP prefetch requests must record one calibrated budget")
     for index, request in enumerate(request_records):
         if request.disposition == "discarded_stale_phase":
             if (
-                execution_mode not in ("bsp_spline_async", "bsp_spline_async_speedup1", "bsp_spline_async_native")
+                not _control.is_async_bsp_mode_v5(execution_mode)
                 or request.trigger != "bsp_prefetch"
                 or index + 1 >= len(request_records)
                 or request_records[index + 1].trigger != "bsp_stale_replan"
@@ -934,7 +928,7 @@ def validate_timing_events_v5(
                 raise ValueError("a BSP stale replan must immediately follow a discarded response")
             previous = request_records[index - 1]
             context = request.scheduler_context
-            expected_phase_multiplier = 500_000 if execution_mode == "bsp_spline_async_speedup1" else 1_000_000
+            expected_phase_multiplier = _control.bsp_speedup_for_mode_v5(execution_mode) * 500_000
             if (
                 context["discarded_request_control_step"] != previous.observation_control_step
                 or context["discarded_activation_control_step"] != request.observation_control_step
@@ -1041,7 +1035,7 @@ def validate_timing_events_v5(
                 "remaining_curve_ns",
                 "immediate_prefetch",
             }
-            if execution_mode == "bsp_spline_async_native":
+            if _control.is_native_latency_mode_v5(execution_mode):
                 expected_context_fields.add("prefetch_budget_ns")
             if set(context) != expected_context_fields:
                 raise ValueError("BSP activation requires phase-skip audit context")
@@ -1057,8 +1051,10 @@ def validate_timing_events_v5(
                 or context["immediate_prefetch"] != 0
             ):
                 raise ValueError("BSP sync activations must start at phase zero without prefetch")
-            expected_rate_hz = 10 if execution_mode == "bsp_spline_async_speedup1" else 20
-            if execution_mode in ("bsp_spline_async", "bsp_spline_async_speedup1", "bsp_spline_async_native") and (
+            expected_rate_hz = (
+                20 if execution_mode == "bsp_spline_sync" else 10 * _control.bsp_speedup_for_mode_v5(execution_mode)
+            )
+            if _control.is_async_bsp_mode_v5(execution_mode) and (
                 context["phase_offset_microindices"] * 20
                 != context["executed_prefix_steps"] * expected_rate_hz * 1_000_000
                 or context["remaining_curve_ns"]

@@ -66,7 +66,7 @@ def _calibration(
 ):
     identity = _checkpoint_identity(bsp=mode_name.startswith("bsp_spline_async"))
     warmup_raw = [100_000_000] * 5
-    native = mode_name == "bsp_spline_async_native"
+    native = control.is_native_latency_mode_v5(mode_name)
     warmup_sampled = [0 if native else 300_000_000] * 5
     measurement_raw = [100_000_000] * 20
     measurement_sampled = [0 if native else 300_000_000] * 20
@@ -109,7 +109,7 @@ def _manifest(mode_name="baseline_async"):
     bsp = mode.policy_variant == "bsp"
     checkpoint_identity = _checkpoint_identity(bsp=bsp)
     calibration = _calibration(mode_name) if mode.asynchronous else None
-    native = mode_name == "bsp_spline_async_native"
+    native = control.is_native_latency_mode_v5(mode_name)
     scheduling_budget = (
         calibration.derived_prefetch_budget_ns
         if native and calibration is not None

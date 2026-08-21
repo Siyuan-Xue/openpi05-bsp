@@ -420,7 +420,7 @@ class EvaluationManifestV5:
             mode = _control.EXECUTION_MODES[self.execution_mode]
         except (KeyError, TypeError) as error:
             raise ValueError("unsupported schema-v5 execution_mode") from error
-        if self.execution_mode == "bsp_spline_async_native":
+        if _control.is_native_latency_mode_v5(self.execution_mode):
             calibration_for_budget = self.latency_calibration
             if (
                 not isinstance(calibration_for_budget, _control.LatencyCalibrationV2)
@@ -860,7 +860,7 @@ class EpisodeRecordV5:
         _require_nonnegative_integer(self.eval_seed, name="eval_seed")
         if self.execution_mode not in _control.EXECUTION_MODES:
             raise ValueError("unsupported schema-v5 execution_mode")
-        if self.execution_mode in ("bsp_spline_async", "bsp_spline_async_speedup1", "bsp_spline_async_native"):
+        if _control.is_async_bsp_mode_v5(self.execution_mode):
             if self.expected_bsp_prefetch_budget_ns is not None:
                 _require_nonnegative_integer(
                     self.expected_bsp_prefetch_budget_ns,
@@ -948,7 +948,7 @@ class EpisodeRecordV5:
                 "identity": identity,
                 "verify_sampled_targets": True,
             }
-            if self.execution_mode in ("bsp_spline_async", "bsp_spline_async_speedup1", "bsp_spline_async_native"):
+            if _control.is_async_bsp_mode_v5(self.execution_mode):
                 validation_args["expected_bsp_prefetch_budget_ns"] = self.expected_bsp_prefetch_budget_ns
             _timing.validate_timing_events_v5(**validation_args)
             _timing.validate_action_seams_v5(

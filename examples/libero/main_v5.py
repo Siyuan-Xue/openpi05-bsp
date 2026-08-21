@@ -861,7 +861,7 @@ def _complete_request_v5(
     try:
         if not isinstance(response, Mapping):
             raise ValueError("policy response must be a mapping")
-        if mode.name == "bsp_spline_async_native":
+        if _control.is_native_latency_mode_v5(mode.name):
             scheduler.observe_raw_inference_latency(raw_inference_latency_ns)
         activation = scheduler.install_response(
             pending.trace.intent,
@@ -1264,7 +1264,7 @@ def _run_attempt_v5(
                 pending_slot.clear()
                 if result is not None:
                     return result
-                if mode.name in ("bsp_spline_async", "bsp_spline_async_speedup1", "bsp_spline_async_native"):
+                if _control.is_async_bsp_mode_v5(mode.name):
                     result = _attempt_request_v5(
                         now_ns=_require_nonnegative_clock(clock),
                         at_due=True,
@@ -1635,7 +1635,7 @@ def _make_manifest_v5(
     server_metadata_fingerprint: str,
     calibration: Optional[_control.LatencyCalibrationV2],
 ) -> _eval.EvaluationManifestV5:
-    native_latency = mode.name == "bsp_spline_async_native"
+    native_latency = _control.is_native_latency_mode_v5(mode.name)
     if native_latency:
         if calibration is None or calibration.derived_prefetch_budget_ns is None:
             raise ValueError("native BSP manifest requires calibrated initial prefetch budget")
@@ -1868,7 +1868,9 @@ def _evaluate_run_v5(
 
                     expected_budget = (
                         calibration.derived_prefetch_budget_ns
-                        if mode.name in ("bsp_spline_async", "bsp_spline_async_speedup1") and calibration is not None
+                        if _control.is_async_bsp_mode_v5(mode.name)
+                        and not _control.is_native_latency_mode_v5(mode.name)
+                        and calibration is not None
                         else None
                     )
                     record = _eval.run_episode_with_retries_v5(
@@ -1938,7 +1940,7 @@ def eval_libero_v5(args: ArgsV5) -> Dict[str, Any]:
         monotonic_ns=clock.monotonic_ns,
         wait_until_ns=clock.wait_until_ns,
         latency_sampler=_latency_sampling.NormalLatencySamplerV1(),
-        inject_sampled_latency=mode.name != "bsp_spline_async_native",
+        inject_sampled_latency=not _control.is_native_latency_mode_v5(mode.name),
     )
     primary_error = None  # type: Optional[BaseException]
     try:

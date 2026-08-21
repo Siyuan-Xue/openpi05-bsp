@@ -31,6 +31,33 @@ def _speedup_one_response(parameters=None):
     return response
 
 
+def _speedup_response(speedup, parameters=None):
+    response = _response(parameters)
+    response["speedup"] = speedup
+    return response
+
+
+@pytest.mark.parametrize(
+    ("speedup", "phase_offset", "remaining_time_ns", "next_sample_time"),
+    [(4, 2.0, 175_000_000, 4.0), (8, 4.0, 62_500_000, 8.0)],
+)
+def test_high_speedup_advances_multiple_curve_indices_per_control_step(
+    speedup, phase_offset, remaining_time_ns, next_sample_time
+):
+    plan = bsp_spline.BspControlActionPlan(expected_speedup=speedup)
+
+    installed = plan.install(
+        _speedup_response(speedup),
+        request_control_step=0,
+        activation_control_step=1,
+        control_freq_hz=20,
+    )
+
+    assert installed.phase_offset_indices == pytest.approx(phase_offset)
+    assert installed.remaining_time_ns == remaining_time_ns
+    assert plan.sample(2).spline_time == pytest.approx(next_sample_time)
+
+
 def test_speedup_one_must_be_explicitly_expected_and_advances_half_an_index_per_control_step():
     with pytest.raises(ValueError, match="speedup"):
         bsp_spline.BspSpline.from_response(_speedup_one_response())

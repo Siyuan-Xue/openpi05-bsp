@@ -18,17 +18,18 @@ class InferenceRequestTest(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 inference.pop_inference_seed({inference.INFERENCE_SEED_KEY: invalid})
 
-    def test_bsp_execution_context_is_exact_speedup_one_and_removed_from_model_inputs(self):
-        observation = {
-            "state": [0.0] * 8,
-            inference.BSP_EXECUTION_KEY: {"schema_version": 1, "speedup": 1},
-        }
+    def test_bsp_execution_context_accepts_explicit_nondefault_speedups_and_removes_them_from_model_inputs(self):
+        for expected_speedup in (1, 4, 8):
+            observation = {
+                "state": [0.0] * 8,
+                inference.BSP_EXECUTION_KEY: {"schema_version": 1, "speedup": expected_speedup},
+            }
 
-        inputs, speedup = inference.pop_bsp_execution(observation)
+            inputs, speedup = inference.pop_bsp_execution(observation)
 
-        self.assertEqual(speedup, 1)
-        self.assertEqual(set(inputs), {"state"})
-        self.assertIn(inference.BSP_EXECUTION_KEY, observation)
+            self.assertEqual(speedup, expected_speedup)
+            self.assertEqual(set(inputs), {"state"})
+            self.assertIn(inference.BSP_EXECUTION_KEY, observation)
 
     def test_bsp_execution_context_rejects_nonexact_payloads(self):
         invalid_values = (
@@ -36,6 +37,7 @@ class InferenceRequestTest(unittest.TestCase):
             {"schema_version": True, "speedup": 1},
             {"schema_version": 1, "speedup": True},
             {"schema_version": 1, "speedup": 2},
+            {"schema_version": 1, "speedup": 3},
             {"schema_version": 1, "speedup": 1, "extra": 0},
         )
         for value in invalid_values:

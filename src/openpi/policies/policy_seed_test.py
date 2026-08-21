@@ -112,7 +112,8 @@ def test_legacy_request_preserves_callable_kwargs_response_shape_and_rng_semanti
     assert "rtc" not in result
 
 
-def test_bsp_speedup_one_envelope_is_removed_before_transforms_and_relabels_the_sidecar(monkeypatch):
+@pytest.mark.parametrize("requested_speedup", [1, 4, 8])
+def test_bsp_execution_envelope_is_removed_before_transforms_and_relabels_the_sidecar(monkeypatch, requested_speedup):
     policy_instance, seen = _fake_policy(action_representation="bsp")
 
     def bsp_output_transform(outputs):
@@ -133,14 +134,14 @@ def test_bsp_speedup_one_envelope_is_removed_before_transforms_and_relabels_the_
     monkeypatch.setattr(policy._model.Observation, "from_dict", staticmethod(lambda inputs: object()))
     request = {
         "raw": np.asarray([3.0]),
-        inference.BSP_EXECUTION_KEY: {"schema_version": 1, "speedup": 1},
+        inference.BSP_EXECUTION_KEY: {"schema_version": 1, "speedup": requested_speedup},
     }
 
     result = policy_instance.infer(request)
 
     assert inference.BSP_EXECUTION_KEY not in seen["input"][0]
-    assert request[inference.BSP_EXECUTION_KEY] == {"schema_version": 1, "speedup": 1}
-    assert result["bsp"]["speedup"] == 1
+    assert request[inference.BSP_EXECUTION_KEY] == {"schema_version": 1, "speedup": requested_speedup}
+    assert result["bsp"]["speedup"] == requested_speedup
 
 
 def test_native_policy_rejects_bsp_speedup_one_execution_envelope_before_sampling(monkeypatch):
@@ -399,6 +400,8 @@ def test_policy_computes_exact_reserved_capability_metadata_and_rejects_collisio
                 "bsp_spline_sync_speedup2_phase0_v2",
                 "bsp_spline_async_phase_skip_speedup2_v2",
                 "bsp_spline_async_phase_skip_speedup1_v1",
+                "bsp_spline_async_phase_skip_speedup4_v1",
+                "bsp_spline_async_phase_skip_speedup8_v1",
             ],
         },
     }

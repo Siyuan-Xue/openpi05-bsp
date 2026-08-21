@@ -56,6 +56,8 @@ def _metadata_payload(*, revision="same", policy_variant="baseline"):
             "bsp_spline_sync_speedup2_phase0_v2",
             "bsp_spline_async_phase_skip_speedup2_v2",
             "bsp_spline_async_phase_skip_speedup1_v1",
+            "bsp_spline_async_phase_skip_speedup4_v1",
+            "bsp_spline_async_phase_skip_speedup8_v1",
         ]
     return msgpack_numpy.packb(
         {
@@ -116,7 +118,7 @@ def _calibration(mode_name, *, latency_ns=0):
         init_state_fingerprint="a" * 64,
         request_fingerprint=control.canonical_fingerprint(canonical_request),
     )
-    sampled_ns = 0 if mode.name == "bsp_spline_async_native" else 300 * NS_PER_MS
+    sampled_ns = 0 if control.is_native_latency_mode_v5(mode.name) else 300 * NS_PER_MS
     effective_ns = max(latency_ns, sampled_ns)
     synthetic_ns = effective_ns - latency_ns
     return control.LatencyCalibrationV2.create(
@@ -1507,6 +1509,8 @@ def test_eval_entrypoint_closes_single_worker_on_normal_and_exception_exit(monke
         pytest.param("baseline_rtc"),
         pytest.param("bsp_spline_async"),
         pytest.param("bsp_spline_async_native"),
+        pytest.param("bsp_spline_async_native_speedup4"),
+        pytest.param("bsp_spline_async_native_speedup8"),
     ],
 )
 def test_all_execution_modes_share_the_worker_latency_injection_point(monkeypatch, execution_mode):
@@ -1539,5 +1543,5 @@ def test_all_execution_modes_share_the_worker_latency_injection_point(monkeypatc
     assert isinstance(sampler, latency_sampling.NormalLatencySamplerV1)
     assert sampler.mean_ns == 300_000_000
     assert sampler.stddev_ns == 60_000_000
-    assert captured[0]["inject_sampled_latency"] is (execution_mode != "bsp_spline_async_native")
+    assert captured[0]["inject_sampled_latency"] is (not control.is_native_latency_mode_v5(execution_mode))
     assert captured[0]["wait_until_ns"].__self__.__class__ is main_v5._SystemClock
