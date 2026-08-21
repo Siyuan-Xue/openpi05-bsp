@@ -9,7 +9,9 @@ import dataclasses
 import logging
 import math
 from pathlib import Path
+import shutil
 import subprocess
+import tempfile
 import time
 from typing import Any, Dict, Optional, Tuple
 
@@ -1519,6 +1521,7 @@ def _persist_episode_artifacts_v5(
 
     writer_factory = imageio.get_writer if video_writer_factory is None else video_writer_factory
     artifact_error = None  # type: Optional[_eval.ArtifactErrorV5]
+    spool_dir = None  # type: Optional[tempfile.TemporaryDirectory]
     try:
         planned = _timing.build_video_timing_audit_v5(
             control_frame_count=len(replay_frames),
@@ -1537,7 +1540,11 @@ def _persist_episode_artifacts_v5(
         )
         padding = 0
         encoded_input_count = 0
-        stream = writer_factory(video_path, fps=_eval.VIDEO_FPS)
+        encoded_path = video_path
+        if video_writer_factory is None:
+            spool_dir = tempfile.TemporaryDirectory(prefix="libero-v5-video-")
+            encoded_path = Path(spool_dir.name) / video_path.name
+        stream = writer_factory(encoded_path, fps=_eval.VIDEO_FPS)
         try:
             for frame in frames:
                 stream.append_data(np.asarray(frame))
@@ -1562,6 +1569,10 @@ def _persist_episode_artifacts_v5(
                 raise ValueError("expanded frame count does not match the v5 timing audit")
         finally:
             stream.close()
+        if encoded_path != video_path:
+            if video_path.exists():
+                raise FileExistsError(f"refusing to overwrite selected video path: {video_path}")
+            shutil.copyfile(encoded_path, video_path)
         encoded_fps, encoded_count, encoded_duration_s = _read_encoded_video(video_path)
         audit = _eval.build_video_artifact_audit_v5(
             episode=persisted,
@@ -1585,6 +1596,9 @@ def _persist_episode_artifacts_v5(
         )
         writer.append_artifact_error(artifact_error)
         video_selector.release(persisted)
+    finally:
+        if spool_dir is not None:
+            spool_dir.cleanup()
     return persisted, artifact_error
 
 

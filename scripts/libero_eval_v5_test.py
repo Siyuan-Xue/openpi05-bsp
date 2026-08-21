@@ -1324,6 +1324,72 @@ def test_selected_zero_frame_video_persists_episode_before_padding_and_audit(mon
     assert audit.planned.video_frame_count == 0
 
 
+def test_production_video_is_closed_locally_before_copy_and_final_readback(monkeypatch, tmp_path):
+    clock = ManualClock()
+    worker = FakeWorker(
+        clock,
+        [_ScriptedCall(0, {"actions": np.zeros((16, 7), dtype=np.float32)})],
+        formal_sampling=True,
+    )
+    attempt = _run(clock, worker, FakeEnvironment(done_after_real_steps=1))
+    record = evaluation.EpisodeRecordV5.from_attempt(
+        _identity(),
+        42,
+        1,
+        execution_mode="baseline_async",
+        result=attempt,
+    )
+    final_path = tmp_path / "selected.mp4"
+    audits = []
+
+    class Writer:
+        def append_episode(self, _persisted):
+            pass
+
+        def append_video_audit(self, audit):
+            audits.append(audit)
+
+        def append_artifact_error(self, error):
+            raise AssertionError(error)
+
+    class Selector:
+        def claim(self, _persisted):
+            return final_path
+
+    class StreamingWriter:
+        def __init__(self, path, *, fps):
+            assert fps == 40
+            self.path = Path(path)
+            assert self.path != final_path
+            assert self.path.suffix == ".mp4"
+
+        def append_data(self, _frame):
+            pass
+
+        def close(self):
+            self.path.write_bytes(b"closed-mp4-with-moov")
+
+    def read_encoded(path):
+        assert Path(path) == final_path
+        assert final_path.read_bytes() == b"closed-mp4-with-moov"
+        return 40.0, 1, 0.025
+
+    monkeypatch.setattr(main_v5.imageio, "get_writer", StreamingWriter)
+    monkeypatch.setattr(main_v5, "_read_encoded_video", read_encoded)
+
+    persisted, artifact_error = main_v5._persist_episode_artifacts_v5(
+        record,
+        Writer(),
+        Selector(),
+        video_show_inference_waits=False,
+    )
+
+    assert persisted.replay_frames == ()
+    assert artifact_error is None
+    assert len(audits) == 1
+    assert audits[0].path == str(final_path)
+
+
 def test_success_video_stop_requires_successful_video_artifact():
     clock = ManualClock()
     worker = FakeWorker(
