@@ -19,7 +19,7 @@ _SCHEMA_FIELDS = {
 _SCHEMA_VERSION = 1
 _ORIGIN_HZ = 10
 _DEGREE = 3
-_SPEEDUP = 2
+_DEFAULT_SPEEDUP = 2
 _ALIGNMENT = "disabled_delta_eff"
 _PARAMETER_SHAPE = (16, 8)
 _ACTION_DIM = 7
@@ -67,7 +67,7 @@ class BspSpline:
     t_max: float
 
     @classmethod
-    def from_response(cls, bsp_mapping: Mapping) -> "BspSpline":
+    def from_response(cls, bsp_mapping: Mapping, *, expected_speedup: int = _DEFAULT_SPEEDUP) -> "BspSpline":
         if not isinstance(bsp_mapping, Mapping):
             raise ValueError("BSP response must be a mapping")
         if set(bsp_mapping) != _SCHEMA_FIELDS:
@@ -76,7 +76,13 @@ class BspSpline:
         _require_exact_integer(bsp_mapping["schema_version"], name="schema_version", expected=_SCHEMA_VERSION)
         origin_hz = _require_exact_integer(bsp_mapping["origin_hz"], name="origin_hz", expected=_ORIGIN_HZ)
         degree = _require_exact_integer(bsp_mapping["degree"], name="degree", expected=_DEGREE)
-        speedup = _require_exact_integer(bsp_mapping["speedup"], name="speedup", expected=_SPEEDUP)
+        if isinstance(expected_speedup, bool) or expected_speedup not in (1, 2):
+            raise ValueError("expected_speedup must be integer 1 or 2")
+        speedup = _require_exact_integer(
+            bsp_mapping["speedup"],
+            name="speedup",
+            expected=expected_speedup,
+        )
         alignment = bsp_mapping["alignment"]
         if not isinstance(alignment, str) or alignment != _ALIGNMENT:
             raise ValueError("alignment must be {!r}".format(_ALIGNMENT))
@@ -183,7 +189,10 @@ class BspPrefetchDecision:
 class BspActionPlan:
     """Own one active curve and a nondecreasing caller-supplied clock, but no transport."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, expected_speedup: int = _DEFAULT_SPEEDUP) -> None:
+        if isinstance(expected_speedup, bool) or expected_speedup not in (1, 2):
+            raise ValueError("expected_speedup must be integer 1 or 2")
+        self._expected_speedup = expected_speedup
         self._spline = None  # type: Optional[BspSpline]
         self._activation_time_ns = None  # type: Optional[int]
         self._high_water_now_ns = None  # type: Optional[int]
@@ -199,7 +208,7 @@ class BspActionPlan:
     def install(self, bsp_mapping: Mapping, *, activation_time_ns: int) -> BspSpline:
         """Validate then replace the curve at or after every previously observed timestamp."""
         validated_activation = _require_nonnegative_ns(activation_time_ns, name="activation_time_ns")
-        candidate = BspSpline.from_response(bsp_mapping)
+        candidate = BspSpline.from_response(bsp_mapping, expected_speedup=self._expected_speedup)
         self._require_at_or_after_high_water(validated_activation, name="activation_time_ns")
         self._spline = candidate
         self._activation_time_ns = validated_activation
@@ -300,7 +309,10 @@ class BspControlActionPlan:
     of control steps that completed while its request was in flight.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, expected_speedup: int = _DEFAULT_SPEEDUP) -> None:
+        if isinstance(expected_speedup, bool) or expected_speedup not in (1, 2):
+            raise ValueError("expected_speedup must be integer 1 or 2")
+        self._expected_speedup = expected_speedup
         self._spline = None  # type: Optional[BspSpline]
         self._activation_control_step = None  # type: Optional[int]
         self._phase_offset_indices = None  # type: Optional[float]
@@ -341,7 +353,7 @@ class BspControlActionPlan:
             raise ValueError("activation_control_step must not precede request_control_step")
         self._require_at_or_after_high_water(activation_step, name="activation_control_step")
 
-        candidate = BspSpline.from_response(bsp_mapping)
+        candidate = BspSpline.from_response(bsp_mapping, expected_speedup=self._expected_speedup)
         executed_prefix_steps = activation_step - request_step
         phase_offset = executed_prefix_steps * candidate.origin_hz * candidate.speedup / control_hz
         first_sample_time = max(candidate.t_min, phase_offset)

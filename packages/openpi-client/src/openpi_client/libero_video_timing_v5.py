@@ -40,6 +40,7 @@ _TRIGGERS = frozenset(
         "initial_plan",
         "baseline_chunk_exhausted",
         "baseline_async_launch",
+        "baseline_async_capacity_replan",
         "rtc_launch",
         "bsp_curve_exhausted",
         "bsp_prefetch",
@@ -50,9 +51,21 @@ _DISPOSITIONS = frozenset(("activated", "discarded_stale_phase", "failed", "aban
 _LATENCY_OUTCOMES = frozenset(("success", "policy_failure"))
 _ACTIVATIONS = frozenset(("initial", "blocking_replace", "immediate_swap"))
 _STALL_REASONS = frozenset((STALL_REASON_SYNCHRONOUS_INFERENCE, STALL_REASON_ASYNC_ACTION_UNDERFLOW))
-_EXECUTION_MODES = frozenset(("baseline_async", "baseline_rtc", "bsp_spline_async", "baseline_sync", "bsp_spline_sync"))
-_NATIVE_MODES = frozenset(("baseline_async", "baseline_rtc", "baseline_sync"))
-_ASYNC_MODES = frozenset(("baseline_async", "baseline_rtc", "bsp_spline_async"))
+_EXECUTION_MODES = frozenset(
+    (
+        "baseline_async",
+        "baseline_async_recovery",
+        "baseline_rtc",
+        "bsp_spline_async",
+        "bsp_spline_async_speedup1",
+        "baseline_sync",
+        "bsp_spline_sync",
+    )
+)
+_NATIVE_MODES = frozenset(("baseline_async", "baseline_async_recovery", "baseline_rtc", "baseline_sync"))
+_ASYNC_MODES = frozenset(
+    ("baseline_async", "baseline_async_recovery", "baseline_rtc", "bsp_spline_async", "bsp_spline_async_speedup1")
+)
 
 _REQUEST_FIELDS = frozenset(
     (
@@ -209,6 +222,16 @@ def _validate_scheduler_context(trigger: str, context: Mapping[str, Any]) -> Non
         if d > s or s + d > 16:
             raise ValueError("RTC scheduler context must satisfy d <= s and s + d <= 16")
         return
+    if trigger == "baseline_async_capacity_replan":
+        if set(context) != {"action_cursor", "forecast_delay_ticks"}:
+            raise ValueError(
+                "baseline async capacity replan context must contain exactly action_cursor and forecast_delay_ticks"
+            )
+        cursor = _require_integer(context["action_cursor"], name="action_cursor", minimum=9, maximum=15)
+        delay = _require_integer(context["forecast_delay_ticks"], name="forecast_delay_ticks", minimum=8, maximum=8)
+        if cursor + delay <= 16:
+            raise ValueError("baseline async capacity replan requires cursor + delay > 16")
+        return
     if trigger == "bsp_prefetch":
         if set(context) != {"remaining_plan_ns", "budget_ns", "request_control_step"}:
             raise ValueError(
@@ -247,7 +270,11 @@ def _validate_scheduler_context(trigger: str, context: Mapping[str, Any]) -> Non
             context["curve_t_max_microindices"],
             name="curve_t_max_microindices",
         )
-        if activation_step - request_step != prefix or phase != prefix * 1_000_000 or phase <= t_max:
+        if (
+            activation_step - request_step != prefix
+            or phase not in (prefix * 500_000, prefix * 1_000_000)
+            or phase <= t_max
+        ):
             raise ValueError("BSP stale replan phase identity is inconsistent")
         return
     raise ValueError("Unsupported request trigger: {}".format(trigger))
@@ -288,12 +315,17 @@ def _validate_activation_context(context: Mapping[str, Any]) -> None:
         )
         remaining_ns = _require_nonnegative_integer(context["remaining_curve_ns"], name="remaining_curve_ns")
         immediate = _require_integer(context["immediate_prefetch"], name="immediate_prefetch", minimum=0, maximum=1)
-        expected_remaining_ns = (remaining_indices * NANOSECONDS_PER_SECOND + 20_000_000 - 1) // 20_000_000
+        matching_rates = tuple(
+            rate
+            for rate in (10, 20)
+            if phase * 20 == prefix * rate * 1_000_000
+            and remaining_ns
+            == (remaining_indices * NANOSECONDS_PER_SECOND + rate * 1_000_000 - 1) // (rate * 1_000_000)
+        )
         if (
             activation_step - request_step != prefix
-            or phase != prefix * 1_000_000
+            or not matching_rates
             or first_sample < phase
-            or remaining_ns != expected_remaining_ns
             or (immediate == 1 and remaining_ns > 400_000_000)
         ):
             raise ValueError("BSP phase-skip activation context is inconsistent")
@@ -339,6 +371,7 @@ class RequestEventV5:
             "initial_plan": "blocking_initial",
             "baseline_chunk_exhausted": "blocking_replan",
             "baseline_async_launch": "background",
+            "baseline_async_capacity_replan": "blocking_replan",
             "rtc_launch": "background",
             "bsp_curve_exhausted": "blocking_replan",
             "bsp_prefetch": "background",
@@ -781,21 +814,23 @@ def validate_timing_events_v5(
     )
     expected_later_request = {
         "baseline_async": ("background", "baseline_async_launch"),
+        "baseline_async_recovery": ("background", "baseline_async_launch"),
         "baseline_rtc": ("background", "rtc_launch"),
         "bsp_spline_async": ("background", "bsp_prefetch"),
+        "bsp_spline_async_speedup1": ("background", "bsp_prefetch"),
         "baseline_sync": ("blocking_replan", "baseline_chunk_exhausted"),
         "bsp_spline_sync": ("blocking_replan", "bsp_curve_exhausted"),
     }[execution_mode]
-    if execution_mode == "bsp_spline_async":
+    if execution_mode in ("bsp_spline_async", "bsp_spline_async_speedup1"):
         if expected_bsp_prefetch_budget_ns is None:
-            raise ValueError("bsp_spline_async requires its calibrated prefetch budget")
+            raise ValueError("asynchronous BSP requires its calibrated prefetch budget")
         calibrated_bsp_budget = _require_nonnegative_integer(
             expected_bsp_prefetch_budget_ns,
             name="expected_bsp_prefetch_budget_ns",
         )
     else:
         if expected_bsp_prefetch_budget_ns is not None:
-            raise ValueError("only bsp_spline_async accepts a prefetch budget")
+            raise ValueError("only asynchronous BSP accepts a prefetch budget")
         calibrated_bsp_budget = None
     observed_bsp_budgets = set()
     previous_submission = -1
@@ -834,12 +869,18 @@ def validate_timing_events_v5(
                 or request.observation_control_step != 0
             ):
                 raise ValueError("first request must be the step-zero blocking initial plan")
-        elif execution_mode == "bsp_spline_async":
+        elif execution_mode in ("bsp_spline_async", "bsp_spline_async_speedup1"):
             if (request.dispatch, request.trigger) not in (
                 expected_later_request,
                 ("blocking_replan", "bsp_stale_replan"),
             ):
                 raise ValueError("request dispatch/trigger does not match BSP execution mode")
+        elif execution_mode == "baseline_async_recovery":
+            if (request.dispatch, request.trigger) not in (
+                expected_later_request,
+                ("blocking_replan", "baseline_async_capacity_replan"),
+            ):
+                raise ValueError("request dispatch/trigger does not match baseline async recovery mode")
         elif (request.dispatch, request.trigger) != expected_later_request:
             raise ValueError("request dispatch/trigger does not match execution mode")
         if request.trigger == "bsp_prefetch":
@@ -856,7 +897,7 @@ def validate_timing_events_v5(
     for index, request in enumerate(request_records):
         if request.disposition == "discarded_stale_phase":
             if (
-                execution_mode != "bsp_spline_async"
+                execution_mode not in ("bsp_spline_async", "bsp_spline_async_speedup1")
                 or request.trigger != "bsp_prefetch"
                 or index + 1 >= len(request_records)
                 or request_records[index + 1].trigger != "bsp_stale_replan"
@@ -867,9 +908,11 @@ def validate_timing_events_v5(
                 raise ValueError("a BSP stale replan must immediately follow a discarded response")
             previous = request_records[index - 1]
             context = request.scheduler_context
+            expected_phase_multiplier = 500_000 if execution_mode == "bsp_spline_async_speedup1" else 1_000_000
             if (
                 context["discarded_request_control_step"] != previous.observation_control_step
                 or context["discarded_activation_control_step"] != request.observation_control_step
+                or context["phase_offset_microindices"] != context["executed_prefix_steps"] * expected_phase_multiplier
             ):
                 raise ValueError("BSP stale replan steps do not match the discarded request")
 
@@ -985,8 +1028,14 @@ def validate_timing_events_v5(
                 or context["immediate_prefetch"] != 0
             ):
                 raise ValueError("BSP sync activations must start at phase zero without prefetch")
-            if execution_mode == "bsp_spline_async" and context["immediate_prefetch"] != int(
-                context["remaining_curve_ns"] <= 400_000_000
+            expected_rate_hz = 10 if execution_mode == "bsp_spline_async_speedup1" else 20
+            if execution_mode in ("bsp_spline_async", "bsp_spline_async_speedup1") and (
+                context["phase_offset_microindices"] * 20
+                != context["executed_prefix_steps"] * expected_rate_hz * 1_000_000
+                or context["remaining_curve_ns"]
+                != (context["remaining_curve_microindices"] * NANOSECONDS_PER_SECOND + expected_rate_hz * 1_000_000 - 1)
+                // (expected_rate_hz * 1_000_000)
+                or context["immediate_prefetch"] != int(context["remaining_curve_ns"] <= 400_000_000)
             ):
                 raise ValueError("BSP async immediate-prefetch audit is inconsistent")
         activations_by_request[activation.request_id] = activation

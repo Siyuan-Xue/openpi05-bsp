@@ -25,6 +25,50 @@ def _response(parameters=None):
     }
 
 
+def _speedup_one_response(parameters=None):
+    response = _response(parameters)
+    response["speedup"] = 1
+    return response
+
+
+def test_speedup_one_must_be_explicitly_expected_and_advances_half_an_index_per_control_step():
+    with pytest.raises(ValueError, match="speedup"):
+        bsp_spline.BspSpline.from_response(_speedup_one_response())
+
+    spline = bsp_spline.BspSpline.from_response(_speedup_one_response(), expected_speedup=1)
+    assert spline.speedup == 1
+
+    plan = bsp_spline.BspControlActionPlan(expected_speedup=1)
+    installed = plan.install(
+        _speedup_one_response(),
+        request_control_step=4,
+        activation_control_step=10,
+        control_freq_hz=20,
+    )
+    assert installed.executed_prefix_steps == 6
+    assert installed.phase_offset_indices == pytest.approx(3.0)
+    assert installed.remaining_time_ns == 600_000_000
+    assert plan.sample(11).spline_time == pytest.approx(3.5)
+
+
+def test_speedup_one_prefetches_at_four_remaining_indices_for_four_hundred_ms():
+    plan = bsp_spline.BspControlActionPlan(expected_speedup=1)
+    plan.install(
+        _speedup_one_response(),
+        request_control_step=0,
+        activation_control_step=0,
+        control_freq_hz=20,
+    )
+
+    before = plan.prefetch_decision(9, lead_time_ns=400_000_000)
+    due = plan.prefetch_decision(10, lead_time_ns=400_000_000)
+
+    assert before.remaining_time_ns == 450_000_000
+    assert not before.should_prefetch
+    assert due.remaining_time_ns == 400_000_000
+    assert due.should_prefetch
+
+
 def _constant_response(value, knots=None):
     parameters = _parameters(knots)
     parameters[:12, :7] = value

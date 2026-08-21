@@ -257,6 +257,32 @@ class RawAsyncPlan(RtcPlan):
             }
         }
 
+    def begin_blocking_replan(self) -> Dict[str, Dict[str, int]]:
+        """Replace an infeasible raw chunk without advancing the environment."""
+        if self._request_kind is not None:
+            raise RtcRequestInFlightError("an async request is already in flight")
+        if self.state is not RtcPlanState.INFEASIBLE:
+            raise RtcLaunchNotReadyError("blocking async recovery requires an infeasible chunk")
+        self._request_kind = "raw_blocking_replan"
+        self._request_start_cursor = self._cursor
+        return {
+            inference.RTC_REQUEST_KEY: {
+                "schema_version": inference.RTC_SCHEMA_VERSION,
+            }
+        }
+
+    def install_result(self, response: Mapping[str, Any]) -> None:
+        if self._request_kind != "raw_blocking_replan":
+            super().install_result(response)
+            return
+        if self._request_start_cursor is None or self._cursor != self._request_start_cursor:
+            raise RtcInvalidDelayError("blocking async recovery cannot advance the action cursor")
+        chunk = RtcActionChunk.from_response(response)
+        self._chunk = chunk
+        self._cursor = 0
+        self._request_kind = None
+        self._request_start_cursor = None
+
 
 def _validated_float32_copy(value: Any, *, shape: Tuple[int, int], label: str) -> np.ndarray:
     array = np.asarray(value)

@@ -360,7 +360,7 @@ def _validate_args_v5(
     try:
         mode = _control.EXECUTION_MODES[args.execution_mode]
     except (KeyError, TypeError) as error:
-        raise ValueError("execution_mode must be one of the five schema-v5 runtime modes") from error
+        raise ValueError("execution_mode must be one of the seven schema-v5 runtime modes") from error
     suite_aliases = {
         "libero_spatial": "libero_spatial",
         "spatial": "libero_spatial",
@@ -732,7 +732,10 @@ def _append_blocking_stall_v5(
     due_ns: Optional[int],
 ) -> None:
     trace = pending.trace
-    full_interval = trace.intent.dispatch == "blocking_initial" or trace.intent.trigger == "bsp_stale_replan"
+    full_interval = trace.intent.dispatch == "blocking_initial" or trace.intent.trigger in (
+        "bsp_stale_replan",
+        "baseline_async_capacity_replan",
+    )
     if full_interval:
         stall_started_ns = submitted_ns
     else:
@@ -1249,7 +1252,7 @@ def _run_attempt_v5(
                 pending_slot.clear()
                 if result is not None:
                     return result
-                if mode.name == "bsp_spline_async":
+                if mode.name in ("bsp_spline_async", "bsp_spline_async_speedup1"):
                     result = _attempt_request_v5(
                         now_ns=_require_nonnegative_clock(clock),
                         at_due=True,
@@ -1812,7 +1815,7 @@ def _evaluate_run_v5(
 
                     expected_budget = (
                         calibration.derived_prefetch_budget_ns
-                        if mode.name == "bsp_spline_async" and calibration is not None
+                        if mode.name in ("bsp_spline_async", "bsp_spline_async_speedup1") and calibration is not None
                         else None
                     )
                     record = _eval.run_episode_with_retries_v5(
@@ -1853,7 +1856,7 @@ def _evaluate_run_v5(
     summary = writer.write_summary(records, artifact_errors=artifact_errors)
     if not summary["acceptance_complete"]:
         raise RuntimeError(
-            "Evaluation acceptance is incomplete: {} infrastructure episodes, " "{} artifact errors".format(
+            "Evaluation acceptance is incomplete: {} infrastructure episodes, {} artifact errors".format(
                 summary["incomplete_infrastructure_count"],
                 summary["artifact_error_count"],
             )

@@ -841,14 +841,14 @@ class EpisodeRecordV5:
         _require_nonnegative_integer(self.eval_seed, name="eval_seed")
         if self.execution_mode not in _control.EXECUTION_MODES:
             raise ValueError("unsupported schema-v5 execution_mode")
-        if self.execution_mode == "bsp_spline_async":
+        if self.execution_mode in ("bsp_spline_async", "bsp_spline_async_speedup1"):
             if self.expected_bsp_prefetch_budget_ns is not None:
                 _require_nonnegative_integer(
                     self.expected_bsp_prefetch_budget_ns,
                     name="expected_bsp_prefetch_budget_ns",
                 )
         elif self.expected_bsp_prefetch_budget_ns is not None:
-            raise ValueError("only bsp_spline_async accepts a prefetch budget")
+            raise ValueError("only asynchronous BSP accepts a prefetch budget")
         if self.status not in _STATUSES:
             raise ValueError("unsupported episode status")
         if self.success is not None and type(self.success) is not bool:
@@ -929,7 +929,7 @@ class EpisodeRecordV5:
                 "identity": identity,
                 "verify_sampled_targets": True,
             }
-            if self.execution_mode == "bsp_spline_async":
+            if self.execution_mode in ("bsp_spline_async", "bsp_spline_async_speedup1"):
                 validation_args["expected_bsp_prefetch_budget_ns"] = self.expected_bsp_prefetch_budget_ns
             _timing.validate_timing_events_v5(**validation_args)
             _timing.validate_action_seams_v5(
@@ -1446,7 +1446,7 @@ def build_video_artifact_audit_v5(
     timing_gate_pass = abs(deviation_ns) <= tolerance_ns
     warning = None
     if not timing_gate_pass:
-        warning = ("encoded duration deviates from expected duration by {:.6f} s " "(tolerance {:.6f} s)").format(
+        warning = ("encoded duration deviates from expected duration by {:.6f} s (tolerance {:.6f} s)").format(
             abs(deviation_ns) / _timing.NANOSECONDS_PER_SECOND,
             tolerance_ns / _timing.NANOSECONDS_PER_SECOND,
         )

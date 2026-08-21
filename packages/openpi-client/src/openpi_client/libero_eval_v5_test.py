@@ -64,7 +64,7 @@ def _calibration(
     task_id=0,
     init_state_index=0,
 ):
-    identity = _checkpoint_identity(bsp=mode_name == "bsp_spline_async")
+    identity = _checkpoint_identity(bsp=mode_name.startswith("bsp_spline_async"))
     warmup_raw = [100_000_000] * 5
     warmup_sampled = [300_000_000] * 5
     measurement_raw = [100_000_000] * 20

@@ -112,6 +112,52 @@ def test_legacy_request_preserves_callable_kwargs_response_shape_and_rng_semanti
     assert "rtc" not in result
 
 
+def test_bsp_speedup_one_envelope_is_removed_before_transforms_and_relabels_the_sidecar(monkeypatch):
+    policy_instance, seen = _fake_policy(action_representation="bsp")
+
+    def bsp_output_transform(outputs):
+        seen["output"].append(np.asarray(outputs["actions"]).copy())
+        return {
+            "actions": np.zeros((8, 7), dtype=np.float32),
+            "bsp": {
+                "schema_version": 1,
+                "parameters": np.zeros((16, 8), dtype=np.float32),
+                "origin_hz": 10,
+                "degree": 3,
+                "speedup": 2,
+                "alignment": "disabled_delta_eff",
+            },
+        }
+
+    policy_instance._output_transform = bsp_output_transform
+    monkeypatch.setattr(policy._model.Observation, "from_dict", staticmethod(lambda inputs: object()))
+    request = {
+        "raw": np.asarray([3.0]),
+        inference.BSP_EXECUTION_KEY: {"schema_version": 1, "speedup": 1},
+    }
+
+    result = policy_instance.infer(request)
+
+    assert inference.BSP_EXECUTION_KEY not in seen["input"][0]
+    assert request[inference.BSP_EXECUTION_KEY] == {"schema_version": 1, "speedup": 1}
+    assert result["bsp"]["speedup"] == 1
+
+
+def test_native_policy_rejects_bsp_speedup_one_execution_envelope_before_sampling(monkeypatch):
+    policy_instance, seen = _fake_policy(action_representation="native")
+    monkeypatch.setattr(policy._model.Observation, "from_dict", staticmethod(lambda inputs: object()))
+
+    with pytest.raises(ValueError, match="BSP action representation"):
+        policy_instance.infer(
+            {
+                "raw": np.asarray([3.0]),
+                inference.BSP_EXECUTION_KEY: {"schema_version": 1, "speedup": 1},
+            }
+        )
+
+    assert not seen["legacy"]
+
+
 def test_bootstrap_pops_both_envelopes_forces_n5_and_captures_before_output_transform(monkeypatch):
     policy_instance, seen = _fake_policy()
     policy_instance._sample_kwargs = {"num_steps": 99}
@@ -337,6 +383,7 @@ def test_policy_computes_exact_reserved_capability_metadata_and_rejects_collisio
                 "baseline_h16_n5_v1",
                 "baseline_sync_n5_h16_full_v2",
                 "baseline_async_h16_v1",
+                "baseline_async_h16_blocking_recovery_v2",
                 "baseline_rtc_h16_v1",
             ],
         },
@@ -351,6 +398,7 @@ def test_policy_computes_exact_reserved_capability_metadata_and_rejects_collisio
             "supported_protocols": [
                 "bsp_spline_sync_speedup2_phase0_v2",
                 "bsp_spline_async_phase_skip_speedup2_v2",
+                "bsp_spline_async_phase_skip_speedup1_v1",
             ],
         },
     }

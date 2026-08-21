@@ -18,6 +18,30 @@ class InferenceRequestTest(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 inference.pop_inference_seed({inference.INFERENCE_SEED_KEY: invalid})
 
+    def test_bsp_execution_context_is_exact_speedup_one_and_removed_from_model_inputs(self):
+        observation = {
+            "state": [0.0] * 8,
+            inference.BSP_EXECUTION_KEY: {"schema_version": 1, "speedup": 1},
+        }
+
+        inputs, speedup = inference.pop_bsp_execution(observation)
+
+        self.assertEqual(speedup, 1)
+        self.assertEqual(set(inputs), {"state"})
+        self.assertIn(inference.BSP_EXECUTION_KEY, observation)
+
+    def test_bsp_execution_context_rejects_nonexact_payloads(self):
+        invalid_values = (
+            None,
+            {"schema_version": True, "speedup": 1},
+            {"schema_version": 1, "speedup": True},
+            {"schema_version": 1, "speedup": 2},
+            {"schema_version": 1, "speedup": 1, "extra": 0},
+        )
+        for value in invalid_values:
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "bsp_execution"):
+                inference.pop_bsp_execution({inference.BSP_EXECUTION_KEY: value})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -66,6 +66,23 @@ and replaced by a blocking replan from the latest observation. The legacy
 eight-action response preview is validated for transport compatibility but is
 not executed by this formal scheduler.
 
+Two opt-in follow-up modes leave all earlier schema-v5 identities unchanged.
+`baseline_async_recovery` preserves plain baseline async launches, prefix skip,
+and segment seams, but replaces the capacity-infeasible `cursor + 8 > 16`
+failure with a blocking request from the latest observation. The fresh
+16-action chunk installs at cursor zero; the blocked interval is audited as a
+real control stall. Model/transport failures and the suite max-step timeout
+remain failures.
+
+`bsp_spline_async_speedup1` requests protocol
+`bsp_spline_async_phase_skip_speedup1_v1`. It keeps the 10 Hz knot-index time
+scale and the 20 Hz controller, so each completed `env.step()` advances 0.5
+curve index. A response delayed by six completed steps therefore starts at
+phase three. The 400 ms prefetch guard uses the real 10 indices/s curve rate
+and becomes due at four remaining indices. The request envelope is removed
+before model transforms and the policy explicitly publishes `speedup=1` in
+the returned sidecar.
+
 The v5 video overlay is one persistent `Cumulative inference wait: X.XX s`
 line with no solid background. Only real action-underflow stalls freeze video;
 hidden async latency does not. Selected videos are streamed to the encoder one

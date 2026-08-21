@@ -46,12 +46,14 @@ def _inference_capabilities(
             "baseline_h16_n5_v1",
             "baseline_sync_n5_h16_full_v2",
             "baseline_async_h16_v1",
+            "baseline_async_h16_blocking_recovery_v2",
             "baseline_rtc_h16_v1",
         ]
     elif action_representation == "bsp":
         supported_protocols = [
             "bsp_spline_sync_speedup2_phase0_v2",
             "bsp_spline_async_phase_skip_speedup2_v2",
+            "bsp_spline_async_phase_skip_speedup1_v1",
         ]
     else:
         supported_protocols = []
@@ -137,6 +139,9 @@ class Policy(BasePolicy):
         # pop_inference_seed copies the top-level mapping so the caller is not mutated.
         inputs, inference_seed = _inference.pop_inference_seed(obs)
         inputs, rtc_context = _inference.pop_rtc_context(inputs)
+        inputs, bsp_execution_speedup = _inference.pop_bsp_execution(inputs)
+        if bsp_execution_speedup is not None and getattr(self, "_action_representation", None) != "bsp":
+            raise ValueError("BSP execution requests require BSP action representation")
         rtc_sample_call = None
         if rtc_context is not None:
             self._validate_rtc_capability()
@@ -188,6 +193,13 @@ class Policy(BasePolicy):
                 raise ValueError("RTC model output must be representable as finite float32 values")
 
         outputs = self._output_transform(outputs)
+        if bsp_execution_speedup is not None:
+            bsp_payload = outputs.get("bsp")
+            if not isinstance(bsp_payload, dict) or bsp_payload.get("speedup") != 2:
+                raise ValueError("BSP output transform must publish the default speedup-two sidecar")
+            bsp_payload = dict(bsp_payload)
+            bsp_payload["speedup"] = bsp_execution_speedup
+            outputs["bsp"] = bsp_payload
         if rtc_model_actions is not None:
             outputs["rtc"] = {
                 "schema_version": _inference.RTC_SCHEMA_VERSION,

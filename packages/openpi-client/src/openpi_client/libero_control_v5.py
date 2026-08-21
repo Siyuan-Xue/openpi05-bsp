@@ -47,6 +47,18 @@ _EXECUTION_PARAMETERS_BY_NAME = {
         "continuity_guidance": False,
         "activation_policy": "immediate_skip_elapsed_prefix",
     },
+    "baseline_async_recovery": {
+        "action_representation": "native",
+        "dispatch": "asynchronous_after_initial_with_blocking_capacity_recovery",
+        "model_action_horizon": 16,
+        "model_action_dim": 32,
+        "minimum_launch_cursor": 8,
+        "forecast_delay_ticks": 8,
+        "num_inference_steps": 5,
+        "continuity_guidance": False,
+        "activation_policy": "immediate_skip_elapsed_prefix",
+        "capacity_recovery": "blocking_replan_from_latest_observation",
+    },
     "baseline_rtc": {
         "action_representation": "native",
         "dispatch": "asynchronous_after_initial",
@@ -67,6 +79,19 @@ _EXECUTION_PARAMETERS_BY_NAME = {
         "degree": 3,
         "speedup": 2,
         "effective_curve_rate_hz": 20,
+        "control_freq_hz": 20,
+        "alignment": "disabled_delta_eff",
+        "activation_policy": "phase_skip_executed_prefix",
+        "prefetch_comparison": "remaining_lte_budget",
+    },
+    "bsp_spline_async_speedup1": {
+        "action_representation": "bsp",
+        "dispatch": "asynchronous_after_initial",
+        "parameter_shape": [16, 8],
+        "origin_hz": 10,
+        "degree": 3,
+        "speedup": 1,
+        "effective_curve_rate_hz": 10,
         "control_freq_hz": 20,
         "alignment": "disabled_delta_eff",
         "activation_policy": "phase_skip_executed_prefix",
@@ -97,10 +122,24 @@ _EXECUTION_PARAMETERS_BY_NAME = {
 
 _MODE_IDENTITIES = {
     "baseline_async": ("baseline", "baseline_async_h16_v1", 16, True, "baseline_async"),
+    "baseline_async_recovery": (
+        "baseline",
+        "baseline_async_h16_blocking_recovery_v2",
+        16,
+        True,
+        "baseline_async",
+    ),
     "baseline_rtc": ("baseline", "baseline_rtc_h16_v1", 16, True, "rtc"),
     "bsp_spline_async": (
         "bsp",
         "bsp_spline_async_phase_skip_speedup2_v2",
+        8,
+        True,
+        "bsp",
+    ),
+    "bsp_spline_async_speedup1": (
+        "bsp",
+        "bsp_spline_async_phase_skip_speedup1_v1",
         8,
         True,
         "bsp",
@@ -173,13 +212,28 @@ def _to_microindices(value: float) -> int:
     return int(round(numeric * 1_000_000))
 
 
-def _remaining_ns_from_microindices(remaining_microindices: int) -> int:
+def _remaining_ns_from_microindices(remaining_microindices: int, *, effective_curve_rate_hz: int = 20) -> int:
     remaining = _require_nonbool_int(
         remaining_microindices,
         label="remaining_microindices",
         minimum=0,
     )
-    return (remaining * 1_000_000_000 + 20_000_000 - 1) // 20_000_000
+    rate = _require_nonbool_int(
+        effective_curve_rate_hz,
+        label="effective_curve_rate_hz",
+        minimum=1,
+    )
+    denominator = rate * 1_000_000
+    return (remaining * 1_000_000_000 + denominator - 1) // denominator
+
+
+def _bsp_phase_rate_hz(executed_prefix_steps: int, phase_offset_microindices: int) -> int:
+    prefix = _require_nonbool_int(executed_prefix_steps, label="executed_prefix_steps", minimum=0)
+    phase = _require_nonbool_int(phase_offset_microindices, label="phase_offset_microindices", minimum=0)
+    matches = [rate for rate in (10, 20) if phase * 20 == prefix * rate * 1_000_000]
+    if not matches:
+        raise ValueError("BSP phase offset does not match the 10 Hz or 20 Hz execution protocol")
+    return matches[0]
 
 
 def _require_sha256(value: Any, *, label: str) -> str:
@@ -251,6 +305,7 @@ class RequestIntentV5:
             "initial_plan",
             "baseline_chunk_exhausted",
             "baseline_async_launch",
+            "baseline_async_capacity_replan",
             "rtc_launch",
             "bsp_curve_exhausted",
             "bsp_prefetch",
@@ -275,6 +330,7 @@ class RequestIntentV5:
             "initial_plan": "blocking_initial",
             "baseline_chunk_exhausted": "blocking_replan",
             "baseline_async_launch": "background",
+            "baseline_async_capacity_replan": "blocking_replan",
             "rtc_launch": "background",
             "bsp_curve_exhausted": "blocking_replan",
             "bsp_prefetch": "background",
@@ -285,6 +341,13 @@ class RequestIntentV5:
         if self.trigger in ("initial_plan", "baseline_chunk_exhausted", "bsp_curve_exhausted"):
             if scheduler_context:
                 raise ValueError("request trigger requires an empty scheduler context")
+        elif self.trigger == "baseline_async_capacity_replan":
+            if set(scheduler_context) != {"action_cursor", "forecast_delay_ticks"}:
+                raise ValueError("baseline async capacity recovery requires cursor and delay")
+            cursor = scheduler_context["action_cursor"]
+            delay = scheduler_context["forecast_delay_ticks"]
+            if not 9 <= cursor <= 15 or delay != 8 or cursor + delay <= 16:
+                raise ValueError("baseline async capacity recovery requires an infeasible cursor")
         elif self.trigger in ("baseline_async_launch", "rtc_launch"):
             if set(scheduler_context) != {"s", "d"}:
                 raise ValueError("RTC launch context must contain exactly s and d")
@@ -315,11 +378,13 @@ class RequestIntentV5:
             if (
                 activation_step < request_step
                 or scheduler_context["executed_prefix_steps"] != activation_step - request_step
-                or scheduler_context["phase_offset_microindices"]
-                != scheduler_context["executed_prefix_steps"] * 1_000_000
                 or scheduler_context["phase_offset_microindices"] <= scheduler_context["curve_t_max_microindices"]
             ):
                 raise ValueError("BSP stale replan phase identity is inconsistent")
+            _bsp_phase_rate_hz(
+                scheduler_context["executed_prefix_steps"],
+                scheduler_context["phase_offset_microindices"],
+            )
         object.__setattr__(self, "scheduler_context", scheduler_context)
         if not isinstance(self.request_overlay, Mapping):
             raise ValueError("request_overlay must be a mapping")
@@ -366,16 +431,24 @@ class ActivationDecisionV5:
             "remaining_curve_ns",
             "immediate_prefetch",
         }:
-            expected_remaining_ns = _remaining_ns_from_microindices(activation_context["remaining_curve_microindices"])
+            matching_rates = tuple(
+                rate
+                for rate in (10, 20)
+                if activation_context["phase_offset_microindices"] * 20
+                == activation_context["executed_prefix_steps"] * rate * 1_000_000
+                and activation_context["remaining_curve_ns"]
+                == _remaining_ns_from_microindices(
+                    activation_context["remaining_curve_microindices"],
+                    effective_curve_rate_hz=rate,
+                )
+            )
             if (
                 self.activation == "discarded_stale_phase"
                 or activation_context["activation_control_step"] < activation_context["request_control_step"]
                 or activation_context["executed_prefix_steps"]
                 != activation_context["activation_control_step"] - activation_context["request_control_step"]
-                or activation_context["phase_offset_microindices"]
-                != activation_context["executed_prefix_steps"] * 1_000_000
+                or not matching_rates
                 or activation_context["first_sample_microindices"] < activation_context["phase_offset_microindices"]
-                or activation_context["remaining_curve_ns"] != expected_remaining_ns
                 or activation_context["immediate_prefetch"] not in (0, 1)
                 or (
                     activation_context["immediate_prefetch"] == 1
@@ -393,13 +466,18 @@ class ActivationDecisionV5:
             "remaining_curve_ns",
             "curve_t_max_microindices",
         }:
+            try:
+                _bsp_phase_rate_hz(
+                    activation_context["executed_prefix_steps"],
+                    activation_context["phase_offset_microindices"],
+                )
+            except ValueError as error:
+                raise ValueError("only a stale response may use the discarded BSP context") from error
             if (
                 self.activation != "discarded_stale_phase"
                 or activation_context["activation_control_step"] < activation_context["request_control_step"]
                 or activation_context["executed_prefix_steps"]
                 != activation_context["activation_control_step"] - activation_context["request_control_step"]
-                or activation_context["phase_offset_microindices"]
-                != activation_context["executed_prefix_steps"] * 1_000_000
                 or activation_context["first_sample_microindices"] != activation_context["phase_offset_microindices"]
                 or activation_context["phase_offset_microindices"] <= activation_context["curve_t_max_microindices"]
                 or activation_context["remaining_curve_microindices"] != 0
@@ -760,7 +838,7 @@ class LatencyCalibrationV1:
             if rounded_ticks > 8:
                 raise ValueError("RTC calibrated delay exceeds eight control ticks")
             delay_ticks = rounded_ticks
-        elif execution_mode == "bsp_spline_async":
+        elif execution_mode in ("bsp_spline_async", "bsp_spline_async_speedup1"):
             budget_ns = rounded_ticks * CONTROL_PERIOD_NS
         else:
             raise ValueError("latency calibration is defined only for asynchronous modes")
@@ -790,7 +868,7 @@ class LatencyCalibrationV1:
     def _validate(self) -> None:
         if _require_nonbool_int(self.schema_version, label="calibration schema_version") != 1:
             raise ValueError("calibration schema_version must be integer 1")
-        if self.execution_mode not in ("baseline_rtc", "bsp_spline_async"):
+        if self.execution_mode not in ("baseline_rtc", "bsp_spline_async", "bsp_spline_async_speedup1"):
             raise ValueError("calibration execution_mode must be asynchronous")
         if self.clock != "monotonic_ns":
             raise ValueError("calibration clock must be monotonic_ns")
@@ -1129,10 +1207,10 @@ class LatencyCalibrationV2:
         rank, raw_p95 = nearest_rank_p95_ns(raw)
         _, sampled_p95 = nearest_rank_p95_ns(sampled)
         _, observed_effective_p95 = nearest_rank_p95_ns(observed_effective)
-        if execution_mode in ("baseline_async", "baseline_rtc"):
+        if execution_mode in ("baseline_async", "baseline_async_recovery", "baseline_rtc"):
             delay_ticks = SCHEDULING_DELAY_TICKS
             prefetch_budget_ns = None
-        elif execution_mode == "bsp_spline_async":
+        elif execution_mode in ("bsp_spline_async", "bsp_spline_async_speedup1"):
             delay_ticks = None
             prefetch_budget_ns = SCHEDULING_LATENCY_BUDGET_NS
         else:
@@ -1272,7 +1350,7 @@ class LatencyCalibrationV2:
         for field, expected in expected_scalars.items():
             if _require_nonbool_int(getattr(self, field), label=field, minimum=0) != expected:
                 raise ValueError("{} does not match calibration measurements".format(field))
-        if self.execution_mode in ("baseline_async", "baseline_rtc"):
+        if self.execution_mode in ("baseline_async", "baseline_async_recovery", "baseline_rtc"):
             if self.derived_delay_ticks != SCHEDULING_DELAY_TICKS or self.derived_prefetch_budget_ns is not None:
                 raise ValueError("baseline calibration must use the fixed eight-tick budget")
         elif self.derived_delay_ticks is not None or self.derived_prefetch_budget_ns != SCHEDULING_LATENCY_BUDGET_NS:
@@ -1340,6 +1418,7 @@ def validate_server_metadata(mode: ExecutionModeSpec, metadata: Mapping[str, Any
                 "baseline_h16_n5_v1",
                 "baseline_sync_n5_h16_full_v2",
                 "baseline_async_h16_v1",
+                "baseline_async_h16_blocking_recovery_v2",
                 "baseline_rtc_h16_v1",
             ],
         }
@@ -1352,6 +1431,7 @@ def validate_server_metadata(mode: ExecutionModeSpec, metadata: Mapping[str, Any
             "supported_protocols": [
                 "bsp_spline_sync_speedup2_phase0_v2",
                 "bsp_spline_async_phase_skip_speedup2_v2",
+                "bsp_spline_async_phase_skip_speedup1_v1",
             ],
         }
     for field, expected_value in expected.items():
@@ -1442,7 +1522,11 @@ def calibrate_async_mode(
     if canonical_identity.request_fingerprint != expected_request_fingerprint:
         raise CalibrationIdentityError("canonical request fingerprint does not match its identity")
     _require_sha256(server_metadata_fingerprint, label="server_metadata_fingerprint")
-    for reserved_key in (inference.INFERENCE_SEED_KEY, inference.RTC_REQUEST_KEY):
+    for reserved_key in (
+        inference.INFERENCE_SEED_KEY,
+        inference.RTC_REQUEST_KEY,
+        inference.BSP_EXECUTION_KEY,
+    ):
         if reserved_key in canonical_request:
             raise ValueError("canonical_request must not contain reserved inference envelopes")
     if mode.policy_variant == "baseline":
@@ -1559,6 +1643,13 @@ def _calibrate_once(
                         "schema_version": inference.RTC_SCHEMA_VERSION,
                     }
                 }
+            elif mode.name == "bsp_spline_async_speedup1":
+                overlay = {
+                    inference.BSP_EXECUTION_KEY: {
+                        "schema_version": inference.BSP_EXECUTION_SCHEMA_VERSION,
+                        "speedup": 1,
+                    }
+                }
             probe = _run_probe(
                 mode,
                 canonical_request,
@@ -1574,7 +1665,10 @@ def _calibrate_once(
                 if mode.calibration_kind == "rtc":
                     previous_response = probe.response
             else:
-                _validate_bsp_calibration_response(probe.response)
+                _validate_bsp_calibration_response(
+                    probe.response,
+                    expected_speedup=1 if mode.name == "bsp_spline_async_speedup1" else 2,
+                )
             fingerprints.append(probe.request_fingerprint)
             prefix = phase + "_"
             breakdown[prefix + "raw_inference_latency_ns"].append(probe.raw_inference_latency_ns)
@@ -1734,9 +1828,9 @@ def _validate_rtc_calibration_response(response: Mapping[str, Any]) -> None:
         raise CalibrationPolicyError("Malformed RTC calibration response") from error
 
 
-def _validate_bsp_calibration_response(response: Mapping[str, Any]) -> None:
+def _validate_bsp_calibration_response(response: Mapping[str, Any], *, expected_speedup: int = 2) -> None:
     try:
-        validate_bsp_response(response)
+        validate_bsp_response(response, expected_speedup=expected_speedup)
     except (TypeError, ValueError) as error:
         raise CalibrationPolicyError("Malformed BSP calibration response") from error
 
@@ -1878,8 +1972,9 @@ class _BaselineSyncScheduler(ModeSchedulerV5):
 
 
 class _BaselineAsyncScheduler(ModeSchedulerV5):
-    def __init__(self, d_init: int) -> None:
+    def __init__(self, d_init: int, *, blocking_capacity_recovery: bool = False) -> None:
         self._d_init = d_init
+        self._blocking_capacity_recovery = blocking_capacity_recovery
         self._plan = rtc.RawAsyncPlan(d_init=d_init)
         self._installed_count = 0
         self._pending_intent = None
@@ -1927,6 +2022,18 @@ class _BaselineAsyncScheduler(ModeSchedulerV5):
                 )
             )
         if state is rtc.RtcPlanState.INFEASIBLE:
+            if self._blocking_capacity_recovery:
+                return self._set_pending(
+                    RequestIntentV5(
+                        dispatch="blocking_replan",
+                        trigger="baseline_async_capacity_replan",
+                        scheduler_context={
+                            "action_cursor": self._plan.cursor,
+                            "forecast_delay_ticks": self._plan.forecast_delay,
+                        },
+                        request_overlay=self._plan.begin_blocking_replan(),
+                    )
+                )
             self._plan.begin_background()
         return None
 
@@ -1941,7 +2048,12 @@ class _BaselineAsyncScheduler(ModeSchedulerV5):
         _validate_install_inputs(intent, now_ns=now_ns, control_step=control_step)
         self._require_pending(intent)
         self._plan.install_result(response)
-        activation = "initial" if self._installed_count == 0 else "immediate_swap"
+        if self._installed_count == 0:
+            activation = "initial"
+        elif intent.dispatch == "blocking_replan":
+            activation = "blocking_replace"
+        else:
+            activation = "immediate_swap"
         self._installed_count += 1
         self._complete_pending()
         return ActivationDecisionV5(
@@ -2039,13 +2151,26 @@ class _RtcScheduler(ModeSchedulerV5):
 
 
 class _BspScheduler(ModeSchedulerV5):
-    def __init__(self, *, asynchronous: bool, budget_ns: Optional[int]) -> None:
+    def __init__(self, *, asynchronous: bool, budget_ns: Optional[int], expected_speedup: int = 2) -> None:
         self._asynchronous = asynchronous
         self._budget_ns = budget_ns
+        if isinstance(expected_speedup, bool) or expected_speedup not in (1, 2):
+            raise ValueError("expected_speedup must be integer 1 or 2")
+        self._expected_speedup = expected_speedup
+        self._request_overlay = (
+            {
+                inference.BSP_EXECUTION_KEY: {
+                    "schema_version": inference.BSP_EXECUTION_SCHEMA_VERSION,
+                    "speedup": 1,
+                }
+            }
+            if expected_speedup == 1
+            else {}
+        )
         self.reset()
 
     def reset(self) -> None:
-        self._plan = bsp_spline.BspControlActionPlan()
+        self._plan = bsp_spline.BspControlActionPlan(expected_speedup=self._expected_speedup)
         self._installed_count = 0
         self._pending_intent = None
         self._pending_request_control_step = None
@@ -2083,7 +2208,7 @@ class _BspScheduler(ModeSchedulerV5):
                     dispatch="blocking_replan",
                     trigger="bsp_stale_replan",
                     scheduler_context=self._stale_replan_context,
-                    request_overlay={},
+                    request_overlay=self._request_overlay,
                 ),
                 request_control_step=step,
             )
@@ -2093,7 +2218,7 @@ class _BspScheduler(ModeSchedulerV5):
                     dispatch="blocking_initial",
                     trigger="initial_plan",
                     scheduler_context={},
-                    request_overlay={},
+                    request_overlay=self._request_overlay,
                 ),
                 request_control_step=step,
             )
@@ -2112,7 +2237,7 @@ class _BspScheduler(ModeSchedulerV5):
                         "budget_ns": self._budget_ns,
                         "request_control_step": step,
                     },
-                    request_overlay={},
+                    request_overlay=self._request_overlay,
                 ),
                 request_control_step=step,
             )
@@ -2126,7 +2251,7 @@ class _BspScheduler(ModeSchedulerV5):
                 dispatch="blocking_replan",
                 trigger="bsp_curve_exhausted",
                 scheduler_context={},
-                request_overlay={},
+                request_overlay=self._request_overlay,
             ),
             request_control_step=step,
         )
@@ -2143,7 +2268,7 @@ class _BspScheduler(ModeSchedulerV5):
         self._require_pending(intent)
         if self._pending_request_control_step is None:
             raise RuntimeError("BSP scheduler is missing its request control step")
-        validate_bsp_response(response)
+        validate_bsp_response(response, expected_speedup=self._expected_speedup)
         request_step = self._pending_request_control_step
         installed = self._plan.install(
             response["bsp"],
@@ -2153,9 +2278,17 @@ class _BspScheduler(ModeSchedulerV5):
         )
         phase_microindices = _to_microindices(installed.phase_offset_indices)
         first_microindices = _to_microindices(installed.first_sample_time)
-        curve_t_max_microindices = _to_microindices(bsp_spline.BspSpline.from_response(response["bsp"]).t_max)
+        curve_t_max_microindices = _to_microindices(
+            bsp_spline.BspSpline.from_response(
+                response["bsp"],
+                expected_speedup=self._expected_speedup,
+            ).t_max
+        )
         remaining_microindices = max(0, curve_t_max_microindices - phase_microindices)
-        remaining_curve_ns = _remaining_ns_from_microindices(remaining_microindices)
+        remaining_curve_ns = _remaining_ns_from_microindices(
+            remaining_microindices,
+            effective_curve_rate_hz=10 * self._expected_speedup,
+        )
         if installed.stale:
             self._complete_pending()
             self._pending_request_control_step = None
@@ -2226,12 +2359,15 @@ def make_scheduler_v5(
     if mode.name == "baseline_sync":
         return _BaselineSyncScheduler()
     if mode.name == "bsp_spline_sync":
-        return _BspScheduler(asynchronous=False, budget_ns=None)
-    if mode.name == "baseline_async":
+        return _BspScheduler(asynchronous=False, budget_ns=None, expected_speedup=2)
+    if mode.name in ("baseline_async", "baseline_async_recovery"):
         assert calibration is not None
         if calibration.derived_delay_ticks is None:
             raise ValueError("baseline async calibration is missing derived delay ticks")
-        return _BaselineAsyncScheduler(calibration.derived_delay_ticks)
+        return _BaselineAsyncScheduler(
+            calibration.derived_delay_ticks,
+            blocking_capacity_recovery=mode.name == "baseline_async_recovery",
+        )
     if mode.name == "baseline_rtc":
         assert calibration is not None
         if calibration.derived_delay_ticks is None:
@@ -2243,6 +2379,7 @@ def make_scheduler_v5(
     return _BspScheduler(
         asynchronous=True,
         budget_ns=calibration.derived_prefetch_budget_ns,
+        expected_speedup=1 if mode.name == "bsp_spline_async_speedup1" else 2,
     )
 
 
@@ -2285,7 +2422,7 @@ def _validate_install_inputs(
     return now, step
 
 
-def validate_bsp_response(response: Mapping[str, Any]) -> bsp_spline.BspSpline:
+def validate_bsp_response(response: Mapping[str, Any], *, expected_speedup: int = 2) -> bsp_spline.BspSpline:
     """Validate the legacy eight actions and exact continuous BSP sidecar together."""
     if not isinstance(response, Mapping) or "actions" not in response or "bsp" not in response:
         raise ValueError("BSP policy response must contain legacy actions and a bsp sidecar")
@@ -2303,4 +2440,4 @@ def validate_bsp_response(response: Mapping[str, Any]) -> bsp_spline.BspSpline:
         float32_actions = np.asarray(actions, dtype=np.float32)
     if not np.isfinite(float32_actions).all():
         raise ValueError("BSP legacy actions must be representable as finite float32")
-    return bsp_spline.BspSpline.from_response(response["bsp"])
+    return bsp_spline.BspSpline.from_response(response["bsp"], expected_speedup=expected_speedup)

@@ -14,12 +14,14 @@ import numpy as np
 # Policy implementations must remove it before running observation transforms.
 INFERENCE_SEED_KEY = "__openpi_inference_seed"
 RTC_REQUEST_KEY = "__openpi_rtc"
+BSP_EXECUTION_KEY = "__openpi_bsp_execution"
 INFERENCE_CAPABILITIES_KEY = "__openpi_inference_capabilities"
 
 RTC_SCHEMA_VERSION = 1
 RTC_ACTION_HORIZON = 16
 RTC_MODEL_ACTION_DIM = 32
 RTC_MIN_START = 8
+BSP_EXECUTION_SCHEMA_VERSION = 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -52,6 +54,27 @@ def pop_inference_seed(observation: Mapping[str, Any]) -> tuple[dict[str, Any], 
     if seed < 0 or seed >= 2**32:
         raise ValueError(f"{INFERENCE_SEED_KEY} must be an integer in [0, 2**32)")
     return inputs, seed
+
+
+def pop_bsp_execution(observation: Mapping[str, Any]) -> tuple[dict[str, Any], int | None]:
+    """Remove and strictly validate the optional BSP speedup-one execution envelope."""
+    inputs = dict(observation)
+    if BSP_EXECUTION_KEY not in inputs:
+        return inputs, None
+    value = inputs.pop(BSP_EXECUTION_KEY)
+    if not isinstance(value, Mapping) or set(value) != {"schema_version", "speedup"}:
+        raise ValueError(f"{BSP_EXECUTION_KEY} must be an exact schema-one mapping")
+    schema_version = value["schema_version"]
+    speedup = value["speedup"]
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, numbers.Integral)
+        or int(schema_version) != BSP_EXECUTION_SCHEMA_VERSION
+    ):
+        raise ValueError(f"{BSP_EXECUTION_KEY}.schema_version must be integer 1")
+    if isinstance(speedup, bool) or not isinstance(speedup, numbers.Integral) or int(speedup) != 1:
+        raise ValueError(f"{BSP_EXECUTION_KEY}.speedup must be integer 1")
+    return inputs, 1
 
 
 def pop_rtc_context(
@@ -89,8 +112,7 @@ def pop_rtc_context(
         raise ValueError(f"{RTC_REQUEST_KEY}.previous_model_actions must have dtype float32")
     if previous.shape != (RTC_ACTION_HORIZON, RTC_MODEL_ACTION_DIM):
         raise ValueError(
-            f"{RTC_REQUEST_KEY}.previous_model_actions must have shape "
-            f"({RTC_ACTION_HORIZON}, {RTC_MODEL_ACTION_DIM})"
+            f"{RTC_REQUEST_KEY}.previous_model_actions must have shape ({RTC_ACTION_HORIZON}, {RTC_MODEL_ACTION_DIM})"
         )
     if not np.isfinite(previous).all():
         raise ValueError(f"{RTC_REQUEST_KEY}.previous_model_actions must be finite")

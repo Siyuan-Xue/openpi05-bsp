@@ -272,6 +272,25 @@ def test_raw_async_request_has_no_continuity_guidance_and_skips_elapsed_prefix()
     np.testing.assert_array_equal(plan.consume_action(), response["actions"][3].astype(np.float32))
 
 
+def test_raw_async_capacity_miss_can_block_for_a_fresh_chunk_from_action_zero():
+    """Removing the blocking recovery must restore the observed launch-infeasible failure."""
+    plan = rtc.RawAsyncPlan(d_init=8)
+    plan.begin_bootstrap()
+    plan.install_result(_response(action_offset=0.0))
+    for _ in range(9):
+        plan.consume_action()
+
+    assert plan.state is rtc.RtcPlanState.INFEASIBLE
+    overlay = plan.begin_blocking_replan()
+    assert overlay == {inference.RTC_REQUEST_KEY: {"schema_version": inference.RTC_SCHEMA_VERSION}}
+
+    fresh = _response(action_offset=2_000.0)
+    plan.install_result(fresh)
+
+    assert plan.cursor == 0
+    np.testing.assert_array_equal(plan.consume_action(), fresh["actions"][0])
+
+
 def test_fixed_rtc_delay_does_not_adapt_below_theoretical_budget():
     plan = rtc.RtcPlan(d_init=8, fixed_delay=True)
     plan.begin_bootstrap()

@@ -47,6 +47,7 @@ def _metadata_payload(*, revision="same", policy_variant="baseline"):
             "baseline_h16_n5_v1",
             "baseline_sync_n5_h16_full_v2",
             "baseline_async_h16_v1",
+            "baseline_async_h16_blocking_recovery_v2",
             "baseline_rtc_h16_v1",
         ]
     else:
@@ -54,6 +55,7 @@ def _metadata_payload(*, revision="same", policy_variant="baseline"):
         protocols = [
             "bsp_spline_sync_speedup2_phase0_v2",
             "bsp_spline_async_phase_skip_speedup2_v2",
+            "bsp_spline_async_phase_skip_speedup1_v1",
         ]
     return msgpack_numpy.packb(
         {
@@ -78,7 +80,7 @@ def _rtc_response(offset=0.0):
     }
 
 
-def _bsp_response(offset=0.0, *, duration_ticks=None):
+def _bsp_response(offset=0.0, *, duration_ticks=None, speedup=2):
     parameters = np.zeros((16, 8), dtype=np.float32)
     parameters[:, :7] = offset
     if duration_ticks is None:
@@ -98,7 +100,7 @@ def _bsp_response(offset=0.0, *, duration_ticks=None):
             "parameters": parameters,
             "origin_hz": 10,
             "degree": 3,
-            "speedup": 2,
+            "speedup": speedup,
             "alignment": "disabled_delta_eff",
         },
     }
@@ -421,6 +423,51 @@ def test_baseline_async_hides_completed_background_latency_and_records_a_seam(
     assert result.inference_latencies[1].completed_offset_ns == (350 + second_latency_ms) * NS_PER_MS
     assert result.action_seams[0].request_id == 1
     assert result.action_seams[0].control_step in (8, 9)
+
+
+def test_baseline_async_capacity_miss_blocks_for_fresh_actions_instead_of_failing():
+    """The old INFEASIBLE branch fails this real runner sequence at control step 33."""
+    clock = ManualClock()
+    worker = FakeWorker(
+        clock,
+        [
+            _ScriptedCall(0, _rtc_response()),
+            _ScriptedCall(250 * NS_PER_MS, _rtc_response(1_000.0)),
+            _ScriptedCall(250 * NS_PER_MS, _rtc_response(2_000.0)),
+            _ScriptedCall(500 * NS_PER_MS, _rtc_response(3_000.0)),
+            _ScriptedCall(50 * NS_PER_MS, _rtc_response(4_000.0)),
+        ],
+    )
+    environment = FakeEnvironment(done_after_real_steps=34)
+    mode = control.EXECUTION_MODES["baseline_async_recovery"]
+
+    result = _run(
+        clock,
+        worker,
+        environment,
+        args=_args(execution_mode=mode.name),
+        scheduler=control.make_scheduler_v5(mode, _calibration(mode.name)),
+        max_steps=40,
+    )
+
+    assert result.success, result.error
+    assert [request.trigger for request in result.inference_requests] == [
+        "initial_plan",
+        "baseline_async_launch",
+        "baseline_async_launch",
+        "baseline_async_launch",
+        "baseline_async_capacity_replan",
+    ]
+    assert result.inference_requests[-1].observation_control_step == 33
+    assert result.plan_activations[-1].activation == "blocking_replace"
+    assert result.plan_activations[-1].activation_context == {"action_cursor": 0}
+    assert len(result.action_underflows) == 1
+    assert result.action_underflows[0].request_id == 3
+    recovery_stall = result.control_stalls[-1]
+    assert recovery_stall.request_id == 4
+    assert recovery_stall.control_step == 33
+    assert recovery_stall.reason == "synchronous_inference"
+    assert np.array_equal(environment.actions[33], _rtc_response(4_000.0)["actions"][0])
 
 
 def test_every_baseline_sync_request_has_schema_one_rtc_envelope_and_fresh_seed():
@@ -777,6 +824,54 @@ def test_real_bsp_async_arrival_skips_elapsed_prefix_then_immediately_prefetches
     assert result.inference_requests[2].trigger == "bsp_prefetch"
     assert result.inference_requests[2].disposition == "abandoned"
     assert np.allclose(environment.actions[-1], 3.0)
+
+
+def test_real_bsp_async_speedup1_advances_half_index_and_prefetches_at_four_remaining_indices():
+    clock = ManualClock()
+    payload = _metadata_payload(policy_variant="bsp")
+    worker = FakeWorker(
+        clock,
+        [
+            _ScriptedCall(0, _bsp_response(duration_ticks=9, speedup=1), metadata_payload=payload),
+            _ScriptedCall(
+                200 * NS_PER_MS,
+                _bsp_response(3.0, duration_ticks=9, speedup=1),
+                metadata_payload=payload,
+            ),
+        ],
+        connect_payload=payload,
+    )
+    environment = FakeEnvironment(done_after_real_steps=15)
+    mode = control.EXECUTION_MODES["bsp_spline_async_speedup1"]
+    calibration = _calibration(mode.name, latency_ns=50 * NS_PER_MS)
+
+    result = _run(
+        clock,
+        worker,
+        environment,
+        args=_args(execution_mode=mode.name),
+        scheduler=control.make_scheduler_v5(mode, calibration),
+        max_steps=30,
+    )
+
+    assert result.success, result.error
+    assert result.inference_requests[1].scheduler_context == {
+        "remaining_plan_ns": 400 * NS_PER_MS,
+        "budget_ns": 400 * NS_PER_MS,
+        "request_control_step": 10,
+    }
+    assert worker.requests[0][inference.BSP_EXECUTION_KEY] == {"schema_version": 1, "speedup": 1}
+    assert worker.requests[1][inference.BSP_EXECUTION_KEY] == {"schema_version": 1, "speedup": 1}
+    assert result.plan_activations[1].activation_context == {
+        "request_control_step": 10,
+        "activation_control_step": 13,
+        "executed_prefix_steps": 3,
+        "phase_offset_microindices": 1_500_000,
+        "first_sample_microindices": 1_500_000,
+        "remaining_curve_microindices": 7_500_000,
+        "remaining_curve_ns": 750 * NS_PER_MS,
+        "immediate_prefetch": 0,
+    }
 
 
 def test_real_bsp_async_discards_stale_short_curve_and_blocks_on_latest_observation():

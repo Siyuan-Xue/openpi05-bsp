@@ -41,6 +41,7 @@ def _native_metadata(extra=None):
                 "baseline_h16_n5_v1",
                 "baseline_sync_n5_h16_full_v2",
                 "baseline_async_h16_v1",
+                "baseline_async_h16_blocking_recovery_v2",
                 "baseline_rtc_h16_v1",
             ],
         },
@@ -61,6 +62,7 @@ def _bsp_metadata(extra=None):
             "supported_protocols": [
                 "bsp_spline_sync_speedup2_phase0_v2",
                 "bsp_spline_async_phase_skip_speedup2_v2",
+                "bsp_spline_async_phase_skip_speedup1_v1",
             ],
         },
     }
@@ -79,7 +81,7 @@ def _rtc_response(offset=0.0):
     }
 
 
-def _bsp_sidecar(duration_ticks=9, value=1.0):
+def _bsp_sidecar(duration_ticks=9, value=1.0, *, speedup=2):
     parameters = np.zeros((16, 8), dtype=np.float32)
     parameters[:12, :7] = value
     parameters[:, 7] = (
@@ -92,15 +94,15 @@ def _bsp_sidecar(duration_ticks=9, value=1.0):
         "parameters": parameters,
         "origin_hz": 10,
         "degree": 3,
-        "speedup": 2,
+        "speedup": speedup,
         "alignment": "disabled_delta_eff",
     }
 
 
-def _bsp_response(duration_ticks=9, value=1.0):
+def _bsp_response(duration_ticks=9, value=1.0, *, speedup=2):
     return {
         "actions": np.full((8, 7), value, dtype=np.float32),
-        "bsp": _bsp_sidecar(duration_ticks=duration_ticks, value=value),
+        "bsp": _bsp_sidecar(duration_ticks=duration_ticks, value=value, speedup=speedup),
     }
 
 
@@ -154,7 +156,7 @@ class _CalibrationWorker:
         self.durations = list(durations)
         self.fail_once_at = fail_once_at
         if metadata is None:
-            metadata = _native_metadata() if mode_name == "baseline_rtc" else _bsp_metadata()
+            metadata = _native_metadata() if mode_name.startswith("baseline") else _bsp_metadata()
         self.connection = async_inference.ConnectionSnapshot(
             connection_id=0,
             metadata_payload=msgpack_numpy.packb(metadata),
@@ -198,10 +200,13 @@ class _CalibrationWorker:
                 completed_monotonic_ns=job.submitted_monotonic_ns + 1,
                 connection=self.connection,
             )
-        if self.mode_name in ("baseline_async", "baseline_rtc"):
+        if self.mode_name in ("baseline_async", "baseline_async_recovery", "baseline_rtc"):
             result = _rtc_response(float(index))
         else:
-            result = _bsp_response(value=float(index))
+            result = _bsp_response(
+                value=float(index),
+                speedup=1 if self.mode_name == "bsp_spline_async_speedup1" else 2,
+            )
         duration = self.durations[index % len(self.durations)]
         effective = max(duration, job.sampled_target_latency_ns)
         return async_inference.InferenceOutcome(
@@ -288,8 +293,10 @@ def test_pacer_waits_through_early_wakeups_and_rejects_starts_before_due_time():
 def test_frozen_execution_modes_preserve_async_parameters_and_add_exact_sync_parameters():
     assert tuple(control.EXECUTION_MODES) == (
         "baseline_async",
+        "baseline_async_recovery",
         "baseline_rtc",
         "bsp_spline_async",
+        "bsp_spline_async_speedup1",
         "baseline_sync",
         "bsp_spline_sync",
     )
@@ -303,6 +310,18 @@ def test_frozen_execution_modes_preserve_async_parameters_and_add_exact_sync_par
         "num_inference_steps": 5,
         "continuity_guidance": False,
         "activation_policy": "immediate_skip_elapsed_prefix",
+    }
+    assert control.EXECUTION_MODES["baseline_async_recovery"].to_parameters_dict() == {
+        "action_representation": "native",
+        "dispatch": "asynchronous_after_initial_with_blocking_capacity_recovery",
+        "model_action_horizon": 16,
+        "model_action_dim": 32,
+        "minimum_launch_cursor": 8,
+        "forecast_delay_ticks": 8,
+        "num_inference_steps": 5,
+        "continuity_guidance": False,
+        "activation_policy": "immediate_skip_elapsed_prefix",
+        "capacity_recovery": "blocking_replan_from_latest_observation",
     }
     assert control.EXECUTION_MODES["baseline_rtc"].to_parameters_dict() == {
         "action_representation": "native",
@@ -324,6 +343,19 @@ def test_frozen_execution_modes_preserve_async_parameters_and_add_exact_sync_par
         "degree": 3,
         "speedup": 2,
         "effective_curve_rate_hz": 20,
+        "control_freq_hz": 20,
+        "alignment": "disabled_delta_eff",
+        "activation_policy": "phase_skip_executed_prefix",
+        "prefetch_comparison": "remaining_lte_budget",
+    }
+    assert control.EXECUTION_MODES["bsp_spline_async_speedup1"].to_parameters_dict() == {
+        "action_representation": "bsp",
+        "dispatch": "asynchronous_after_initial",
+        "parameter_shape": [16, 8],
+        "origin_hz": 10,
+        "degree": 3,
+        "speedup": 1,
+        "effective_curve_rate_hz": 10,
         "control_freq_hz": 20,
         "alignment": "disabled_delta_eff",
         "activation_policy": "phase_skip_executed_prefix",
@@ -369,6 +401,17 @@ def test_server_metadata_validation_binds_the_full_outer_object(mode_name, metad
 
     assert fingerprint == control.canonical_fingerprint(metadata)
     assert fingerprint != control.canonical_fingerprint({**metadata, "unrelated": "changed"})
+
+
+def test_recovery_mode_requires_the_new_baseline_policy_capability():
+    metadata = _native_metadata()
+    assert control.validate_server_metadata(control.EXECUTION_MODES["baseline_async_recovery"], metadata)
+
+    metadata[inference.INFERENCE_CAPABILITIES_KEY]["supported_protocols"].remove(
+        "baseline_async_h16_blocking_recovery_v2"
+    )
+    with pytest.raises(ValueError, match="capabilit"):
+        control.validate_server_metadata(control.EXECUTION_MODES["baseline_async_recovery"], metadata)
 
 
 @pytest.mark.parametrize(
@@ -839,6 +882,26 @@ def test_bsp_calibration_discards_partial_samples_and_restarts_whole_sequence_af
     assert len(calibration.measurement_observed_effective_latency_ns) == 20
 
 
+def test_bsp_speedup1_calibration_uses_the_execution_envelope_for_all_twenty_five_probes():
+    request = {"state": np.arange(4, dtype=np.float32)}
+    mode = control.EXECUTION_MODES["bsp_spline_async_speedup1"]
+    worker = _CalibrationWorker(mode.name, [80_000_000] * 25)
+
+    calibration = control.calibrate_async_mode(
+        mode,
+        request,
+        _observation_identity(request),
+        worker,
+        _checkpoint_identity(bsp=True),
+        control.canonical_fingerprint(_bsp_metadata()),
+    )
+
+    assert len(worker.requests) == 25
+    assert all(item[inference.BSP_EXECUTION_KEY] == {"schema_version": 1, "speedup": 1} for item in worker.requests)
+    assert calibration.execution_mode == mode.name
+    assert calibration.derived_prefetch_budget_ns == 400_000_000
+
+
 def test_calibration_records_requested_and_observed_latency_breakdown():
     request = {"state": np.arange(4, dtype=np.float32)}
     worker = _CalibrationWorker("bsp_spline_async", [80_000_000] * 25)
@@ -1168,7 +1231,7 @@ def test_calibration_rejects_metadata_change_in_an_unrelated_outer_field():
 
 
 def _schema5_calibration(mode_name, *, empirical_observed_effective_ns=300_000_000):
-    checkpoint = _checkpoint_identity(bsp=mode_name == "bsp_spline_async")
+    checkpoint = _checkpoint_identity(bsp=mode_name.startswith("bsp_spline_async"))
     return control.LatencyCalibrationV2.create(
         execution_mode=mode_name,
         checkpoint_identity_fingerprint=checkpoint.fingerprint,
@@ -1196,17 +1259,53 @@ def _schema5_calibration(mode_name, *, empirical_observed_effective_ns=300_000_0
     )
 
 
-def test_schema5_preserves_three_async_modes_and_adds_two_random_latency_sync_modes():
+def test_schema5_adds_baseline_async_blocking_recovery_without_replacing_v1():
+    assert "baseline_async" in control.EXECUTION_MODES
+    assert "baseline_async_recovery" in control.EXECUTION_MODES
+    assert control.EXECUTION_MODES["baseline_async"].policy_protocol == "baseline_async_h16_v1"
+    assert (
+        control.EXECUTION_MODES["baseline_async_recovery"].policy_protocol == "baseline_async_h16_blocking_recovery_v2"
+    )
+
+
+def test_schema5_adds_bsp_speedup1_without_replacing_existing_modes():
     assert set(control.EXECUTION_MODES) == {
         "baseline_async",
+        "baseline_async_recovery",
         "baseline_rtc",
         "bsp_spline_async",
+        "bsp_spline_async_speedup1",
         "baseline_sync",
         "bsp_spline_sync",
     }
-    assert control.EXECUTION_MODES["baseline_async"].policy_protocol == "baseline_async_h16_v1"
+    assert (
+        control.EXECUTION_MODES["bsp_spline_async_speedup1"].policy_protocol
+        == "bsp_spline_async_phase_skip_speedup1_v1"
+    )
     assert control.EXECUTION_MODES["baseline_sync"].policy_protocol == "baseline_sync_n5_h16_full_v2"
     assert control.EXECUTION_MODES["bsp_spline_sync"].policy_protocol == "bsp_spline_sync_speedup2_phase0_v2"
+
+
+def test_bsp_speedup1_scheduler_requests_server_identity_and_uses_real_remaining_wall_clock():
+    mode = control.EXECUTION_MODES["bsp_spline_async_speedup1"]
+    scheduler = control.make_scheduler_v5(mode, _schema5_calibration(mode.name))
+
+    initial = scheduler.maybe_request(0, control_step=0, at_due=True, request_in_flight=False)
+    assert initial.request_overlay == {inference.BSP_EXECUTION_KEY: {"schema_version": 1, "speedup": 1}}
+    activation = scheduler.install_response(
+        initial,
+        _bsp_response(speedup=1),
+        now_ns=300_000_000,
+        control_step=0,
+    )
+    assert activation.activation_context["phase_offset_microindices"] == 0
+    assert activation.activation_context["remaining_curve_ns"] == 900_000_000
+
+    assert scheduler.maybe_request(0, control_step=9, at_due=True, request_in_flight=False) is None
+    prefetch = scheduler.maybe_request(0, control_step=10, at_due=True, request_in_flight=False)
+    assert prefetch.trigger == "bsp_prefetch"
+    assert prefetch.scheduler_context["remaining_plan_ns"] == 400_000_000
+    assert prefetch.request_overlay == initial.request_overlay
 
 
 def test_baseline_sync_executes_all_sixteen_actions_before_blocking_replan():
@@ -1369,3 +1468,29 @@ def test_baseline_async_install_skips_elapsed_prefix_and_underflow_does_not_adva
     decision = scheduler.take_action(19)
     assert not decision.underflow
     np.testing.assert_array_equal(decision.action, response["actions"][8])
+
+
+def test_baseline_async_recovery_blocks_at_capacity_miss_and_restarts_from_zero():
+    """Replacing the recovery with the old INFEASIBLE raise must fail this test."""
+    scheduler = control.make_scheduler_v5(
+        control.EXECUTION_MODES["baseline_async_recovery"],
+        _schema5_calibration("baseline_async_recovery"),
+    )
+    initial = scheduler.maybe_request(0, at_due=True, request_in_flight=False)
+    scheduler.install_response(initial, _rtc_response(), now_ns=0, control_step=0)
+    for step in range(9):
+        scheduler.take_action(step)
+
+    recovery = scheduler.maybe_request(9, at_due=True, request_in_flight=False, control_step=9)
+    assert recovery.dispatch == "blocking_replan"
+    assert recovery.trigger == "baseline_async_capacity_replan"
+    assert dict(recovery.scheduler_context) == {"action_cursor": 9, "forecast_delay_ticks": 8}
+    assert recovery.request_overlay == {inference.RTC_REQUEST_KEY: {"schema_version": inference.RTC_SCHEMA_VERSION}}
+
+    response = _rtc_response(offset=3_000.0)
+    activation = scheduler.install_response(recovery, response, now_ns=10, control_step=9)
+    assert activation.activation == "blocking_replace"
+    assert dict(activation.activation_context) == {"action_cursor": 0}
+    decision = scheduler.take_action(11, control_step=9)
+    assert not decision.underflow
+    np.testing.assert_array_equal(decision.action, response["actions"][0])
