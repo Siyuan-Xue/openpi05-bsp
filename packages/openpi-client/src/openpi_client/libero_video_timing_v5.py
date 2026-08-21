@@ -272,7 +272,7 @@ def _validate_scheduler_context(trigger: str, context: Mapping[str, Any]) -> Non
         )
         if (
             activation_step - request_step != prefix
-            or phase not in (prefix * 500_000, prefix * 1_000_000)
+            or phase not in (prefix * 500_000, prefix * 1_000_000, prefix * 2_000_000, prefix * 4_000_000)
             or phase <= t_max
         ):
             raise ValueError("BSP stale replan phase identity is inconsistent")

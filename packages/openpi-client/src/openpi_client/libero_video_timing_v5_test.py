@@ -148,6 +148,25 @@ def test_native_high_speedup_timing_uses_mode_phase_rate_and_dynamic_budget(exec
     assert normalized[2][0].activation_context["remaining_curve_ns"] == remaining_ns
 
 
+@pytest.mark.parametrize("phase_multiplier", (2_000_000, 4_000_000))
+def test_stale_replan_record_accepts_supported_high_speedup_phase_identity(phase_multiplier):
+    event = _request(
+        1,
+        150,
+        observation_control_step=3,
+        dispatch="blocking_replan",
+        trigger="bsp_stale_replan",
+        scheduler_context={
+            "discarded_request_control_step": 1,
+            "discarded_activation_control_step": 3,
+            "executed_prefix_steps": 2,
+            "phase_offset_microindices": 2 * phase_multiplier,
+            "curve_t_max_microindices": 1_000_000,
+        },
+    )
+    assert event.scheduler_context["phase_offset_microindices"] == 2 * phase_multiplier
+
+
 def test_bsp_phase_skip_timeline_accepts_stale_discard_then_same_step_blocking_replan():
     requests = (
         _initial_request(),
