@@ -97,6 +97,23 @@ _EXECUTION_PARAMETERS_BY_NAME = {
         "activation_policy": "phase_skip_executed_prefix",
         "prefetch_comparison": "remaining_lte_budget",
     },
+    "bsp_spline_async_native": {
+        "action_representation": "bsp",
+        "dispatch": "asynchronous_after_initial",
+        "parameter_shape": [16, 8],
+        "origin_hz": 10,
+        "degree": 3,
+        "speedup": 2,
+        "effective_curve_rate_hz": 20,
+        "control_freq_hz": 20,
+        "alignment": "disabled_delta_eff",
+        "activation_policy": "phase_skip_executed_prefix",
+        "prefetch_comparison": "remaining_lte_budget",
+        "latency_injection": "disabled_native",
+        "prefetch_budget_policy": "rolling_raw_p95_20_ceil_control_period",
+        "prefetch_window_size": 20,
+        "prefetch_budget_rounding_ns": 50_000_000,
+    },
     "baseline_sync": {
         "action_representation": "native",
         "dispatch": "synchronous",
@@ -140,6 +157,13 @@ _MODE_IDENTITIES = {
     "bsp_spline_async_speedup1": (
         "bsp",
         "bsp_spline_async_phase_skip_speedup1_v1",
+        8,
+        True,
+        "bsp",
+    ),
+    "bsp_spline_async_native": (
+        "bsp",
+        "bsp_spline_async_phase_skip_speedup2_v2",
         8,
         True,
         "bsp",
@@ -421,16 +445,29 @@ class ActivationDecisionV5:
         if set(activation_context) == {"action_cursor"}:
             if self.activation == "discarded_stale_phase" or activation_context["action_cursor"] > 15:
                 raise ValueError("native activation action_cursor must be in 0..15")
-        elif set(activation_context) == {
-            "request_control_step",
-            "activation_control_step",
-            "executed_prefix_steps",
-            "phase_offset_microindices",
-            "first_sample_microindices",
-            "remaining_curve_microindices",
-            "remaining_curve_ns",
-            "immediate_prefetch",
-        }:
+        elif set(activation_context) in (
+            {
+                "request_control_step",
+                "activation_control_step",
+                "executed_prefix_steps",
+                "phase_offset_microindices",
+                "first_sample_microindices",
+                "remaining_curve_microindices",
+                "remaining_curve_ns",
+                "immediate_prefetch",
+            },
+            {
+                "request_control_step",
+                "activation_control_step",
+                "executed_prefix_steps",
+                "phase_offset_microindices",
+                "first_sample_microindices",
+                "remaining_curve_microindices",
+                "remaining_curve_ns",
+                "immediate_prefetch",
+                "prefetch_budget_ns",
+            },
+        ):
             matching_rates = tuple(
                 rate
                 for rate in (10, 20)
@@ -452,7 +489,8 @@ class ActivationDecisionV5:
                 or activation_context["immediate_prefetch"] not in (0, 1)
                 or (
                     activation_context["immediate_prefetch"] == 1
-                    and activation_context["remaining_curve_ns"] > SCHEDULING_LATENCY_BUDGET_NS
+                    and activation_context["remaining_curve_ns"]
+                    > activation_context.get("prefetch_budget_ns", SCHEDULING_LATENCY_BUDGET_NS)
                 )
             ):
                 raise ValueError("BSP phase-skip activation context is inconsistent")
@@ -767,6 +805,13 @@ def nearest_rank_p95_ns(measurements_ns: Sequence[int]) -> Tuple[int, int]:
     measurements = [_require_nonbool_int(value, label="latency measurement", minimum=0) for value in measurements_ns]
     rank = 19
     return rank, sorted(measurements)[rank - 1]
+
+
+def native_prefetch_budget_ns(measurements_ns: Sequence[int]) -> int:
+    """Round the latest twenty native raw latencies up to one control period."""
+    _, p95_ns = nearest_rank_p95_ns(measurements_ns)
+    ticks = max(1, (p95_ns + CONTROL_PERIOD_NS - 1) // CONTROL_PERIOD_NS)
+    return ticks * CONTROL_PERIOD_NS
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1213,6 +1258,9 @@ class LatencyCalibrationV2:
         elif execution_mode in ("bsp_spline_async", "bsp_spline_async_speedup1"):
             delay_ticks = None
             prefetch_budget_ns = SCHEDULING_LATENCY_BUDGET_NS
+        elif execution_mode == "bsp_spline_async_native":
+            delay_ticks = None
+            prefetch_budget_ns = native_prefetch_budget_ns(raw)
         else:
             raise ValueError("latency calibration is defined only for schema-v5 modes")
         values = {
@@ -1243,12 +1291,17 @@ class LatencyCalibrationV2:
             "empirical_raw_p95_ns": raw_p95,
             "empirical_sampled_target_p95_ns": sampled_p95,
             "empirical_observed_effective_p95_ns": observed_effective_p95,
-            "theoretical_p95_latency_ns": THEORETICAL_P95_LATENCY_NS,
+            "theoretical_p95_latency_ns": (
+                0 if execution_mode == "bsp_spline_async_native" else THEORETICAL_P95_LATENCY_NS
+            ),
             "control_period_ns": CONTROL_PERIOD_NS,
-            "scheduling_latency_budget_ns": SCHEDULING_LATENCY_BUDGET_NS,
+            "scheduling_latency_budget_ns": (
+                prefetch_budget_ns if execution_mode == "bsp_spline_async_native" else SCHEDULING_LATENCY_BUDGET_NS
+            ),
             "derived_delay_ticks": delay_ticks,
             "derived_prefetch_budget_ns": prefetch_budget_ns,
-            "empirical_p95_exceeds_budget": observed_effective_p95 > SCHEDULING_LATENCY_BUDGET_NS,
+            "empirical_p95_exceeds_budget": observed_effective_p95
+            > (prefetch_budget_ns if execution_mode == "bsp_spline_async_native" else SCHEDULING_LATENCY_BUDGET_NS),
         }
         return cls(
             fingerprint=canonical_fingerprint(_calibration_v2_payload(values)),
@@ -1336,14 +1389,20 @@ class LatencyCalibrationV2:
         rank, raw_p95 = nearest_rank_p95_ns(self.measurement_raw_inference_latency_ns)
         _, sampled_p95 = nearest_rank_p95_ns(self.measurement_sampled_target_latency_ns)
         _, observed_effective_p95 = nearest_rank_p95_ns(self.measurement_observed_effective_latency_ns)
+        native_budget_ns = native_prefetch_budget_ns(self.measurement_raw_inference_latency_ns)
+        expected_budget_ns = (
+            native_budget_ns if self.execution_mode == "bsp_spline_async_native" else SCHEDULING_LATENCY_BUDGET_NS
+        )
         expected_scalars = {
             "p95_rank": rank,
             "empirical_raw_p95_ns": raw_p95,
             "empirical_sampled_target_p95_ns": sampled_p95,
             "empirical_observed_effective_p95_ns": observed_effective_p95,
-            "theoretical_p95_latency_ns": THEORETICAL_P95_LATENCY_NS,
+            "theoretical_p95_latency_ns": (
+                0 if self.execution_mode == "bsp_spline_async_native" else THEORETICAL_P95_LATENCY_NS
+            ),
             "control_period_ns": CONTROL_PERIOD_NS,
-            "scheduling_latency_budget_ns": SCHEDULING_LATENCY_BUDGET_NS,
+            "scheduling_latency_budget_ns": expected_budget_ns,
         }
         if self.p95_method != "nearest_rank":
             raise ValueError("calibration must use nearest-rank p95")
@@ -1353,10 +1412,17 @@ class LatencyCalibrationV2:
         if self.execution_mode in ("baseline_async", "baseline_async_recovery", "baseline_rtc"):
             if self.derived_delay_ticks != SCHEDULING_DELAY_TICKS or self.derived_prefetch_budget_ns is not None:
                 raise ValueError("baseline calibration must use the fixed eight-tick budget")
+        elif self.execution_mode == "bsp_spline_async_native":
+            if self.derived_delay_ticks is not None or self.derived_prefetch_budget_ns != native_budget_ns:
+                raise ValueError("native BSP calibration must derive its initial raw-latency budget")
+            for field in _CALIBRATION_V2_SERIES_FIELDS:
+                if "sampled_target" in field or "synthetic_delay" in field or "overshoot" in field:
+                    if any(getattr(self, field)):
+                        raise ValueError("native BSP calibration must not inject synthetic latency")
         elif self.derived_delay_ticks is not None or self.derived_prefetch_budget_ns != SCHEDULING_LATENCY_BUDGET_NS:
             raise ValueError("BSP calibration must use the fixed prefetch budget")
         if type(self.empirical_p95_exceeds_budget) is not bool or self.empirical_p95_exceeds_budget != (
-            observed_effective_p95 > SCHEDULING_LATENCY_BUDGET_NS
+            observed_effective_p95 > expected_budget_ns
         ):
             raise ValueError("empirical_p95_exceeds_budget does not match the measurements")
         _require_sha256(self.fingerprint, label="calibration fingerprint")
@@ -1864,6 +1930,9 @@ class ModeSchedulerV5:
     def take_action(self, now_ns: int, *, control_step: int = 0) -> ActionDecisionV5:
         raise NotImplementedError
 
+    def observe_raw_inference_latency(self, raw_inference_latency_ns: int) -> None:
+        raise ValueError("scheduler does not use a rolling raw-latency budget")
+
     def _reuse_pending(
         self,
         *,
@@ -2151,12 +2220,32 @@ class _RtcScheduler(ModeSchedulerV5):
 
 
 class _BspScheduler(ModeSchedulerV5):
-    def __init__(self, *, asynchronous: bool, budget_ns: Optional[int], expected_speedup: int = 2) -> None:
+    def __init__(
+        self,
+        *,
+        asynchronous: bool,
+        budget_ns: Optional[int],
+        expected_speedup: int = 2,
+        rolling_raw_latencies_ns: Optional[Sequence[int]] = None,
+    ) -> None:
         self._asynchronous = asynchronous
         self._budget_ns = budget_ns
         if isinstance(expected_speedup, bool) or expected_speedup not in (1, 2):
             raise ValueError("expected_speedup must be integer 1 or 2")
         self._expected_speedup = expected_speedup
+        self._initial_rolling_raw_latencies_ns = (
+            None
+            if rolling_raw_latencies_ns is None
+            else _latency_series(
+                rolling_raw_latencies_ns,
+                label="rolling_raw_latencies_ns",
+                count=CALIBRATION_MEASUREMENT_COUNT,
+            )
+        )
+        if self._initial_rolling_raw_latencies_ns is not None:
+            expected_budget = native_prefetch_budget_ns(self._initial_rolling_raw_latencies_ns)
+            if budget_ns != expected_budget:
+                raise ValueError("rolling raw-latency history does not match the initial prefetch budget")
         self._request_overlay = (
             {
                 inference.BSP_EXECUTION_KEY: {
@@ -2175,6 +2264,21 @@ class _BspScheduler(ModeSchedulerV5):
         self._pending_intent = None
         self._pending_request_control_step = None
         self._stale_replan_context = None
+        self._rolling_raw_latencies_ns = (
+            None if self._initial_rolling_raw_latencies_ns is None else list(self._initial_rolling_raw_latencies_ns)
+        )
+
+    def observe_raw_inference_latency(self, raw_inference_latency_ns: int) -> None:
+        if self._rolling_raw_latencies_ns is None:
+            return super().observe_raw_inference_latency(raw_inference_latency_ns)
+        raw_ns = _require_nonbool_int(
+            raw_inference_latency_ns,
+            label="raw_inference_latency_ns",
+            minimum=0,
+        )
+        self._rolling_raw_latencies_ns.append(raw_ns)
+        del self._rolling_raw_latencies_ns[:-CALIBRATION_MEASUREMENT_COUNT]
+        self._budget_ns = native_prefetch_budget_ns(self._rolling_raw_latencies_ns)
 
     def _set_bsp_pending(
         self,
@@ -2327,18 +2431,23 @@ class _BspScheduler(ModeSchedulerV5):
         immediate_prefetch = int(
             self._asynchronous and self._budget_ns is not None and remaining_curve_ns <= self._budget_ns
         )
+        activation_context = {
+            "request_control_step": request_step,
+            "activation_control_step": step,
+            "executed_prefix_steps": installed.executed_prefix_steps,
+            "phase_offset_microindices": phase_microindices,
+            "first_sample_microindices": first_microindices,
+            "remaining_curve_microindices": remaining_microindices,
+            "remaining_curve_ns": remaining_curve_ns,
+            "immediate_prefetch": immediate_prefetch,
+        }
+        if self._rolling_raw_latencies_ns is not None:
+            if self._budget_ns is None:
+                raise AssertionError("native BSP scheduler lost its rolling budget")
+            activation_context["prefetch_budget_ns"] = self._budget_ns
         return ActivationDecisionV5(
             activation=activation,
-            activation_context={
-                "request_control_step": request_step,
-                "activation_control_step": step,
-                "executed_prefix_steps": installed.executed_prefix_steps,
-                "phase_offset_microindices": phase_microindices,
-                "first_sample_microindices": first_microindices,
-                "remaining_curve_microindices": remaining_microindices,
-                "remaining_curve_ns": remaining_curve_ns,
-                "immediate_prefetch": immediate_prefetch,
-            },
+            activation_context=activation_context,
         )
 
     def take_action(self, now_ns: int, *, control_step: int = 0) -> ActionDecisionV5:
@@ -2380,6 +2489,9 @@ def make_scheduler_v5(
         asynchronous=True,
         budget_ns=calibration.derived_prefetch_budget_ns,
         expected_speedup=1 if mode.name == "bsp_spline_async_speedup1" else 2,
+        rolling_raw_latencies_ns=(
+            calibration.measurement_raw_inference_latency_ns if mode.name == "bsp_spline_async_native" else None
+        ),
     )
 
 

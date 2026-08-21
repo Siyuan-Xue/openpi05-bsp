@@ -111,6 +111,7 @@ class AsyncInferenceWorker:
         wait_until_ns: Optional[Callable[[int], None]] = None,
         synthetic_latency_target_ms: int = 0,
         latency_sampler: Optional[latency_sampling.NormalLatencySamplerV1] = None,
+        inject_sampled_latency: bool = True,
     ) -> None:
         if shutdown_timeout_s <= 0:
             raise ValueError("shutdown_timeout_s must be positive")
@@ -126,6 +127,8 @@ class AsyncInferenceWorker:
             raise ValueError("latency_sampler and synthetic_latency_target_ms are mutually exclusive")
         if latency_sampler is not None and not isinstance(latency_sampler, latency_sampling.NormalLatencySamplerV1):
             raise ValueError("latency_sampler must be a NormalLatencySamplerV1")
+        if type(inject_sampled_latency) is not bool:
+            raise ValueError("inject_sampled_latency must be a boolean")
 
         self._policy_factory = policy_factory
         self._shutdown_timeout_s = shutdown_timeout_s
@@ -134,6 +137,7 @@ class AsyncInferenceWorker:
         self._wait_until_ns = wait_until_ns or self._default_wait_until_ns
         self._synthetic_latency_target_ns = synthetic_latency_target_ms * 1_000_000
         self._latency_sampler = latency_sampler
+        self._inject_sampled_latency = inject_sampled_latency
         self._packer = msgpack_numpy.Packer()
 
         self._condition = threading.Condition()
@@ -183,7 +187,9 @@ class AsyncInferenceWorker:
             if self._latency_sampler is not None:
                 if latency_sample_key is None:
                     raise ValueError("latency_sample_key is required when latency_sampler is configured")
-                sampled_target_latency_ns = self._latency_sampler.sample_target_ns(latency_sample_key)
+                sampled_target_latency_ns = (
+                    self._latency_sampler.sample_target_ns(latency_sample_key) if self._inject_sampled_latency else 0
+                )
             else:
                 if latency_sample_key is not None:
                     raise ValueError("latency_sample_key requires a configured latency_sampler")

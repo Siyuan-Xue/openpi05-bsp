@@ -66,9 +66,14 @@ def _calibration(
 ):
     identity = _checkpoint_identity(bsp=mode_name.startswith("bsp_spline_async"))
     warmup_raw = [100_000_000] * 5
-    warmup_sampled = [300_000_000] * 5
+    native = mode_name == "bsp_spline_async_native"
+    warmup_sampled = [0 if native else 300_000_000] * 5
     measurement_raw = [100_000_000] * 20
-    measurement_sampled = [300_000_000] * 20
+    measurement_sampled = [0 if native else 300_000_000] * 20
+    warmup_delay = [0 if native else 200_000_000] * 5
+    measurement_delay = [0 if native else 200_000_000] * 20
+    warmup_effective = warmup_raw if native else warmup_sampled
+    measurement_effective = measurement_raw if native else measurement_sampled
     return control.LatencyCalibrationV2.create(
         execution_mode=mode_name,
         checkpoint_identity_fingerprint=identity.fingerprint,
@@ -86,15 +91,15 @@ def _calibration(
         measurement_request_fingerprints=["7" * 64] * 20,
         warmup_raw_inference_latency_ns=warmup_raw,
         warmup_sampled_target_latency_ns=warmup_sampled,
-        warmup_requested_synthetic_delay_ns=[200_000_000] * 5,
-        warmup_observed_synthetic_delay_ns=[200_000_000] * 5,
-        warmup_observed_effective_latency_ns=warmup_sampled,
+        warmup_requested_synthetic_delay_ns=warmup_delay,
+        warmup_observed_synthetic_delay_ns=warmup_delay,
+        warmup_observed_effective_latency_ns=warmup_effective,
         warmup_latency_overshoot_ns=[0] * 5,
         measurement_raw_inference_latency_ns=measurement_raw,
         measurement_sampled_target_latency_ns=measurement_sampled,
-        measurement_requested_synthetic_delay_ns=[200_000_000] * 20,
-        measurement_observed_synthetic_delay_ns=[200_000_000] * 20,
-        measurement_observed_effective_latency_ns=measurement_sampled,
+        measurement_requested_synthetic_delay_ns=measurement_delay,
+        measurement_observed_synthetic_delay_ns=measurement_delay,
+        measurement_observed_effective_latency_ns=measurement_effective,
         measurement_latency_overshoot_ns=[0] * 20,
     )
 
@@ -104,6 +109,12 @@ def _manifest(mode_name="baseline_async"):
     bsp = mode.policy_variant == "bsp"
     checkpoint_identity = _checkpoint_identity(bsp=bsp)
     calibration = _calibration(mode_name) if mode.asynchronous else None
+    native = mode_name == "bsp_spline_async_native"
+    scheduling_budget = (
+        calibration.derived_prefetch_budget_ns
+        if native and calibration is not None
+        else control.SCHEDULING_LATENCY_BUDGET_NS
+    )
     return evaluation.EvaluationManifestV5(
         schema_version=5,
         dataset_fps=10,
@@ -112,17 +123,25 @@ def _manifest(mode_name="baseline_async"):
         controller_period_ns=50_000_000,
         video_fps=40,
         video_show_inference_waits=True,
-        latency_distribution={
-            "distribution": "normal",
-            "mean_ns": 300_000_000,
-            "stddev_ns": 60_000_000,
-            "seed": 42,
-            "sampler_version": latency_sampling.SAMPLER_VERSION,
-            "negative_policy": latency_sampling.NEGATIVE_POLICY,
-        },
-        theoretical_p95_latency_ns=control.THEORETICAL_P95_LATENCY_NS,
-        scheduling_latency_budget_ns=control.SCHEDULING_LATENCY_BUDGET_NS,
-        scheduling_delay_ticks=control.SCHEDULING_DELAY_TICKS,
+        latency_distribution=(
+            {
+                "distribution": "native",
+                "synthetic_latency_target_ns": 0,
+                "sampler_version": "native_zero_target_v1",
+            }
+            if native
+            else {
+                "distribution": "normal",
+                "mean_ns": 300_000_000,
+                "stddev_ns": 60_000_000,
+                "seed": 42,
+                "sampler_version": latency_sampling.SAMPLER_VERSION,
+                "negative_policy": latency_sampling.NEGATIVE_POLICY,
+            }
+        ),
+        theoretical_p95_latency_ns=0 if native else control.THEORETICAL_P95_LATENCY_NS,
+        scheduling_latency_budget_ns=scheduling_budget,
+        scheduling_delay_ticks=scheduling_budget // control.CONTROL_PERIOD_NS,
         execution_mode=mode_name,
         execution_parameters=mode.to_parameters_dict(),
         latency_calibration=calibration,
@@ -844,3 +863,28 @@ def test_video_selector_claims_only_the_first_success_and_counted_failure(tmp_pa
     assert selector.claim(success) is None
     assert selector.claim(failure).name.startswith("failure-")
     assert selector.claim(failure) is None
+
+
+def test_success_only_video_selector_retries_after_failed_encoding(tmp_path):
+    """Keeping a failed claim reserved must fail this success-video retry test."""
+    success = evaluation.EpisodeRecordV5.from_attempt(
+        _identity(0),
+        42,
+        1,
+        execution_mode="baseline_async",
+        result=_attempt(_identity(0)),
+    )
+    failure = evaluation.EpisodeRecordV5.from_attempt(
+        _identity(1),
+        42,
+        1,
+        execution_mode="baseline_async",
+        result=_attempt(_identity(1), success=False),
+    )
+    selector = evaluation.VideoSelectorV5(tmp_path, success_only=True)
+
+    assert selector.claim(failure) is None
+    first = selector.claim(success)
+    assert first is not None and first.name.startswith("success-")
+    selector.release(success)
+    assert selector.claim(success) == first

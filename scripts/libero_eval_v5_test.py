@@ -116,7 +116,7 @@ def _calibration(mode_name, *, latency_ns=0):
         init_state_fingerprint="a" * 64,
         request_fingerprint=control.canonical_fingerprint(canonical_request),
     )
-    sampled_ns = 300 * NS_PER_MS
+    sampled_ns = 0 if mode.name == "bsp_spline_async_native" else 300 * NS_PER_MS
     effective_ns = max(latency_ns, sampled_ns)
     synthetic_ns = effective_ns - latency_ns
     return control.LatencyCalibrationV2.create(
@@ -874,6 +874,38 @@ def test_real_bsp_async_speedup1_advances_half_index_and_prefetches_at_four_rema
     }
 
 
+def test_native_bsp_async_records_the_online_budget_that_triggered_each_activation():
+    clock = ManualClock()
+    payload = _metadata_payload(policy_variant="bsp")
+    worker = FakeWorker(
+        clock,
+        [
+            _ScriptedCall(250 * NS_PER_MS, _bsp_response(duration_ticks=9), metadata_payload=payload),
+            _ScriptedCall(250 * NS_PER_MS, _bsp_response(3.0, duration_ticks=9), metadata_payload=payload),
+        ],
+        connect_payload=payload,
+        formal_sampling=False,
+    )
+    environment = FakeEnvironment(done_after_real_steps=11)
+    mode = control.EXECUTION_MODES["bsp_spline_async_native"]
+    calibration = _calibration(mode.name, latency_ns=80 * NS_PER_MS)
+
+    result = _run(
+        clock,
+        worker,
+        environment,
+        args=_args(execution_mode=mode.name),
+        scheduler=control.make_scheduler_v5(mode, calibration),
+        max_steps=30,
+    )
+
+    assert result.success, result.error
+    assert result.inference_requests[1].scheduler_context["budget_ns"] == 100 * NS_PER_MS
+    assert result.plan_activations[1].activation_context["prefetch_budget_ns"] == 250 * NS_PER_MS
+    assert all(request.sampled_target_latency_ns == 0 for request in result.inference_requests)
+    assert all(latency.observed_synthetic_delay_ns == 0 for latency in result.inference_latencies)
+
+
 def test_real_bsp_async_discards_stale_short_curve_and_blocks_on_latest_observation():
     clock = ManualClock()
     payload = _metadata_payload(policy_variant="bsp")
@@ -1292,6 +1324,68 @@ def test_selected_zero_frame_video_persists_episode_before_padding_and_audit(mon
     assert audit.planned.video_frame_count == 0
 
 
+def test_success_video_stop_requires_successful_video_artifact():
+    clock = ManualClock()
+    worker = FakeWorker(
+        clock,
+        [_ScriptedCall(0, _rtc_response())],
+        formal_sampling=True,
+    )
+    attempt = _run(clock, worker, FakeEnvironment(done_after_real_steps=1))
+    success = evaluation.EpisodeRecordV5.from_attempt(
+        _identity(),
+        42,
+        1,
+        execution_mode="baseline_async",
+        result=attempt,
+    )
+    artifact_error = evaluation.ArtifactErrorV5(
+        episode_id=success.episode_id,
+        artifact_type="video",
+        path="failed.mp4",
+        error="ffmpeg failed",
+    )
+
+    assert main_v5._has_success_video_v5(success, None)
+    assert not main_v5._has_success_video_v5(success, artifact_error)
+
+
+def test_native_bsp_attempt_uses_zero_synthetic_latency_and_dynamic_activation_budget():
+    clock = ManualClock()
+    worker = FakeWorker(
+        clock,
+        [
+            _ScriptedCall(
+                80 * NS_PER_MS,
+                _bsp_response(speedup=2),
+                metadata_payload=_metadata_payload(policy_variant="bsp"),
+            )
+        ],
+        connect_payload=_metadata_payload(policy_variant="bsp"),
+        formal_sampling=False,
+    )
+    mode = control.EXECUTION_MODES["bsp_spline_async_native"]
+    attempt = _run(
+        clock,
+        worker,
+        FakeEnvironment(done_after_real_steps=1),
+        args=_args(execution_mode=mode.name),
+        scheduler=control.make_scheduler_v5(mode, _calibration(mode.name, latency_ns=80 * NS_PER_MS)),
+    )
+    record = evaluation.EpisodeRecordV5.from_attempt(
+        _identity(),
+        42,
+        1,
+        execution_mode=mode.name,
+        result=attempt,
+    )
+
+    assert record.status == "success"
+    assert record.inference_requests[0].sampled_target_latency_ns == 0
+    assert record.inference_latencies[0].observed_synthetic_delay_ns == 0
+    assert record.plan_activations[0].activation_context["prefetch_budget_ns"] == 100 * NS_PER_MS
+
+
 @pytest.mark.parametrize(
     "failure",
     [pytest.param(None), pytest.param(KeyboardInterrupt("stop"))],
@@ -1346,6 +1440,7 @@ def test_eval_entrypoint_closes_single_worker_on_normal_and_exception_exit(monke
         pytest.param("baseline_async"),
         pytest.param("baseline_rtc"),
         pytest.param("bsp_spline_async"),
+        pytest.param("bsp_spline_async_native"),
     ],
 )
 def test_all_execution_modes_share_the_worker_latency_injection_point(monkeypatch, execution_mode):
@@ -1378,4 +1473,5 @@ def test_all_execution_modes_share_the_worker_latency_injection_point(monkeypatc
     assert isinstance(sampler, latency_sampling.NormalLatencySamplerV1)
     assert sampler.mean_ns == 300_000_000
     assert sampler.stddev_ns == 60_000_000
+    assert captured[0]["inject_sampled_latency"] is (execution_mode != "bsp_spline_async_native")
     assert captured[0]["wait_until_ns"].__self__.__class__ is main_v5._SystemClock

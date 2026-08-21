@@ -64,6 +64,8 @@ class ArgsV5:
     control_freq: int = 20
     video_fps: int = 40
     video_show_inference_waits: bool = False
+    success_video_only: bool = False
+    stop_after_first_success_video_per_task: bool = False
 
     output_dir: str = "data/libero/eval-v5"
 
@@ -360,7 +362,7 @@ def _validate_args_v5(
     try:
         mode = _control.EXECUTION_MODES[args.execution_mode]
     except (KeyError, TypeError) as error:
-        raise ValueError("execution_mode must be one of the seven schema-v5 runtime modes") from error
+        raise ValueError("execution_mode must be one of the schema-v5 runtime modes") from error
     suite_aliases = {
         "libero_spatial": "libero_spatial",
         "spatial": "libero_spatial",
@@ -426,6 +428,12 @@ def _validate_args_v5(
         raise ValueError("schema-v5 execution requires exactly 20 Hz control and 40 fps video")
     if type(args.video_show_inference_waits) is not bool:
         raise ValueError("video_show_inference_waits must be boolean")
+    if type(args.success_video_only) is not bool:
+        raise ValueError("success_video_only must be boolean")
+    if type(args.stop_after_first_success_video_per_task) is not bool:
+        raise ValueError("stop_after_first_success_video_per_task must be boolean")
+    if args.stop_after_first_success_video_per_task and not args.success_video_only:
+        raise ValueError("stop_after_first_success_video_per_task requires success_video_only")
     if args.dataset_revision != "v2.0":
         raise ValueError("dataset_revision must be v2.0")
     return suites, task_ids, mode
@@ -851,6 +859,8 @@ def _complete_request_v5(
     try:
         if not isinstance(response, Mapping):
             raise ValueError("policy response must be a mapping")
+        if mode.name == "bsp_spline_async_native":
+            scheduler.observe_raw_inference_latency(raw_inference_latency_ns)
         activation = scheduler.install_response(
             pending.trace.intent,
             response,
@@ -1252,7 +1262,7 @@ def _run_attempt_v5(
                 pending_slot.clear()
                 if result is not None:
                     return result
-                if mode.name in ("bsp_spline_async", "bsp_spline_async_speedup1"):
+                if mode.name in ("bsp_spline_async", "bsp_spline_async_speedup1", "bsp_spline_async_native"):
                     result = _attempt_request_v5(
                         now_ns=_require_nonnegative_clock(clock),
                         at_due=True,
@@ -1574,7 +1584,18 @@ def _persist_episode_artifacts_v5(
             error=f"{type(error).__name__}: {error}",
         )
         writer.append_artifact_error(artifact_error)
+        video_selector.release(persisted)
     return persisted, artifact_error
+
+
+def _has_success_video_v5(
+    record: _eval.EpisodeRecordV5,
+    artifact_error: Optional[_eval.ArtifactErrorV5],
+) -> bool:
+    if not isinstance(record, _eval.EpisodeRecordV5):
+        raise ValueError("record must be EpisodeRecordV5")
+    record._validate()
+    return record.success is True and artifact_error is None
 
 
 def _checkpoint_identity_v5(args: ArgsV5, code_sha: str) -> _control.CheckpointIdentityV1:
@@ -1600,6 +1621,30 @@ def _make_manifest_v5(
     server_metadata_fingerprint: str,
     calibration: Optional[_control.LatencyCalibrationV2],
 ) -> _eval.EvaluationManifestV5:
+    native_latency = mode.name == "bsp_spline_async_native"
+    if native_latency:
+        if calibration is None or calibration.derived_prefetch_budget_ns is None:
+            raise ValueError("native BSP manifest requires calibrated initial prefetch budget")
+        latency_distribution = {
+            "distribution": "native",
+            "synthetic_latency_target_ns": 0,
+            "sampler_version": "native_zero_target_v1",
+        }
+        theoretical_p95_latency_ns = 0
+        scheduling_latency_budget_ns = calibration.derived_prefetch_budget_ns
+        scheduling_delay_ticks = scheduling_latency_budget_ns // _control.CONTROL_PERIOD_NS
+    else:
+        latency_distribution = {
+            "distribution": "normal",
+            "mean_ns": _latency_sampling.DEFAULT_MEAN_NS,
+            "stddev_ns": _latency_sampling.DEFAULT_STDDEV_NS,
+            "seed": _latency_sampling.DEFAULT_SEED,
+            "sampler_version": _latency_sampling.SAMPLER_VERSION,
+            "negative_policy": _latency_sampling.NEGATIVE_POLICY,
+        }
+        theoretical_p95_latency_ns = _control.THEORETICAL_P95_LATENCY_NS
+        scheduling_latency_budget_ns = _control.SCHEDULING_LATENCY_BUDGET_NS
+        scheduling_delay_ticks = _control.SCHEDULING_DELAY_TICKS
     return _eval.EvaluationManifestV5(
         schema_version=5,
         dataset_fps=10,
@@ -1608,17 +1653,10 @@ def _make_manifest_v5(
         controller_period_ns=_control.CONTROL_PERIOD_NS,
         video_fps=40,
         video_show_inference_waits=args.video_show_inference_waits,
-        latency_distribution={
-            "distribution": "normal",
-            "mean_ns": _latency_sampling.DEFAULT_MEAN_NS,
-            "stddev_ns": _latency_sampling.DEFAULT_STDDEV_NS,
-            "seed": _latency_sampling.DEFAULT_SEED,
-            "sampler_version": _latency_sampling.SAMPLER_VERSION,
-            "negative_policy": _latency_sampling.NEGATIVE_POLICY,
-        },
-        theoretical_p95_latency_ns=_control.THEORETICAL_P95_LATENCY_NS,
-        scheduling_latency_budget_ns=_control.SCHEDULING_LATENCY_BUDGET_NS,
-        scheduling_delay_ticks=_control.SCHEDULING_DELAY_TICKS,
+        latency_distribution=latency_distribution,
+        theoretical_p95_latency_ns=theoretical_p95_latency_ns,
+        scheduling_latency_budget_ns=scheduling_latency_budget_ns,
+        scheduling_delay_ticks=scheduling_delay_ticks,
         execution_mode=mode.name,
         execution_parameters=mode.to_parameters_dict(),
         latency_calibration=calibration,
@@ -1753,9 +1791,10 @@ def _evaluate_run_v5(
     # validation have all succeeded.
     writer = _eval.ArtifactWriterV5(output_dir)
     writer.write_manifest(manifest)
-    video_selector = _eval.VideoSelectorV5(output_dir / "videos")
+    video_selector = _eval.VideoSelectorV5(output_dir / "videos", success_only=args.success_video_only)
     records = []  # type: List[_eval.EpisodeRecordV5]
     artifact_errors = []  # type: List[_eval.ArtifactErrorV5]
+    successful_video_tasks = set()  # type: set
     np.random.seed(args.eval_seed)
 
     for suite_name in suites:
@@ -1842,6 +1881,12 @@ def _evaluate_run_v5(
                         record.attempts,
                         record.steps,
                     )
+                    if args.stop_after_first_success_video_per_task and _has_success_video_v5(
+                        record,
+                        artifact_error,
+                    ):
+                        successful_video_tasks.add((suite_name, task_id))
+                        break
             except BaseException as error:
                 environment_primary = error
                 raise
@@ -1854,6 +1899,11 @@ def _evaluate_run_v5(
                     raise
 
     summary = writer.write_summary(records, artifact_errors=artifact_errors)
+    if args.stop_after_first_success_video_per_task:
+        expected_success_video_tasks = {(suite_name, task_id) for suite_name in suites for task_id in task_ids}
+        if successful_video_tasks != expected_success_video_tasks:
+            raise RuntimeError("Not every selected task produced a successful readable MP4")
+        return summary
     if not summary["acceptance_complete"]:
         raise RuntimeError(
             "Evaluation acceptance is incomplete: {} infrastructure episodes, {} artifact errors".format(
@@ -1874,6 +1924,7 @@ def eval_libero_v5(args: ArgsV5) -> Dict[str, Any]:
         monotonic_ns=clock.monotonic_ns,
         wait_until_ns=clock.wait_until_ns,
         latency_sampler=_latency_sampling.NormalLatencySamplerV1(),
+        inject_sampled_latency=mode.name != "bsp_spline_async_native",
     )
     primary_error = None  # type: Optional[BaseException]
     try:

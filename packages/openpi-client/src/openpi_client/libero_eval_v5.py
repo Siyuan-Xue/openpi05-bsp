@@ -416,39 +416,58 @@ class EvaluationManifestV5:
         )
         if type(self.video_show_inference_waits) is not bool:
             raise ValueError("video_show_inference_waits must be boolean")
-        expected_latency_distribution = {
-            "distribution": "normal",
-            "mean_ns": latency_sampling.DEFAULT_MEAN_NS,
-            "stddev_ns": latency_sampling.DEFAULT_STDDEV_NS,
-            "seed": latency_sampling.DEFAULT_SEED,
-            "sampler_version": latency_sampling.SAMPLER_VERSION,
-            "negative_policy": latency_sampling.NEGATIVE_POLICY,
-        }
+        try:
+            mode = _control.EXECUTION_MODES[self.execution_mode]
+        except (KeyError, TypeError) as error:
+            raise ValueError("unsupported schema-v5 execution_mode") from error
+        if self.execution_mode == "bsp_spline_async_native":
+            calibration_for_budget = self.latency_calibration
+            if (
+                not isinstance(calibration_for_budget, _control.LatencyCalibrationV2)
+                or calibration_for_budget.derived_prefetch_budget_ns is None
+            ):
+                raise ValueError("native BSP manifest requires a calibrated initial budget")
+            expected_latency_distribution = {
+                "distribution": "native",
+                "synthetic_latency_target_ns": 0,
+                "sampler_version": "native_zero_target_v1",
+            }
+            expected_theoretical_p95 = 0
+            expected_scheduling_budget = calibration_for_budget.derived_prefetch_budget_ns
+            expected_delay_ticks = expected_scheduling_budget // CONTROLLER_PERIOD_NS
+        else:
+            expected_latency_distribution = {
+                "distribution": "normal",
+                "mean_ns": latency_sampling.DEFAULT_MEAN_NS,
+                "stddev_ns": latency_sampling.DEFAULT_STDDEV_NS,
+                "seed": latency_sampling.DEFAULT_SEED,
+                "sampler_version": latency_sampling.SAMPLER_VERSION,
+                "negative_policy": latency_sampling.NEGATIVE_POLICY,
+            }
+            expected_theoretical_p95 = _control.THEORETICAL_P95_LATENCY_NS
+            expected_scheduling_budget = _control.SCHEDULING_LATENCY_BUDGET_NS
+            expected_delay_ticks = _control.SCHEDULING_DELAY_TICKS
         if not _json_values_match(self.latency_distribution, expected_latency_distribution):
             raise ValueError("latency_distribution does not match the frozen schema-v5 sampler")
         for name, value, expected in (
             (
                 "theoretical_p95_latency_ns",
                 self.theoretical_p95_latency_ns,
-                _control.THEORETICAL_P95_LATENCY_NS,
+                expected_theoretical_p95,
             ),
             (
                 "scheduling_latency_budget_ns",
                 self.scheduling_latency_budget_ns,
-                _control.SCHEDULING_LATENCY_BUDGET_NS,
+                expected_scheduling_budget,
             ),
             (
                 "scheduling_delay_ticks",
                 self.scheduling_delay_ticks,
-                _control.SCHEDULING_DELAY_TICKS,
+                expected_delay_ticks,
             ),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value != expected:
                 raise ValueError("{} must be exactly {}".format(name, expected))
-        try:
-            mode = _control.EXECUTION_MODES[self.execution_mode]
-        except (KeyError, TypeError) as error:
-            raise ValueError("unsupported schema-v5 execution_mode") from error
         expected_parameters = mode.to_parameters_dict()
         if not _json_values_match(self.execution_parameters, expected_parameters):
             raise ValueError("execution_parameters do not match the frozen mode table")
@@ -841,7 +860,7 @@ class EpisodeRecordV5:
         _require_nonnegative_integer(self.eval_seed, name="eval_seed")
         if self.execution_mode not in _control.EXECUTION_MODES:
             raise ValueError("unsupported schema-v5 execution_mode")
-        if self.execution_mode in ("bsp_spline_async", "bsp_spline_async_speedup1"):
+        if self.execution_mode in ("bsp_spline_async", "bsp_spline_async_speedup1", "bsp_spline_async_native"):
             if self.expected_bsp_prefetch_budget_ns is not None:
                 _require_nonnegative_integer(
                     self.expected_bsp_prefetch_budget_ns,
@@ -929,7 +948,7 @@ class EpisodeRecordV5:
                 "identity": identity,
                 "verify_sampled_targets": True,
             }
-            if self.execution_mode in ("bsp_spline_async", "bsp_spline_async_speedup1"):
+            if self.execution_mode in ("bsp_spline_async", "bsp_spline_async_speedup1", "bsp_spline_async_native"):
                 validation_args["expected_bsp_prefetch_budget_ns"] = self.expected_bsp_prefetch_budget_ns
             _timing.validate_timing_events_v5(**validation_args)
             _timing.validate_action_seams_v5(
@@ -1476,8 +1495,11 @@ def _safe_component(value: str, *, fallback: str) -> str:
 class VideoSelectorV5:
     """Reserve the first success and counted failure video per task."""
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, success_only: bool = False):
+        if type(success_only) is not bool:
+            raise ValueError("success_only must be a boolean")
         self._root = Path(root)
+        self._success_only = success_only
         self._claimed = set()  # type: set
 
     def claim(self, record: EpisodeRecordV5) -> Optional[Path]:
@@ -1487,6 +1509,8 @@ class VideoSelectorV5:
         if record.success is True:
             outcome = "success"
         elif record.include_in_success_rate and record.failure_kind in _FAILURE_KINDS:
+            if self._success_only:
+                return None
             outcome = "failure"
         else:
             return None
@@ -1502,6 +1526,18 @@ class VideoSelectorV5:
             record.init_state_index,
             record.episode_id,
         )
+
+    def release(self, record: EpisodeRecordV5) -> None:
+        if not isinstance(record, EpisodeRecordV5):
+            raise ValueError("record must be EpisodeRecordV5")
+        record._validate()
+        if record.success is True:
+            outcome = "success"
+        elif record.include_in_success_rate and record.failure_kind in _FAILURE_KINDS:
+            outcome = "failure"
+        else:
+            return
+        self._claimed.discard((record.suite, record.task_id, outcome))
 
 
 def _atomic_append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:

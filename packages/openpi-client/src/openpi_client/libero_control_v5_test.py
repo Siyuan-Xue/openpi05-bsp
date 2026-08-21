@@ -297,6 +297,7 @@ def test_frozen_execution_modes_preserve_async_parameters_and_add_exact_sync_par
         "baseline_rtc",
         "bsp_spline_async",
         "bsp_spline_async_speedup1",
+        "bsp_spline_async_native",
         "baseline_sync",
         "bsp_spline_sync",
     )
@@ -360,6 +361,23 @@ def test_frozen_execution_modes_preserve_async_parameters_and_add_exact_sync_par
         "alignment": "disabled_delta_eff",
         "activation_policy": "phase_skip_executed_prefix",
         "prefetch_comparison": "remaining_lte_budget",
+    }
+    assert control.EXECUTION_MODES["bsp_spline_async_native"].to_parameters_dict() == {
+        "action_representation": "bsp",
+        "dispatch": "asynchronous_after_initial",
+        "parameter_shape": [16, 8],
+        "origin_hz": 10,
+        "degree": 3,
+        "speedup": 2,
+        "effective_curve_rate_hz": 20,
+        "control_freq_hz": 20,
+        "alignment": "disabled_delta_eff",
+        "activation_policy": "phase_skip_executed_prefix",
+        "prefetch_comparison": "remaining_lte_budget",
+        "latency_injection": "disabled_native",
+        "prefetch_budget_policy": "rolling_raw_p95_20_ceil_control_period",
+        "prefetch_window_size": 20,
+        "prefetch_budget_rounding_ns": 50_000_000,
     }
     assert control.EXECUTION_MODES["baseline_sync"].to_parameters_dict() == {
         "action_representation": "native",
@@ -1259,6 +1277,33 @@ def _schema5_calibration(mode_name, *, empirical_observed_effective_ns=300_000_0
     )
 
 
+def _native_bsp_calibration(raw_latency_ns=80_000_000):
+    mode_name = "bsp_spline_async_native"
+    checkpoint = _checkpoint_identity(bsp=True)
+    return control.LatencyCalibrationV2.create(
+        execution_mode=mode_name,
+        checkpoint_identity_fingerprint=checkpoint.fingerprint,
+        server_metadata_fingerprint=_OTHER_SHA,
+        canonical_observation_identity=_observation_identity({"state": np.zeros(8, dtype=np.float32)}),
+        seed_namespace="openpi-libero-calibration-v2/{}/{}".format(mode_name, checkpoint.fingerprint),
+        bootstrap_request_fingerprint=None,
+        warmup_request_fingerprints=[_SHA] * 5,
+        measurement_request_fingerprints=[_OTHER_SHA] * 20,
+        warmup_raw_inference_latency_ns=[raw_latency_ns] * 5,
+        warmup_sampled_target_latency_ns=[0] * 5,
+        warmup_requested_synthetic_delay_ns=[0] * 5,
+        warmup_observed_synthetic_delay_ns=[0] * 5,
+        warmup_observed_effective_latency_ns=[raw_latency_ns] * 5,
+        warmup_latency_overshoot_ns=[0] * 5,
+        measurement_raw_inference_latency_ns=[raw_latency_ns] * 20,
+        measurement_sampled_target_latency_ns=[0] * 20,
+        measurement_requested_synthetic_delay_ns=[0] * 20,
+        measurement_observed_synthetic_delay_ns=[0] * 20,
+        measurement_observed_effective_latency_ns=[raw_latency_ns] * 20,
+        measurement_latency_overshoot_ns=[0] * 20,
+    )
+
+
 def test_schema5_adds_baseline_async_blocking_recovery_without_replacing_v1():
     assert "baseline_async" in control.EXECUTION_MODES
     assert "baseline_async_recovery" in control.EXECUTION_MODES
@@ -1275,6 +1320,7 @@ def test_schema5_adds_bsp_speedup1_without_replacing_existing_modes():
         "baseline_rtc",
         "bsp_spline_async",
         "bsp_spline_async_speedup1",
+        "bsp_spline_async_native",
         "baseline_sync",
         "bsp_spline_sync",
     }
@@ -1284,6 +1330,36 @@ def test_schema5_adds_bsp_speedup1_without_replacing_existing_modes():
     )
     assert control.EXECUTION_MODES["baseline_sync"].policy_protocol == "baseline_sync_n5_h16_full_v2"
     assert control.EXECUTION_MODES["bsp_spline_sync"].policy_protocol == "bsp_spline_sync_speedup2_phase0_v2"
+
+
+def test_native_bsp_mode_preserves_speedup2_and_declares_dynamic_raw_latency_prefetch():
+    mode = control.EXECUTION_MODES["bsp_spline_async_native"]
+    assert mode.policy_protocol == "bsp_spline_async_phase_skip_speedup2_v2"
+    assert mode.to_parameters_dict()["speedup"] == 2
+    assert mode.to_parameters_dict()["latency_injection"] == "disabled_native"
+    assert mode.to_parameters_dict()["prefetch_budget_policy"] == "rolling_raw_p95_20_ceil_control_period"
+
+
+def test_native_bsp_scheduler_updates_prefetch_budget_from_rolling_raw_p95():
+    """Replacing the rolling p95 with a fixed 400 ms budget must fail this test."""
+    mode = control.EXECUTION_MODES["bsp_spline_async_native"]
+    scheduler = control.make_scheduler_v5(mode, _native_bsp_calibration())
+    initial = scheduler.maybe_request(0, control_step=0, at_due=True, request_in_flight=False)
+    scheduler.install_response(initial, _bsp_response(speedup=2), now_ns=80_000_000, control_step=0)
+
+    assert scheduler.maybe_request(0, control_step=6, at_due=True, request_in_flight=False) is None
+    first_prefetch = scheduler.maybe_request(0, control_step=7, at_due=True, request_in_flight=False)
+    assert first_prefetch.scheduler_context["remaining_plan_ns"] == 100_000_000
+    assert first_prefetch.scheduler_context["budget_ns"] == 100_000_000
+
+    scheduler = control.make_scheduler_v5(mode, _native_bsp_calibration())
+    initial = scheduler.maybe_request(0, control_step=0, at_due=True, request_in_flight=False)
+    scheduler.install_response(initial, _bsp_response(speedup=2), now_ns=80_000_000, control_step=0)
+    scheduler.observe_raw_inference_latency(250_000_000)
+    scheduler.observe_raw_inference_latency(250_000_000)
+    adaptive_prefetch = scheduler.maybe_request(0, control_step=4, at_due=True, request_in_flight=False)
+    assert adaptive_prefetch.scheduler_context["remaining_plan_ns"] == 250_000_000
+    assert adaptive_prefetch.scheduler_context["budget_ns"] == 250_000_000
 
 
 def test_bsp_speedup1_scheduler_requests_server_identity_and_uses_real_remaining_wall_clock():

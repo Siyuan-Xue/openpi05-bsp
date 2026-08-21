@@ -548,6 +548,48 @@ def test_sampled_latency_is_snapshotted_on_job_and_outcome():
         worker.close()
 
 
+def test_native_latency_keeps_sample_identity_but_never_waits_for_sampled_target():
+    """Re-enabling sampled-target waiting must fail this native-latency test."""
+    clock = _ManualMonotonicNs(10_000_000)
+    waiter = _LatencyWaiter(clock)
+    policy = _GatePolicy(result={"answer": 11})
+    sampler = latency_sampling.NormalLatencySamplerV1(mean_ns=300_000_000, stddev_ns=1)
+    key = latency_sampling.LatencySampleKeyV1(
+        namespace="formal",
+        seed=42,
+        suite="libero_10",
+        task_id=0,
+        trial_index=0,
+        request_ordinal=0,
+    )
+    worker = async_inference.AsyncInferenceWorker(
+        _Factory([policy]),
+        monotonic_ns=clock,
+        wait_until_ns=waiter,
+        latency_sampler=sampler,
+        inject_sampled_latency=False,
+    )
+    try:
+        job = worker.submit({"request": "native"}, latency_sample_key=key)
+        assert job.latency_sample_key == key
+        assert job.sampled_target_latency_ns == 0
+        assert policy.started.wait(1.0)
+        clock.set(90_000_000)
+        policy.release.set()
+        outcome = worker.wait(job, timeout=1.0)
+
+        assert waiter.deadlines == []
+        assert outcome.raw_inference_latency_ns == 80_000_000
+        assert outcome.sampled_target_latency_ns == 0
+        assert outcome.requested_synthetic_delay_ns == 0
+        assert outcome.observed_synthetic_delay_ns == 0
+        assert outcome.observed_effective_latency_ns == 80_000_000
+        assert outcome.latency_overshoot_ns == 0
+    finally:
+        policy.release.set()
+        worker.close()
+
+
 def test_sampled_latency_never_shortens_raw_request():
     clock = _ManualMonotonicNs(10)
     waiter = _LatencyWaiter(clock)
