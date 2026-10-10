@@ -1,323 +1,167 @@
-# openpi
+<div align="center">
 
-openpi holds open-source models and packages for robotics, published by the [Physical Intelligence team](https://www.physicalintelligence.company/).
+# openpi05-bsp
 
-Currently, this repo contains three types of models:
-- the [π₀ model](https://www.physicalintelligence.company/blog/pi0), a flow-based vision-language-action model (VLA).
-- the [π₀-FAST model](https://www.physicalintelligence.company/research/fast), an autoregressive VLA, based on the FAST action tokenizer.
-- the [π₀.₅ model](https://www.physicalintelligence.company/blog/pi05), an upgraded version of π₀ with better open-world generalization trained with [knowledge insulation](https://www.physicalintelligence.company/research/knowledge_insulation). Note that, in this repository, we currently only support the flow matching head for both $\pi_{0.5}$ training and inference.
+### π0.5 with B-spline actions and phase-skipping async execution, benchmarked on LIBERO under random inference latency
 
-For all models, we provide _base model_ checkpoints, pre-trained on 10k+ hours of robot data, and examples for using them out of the box or fine-tuning them to your own datasets.
+<b>English</b> · <a href="./README.zh-CN.md">简体中文</a>
 
-This is an experiment: $\pi_0$ was developed for our own robots, which differ from the widely used platforms such as [ALOHA](https://tonyzhaozh.github.io/aloha/) and [DROID](https://droid-dataset.github.io/), and though we are optimistic that researchers and practitioners will be able to run creative new experiments adapting $\pi_0$ to their own platforms, we do not expect every such attempt to be successful. All this is to say: $\pi_0$ may or may not work for you, but you are welcome to try it and see!
+![Python 3.11](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
+![JAX](https://img.shields.io/badge/JAX-LoRA%20fine--tuning-A8B9CC)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE)
+[![Fork of Physical-Intelligence/openpi](https://img.shields.io/badge/fork%20of-Physical--Intelligence%2Fopenpi-black?logo=github)](https://github.com/Physical-Intelligence/openpi)
 
-## Updates
+</div>
 
-- [Sept 2025] We released PyTorch support in openpi.
-- [Sept 2025] We released pi05, an upgraded version of pi0 with better open-world generalization.
-- [Sept 2025]: We have added an [improved idle filter](examples/droid/README_train.md#data-filtering) for DROID training.
-- [Jun 2025]: We have added [instructions](examples/droid/README_train.md) for using `openpi` to train VLAs on the full [DROID dataset](https://droid-dataset.github.io/). This is an approximate open-source implementation of the training pipeline used to train pi0-FAST-DROID. 
+> [!NOTE]
+> **This is a research fork of [Physical-Intelligence/openpi](https://github.com/Physical-Intelligence/openpi).** It adds B-spline action targets for π0.5 (following [B-spline Policy](https://b-spline-policy.github.io/), Han, Xiong et al., 2026), async clients with phase skipping and an RTC baseline, and a reproducible random-latency evaluation on LIBERO. Upstream code, the Apache-2.0 license and all credit for openpi stay with Physical Intelligence. The original openpi README now lives in [`docs/UPSTREAM_README.md`](docs/UPSTREAM_README.md).
 
+## 📌 TL;DR
 
-## Requirements
+- **Problem:** a π0.5 forward pass takes hundreds of milliseconds. If the robot waits, it stalls. If it keeps moving while the next action chunk is computed, the new chunk arrives partly stale and switching to it causes a jump at the seam.
+- **Idea:** train π0.5 to output a continuous cubic **B-spline** instead of discrete action chunks. When a new curve arrives, start executing it at the **phase the robot has already reached** (phase skipping), and drop curves that are completely stale.
+- **Result:** coming soon. <!-- TODO(Miles): one headline number from report_v5.md, e.g. success rate and seam jump of bsp_spline_async vs baseline_rtc at Normal(300 ms, 60 ms) latency. -->
 
-To run the models in this repository, you will need an NVIDIA GPU with at least the following specifications. These estimations assume a single GPU, but you can also use multiple GPUs with model parallelism to reduce per-GPU memory requirements by configuring `fsdp_devices` in the training config. Please also note that the current training script does not yet support multi-node training.
+## 🎬 Demo
 
-| Mode               | Memory Required | Example GPU        |
-| ------------------ | --------------- | ------------------ |
-| Inference          | > 8 GB          | RTX 4090           |
-| Fine-Tuning (LoRA) | > 22.5 GB       | RTX 4090           |
-| Fine-Tuning (Full) | > 70 GB         | A100 (80GB) / H100 |
+**Demo coming soon:** side-by-side LIBERO rollouts of the four execution modes under the same latency draws.
 
-The repo has been tested with Ubuntu 22.04, we do not currently support other operating systems.
+<!-- GIF slots (one LIBERO episode per mode, same task and trial index, exported from the evaluator MP4s with the "Cumulative inference wait" overlay; square, about 320 px, under 10 MB each):
+  docs/media/demo_baseline_sync.gif
+  docs/media/demo_baseline_async.gif
+  docs/media/demo_baseline_rtc.gif
+  docs/media/demo_bsp_spline_async.gif
+When all four exist, replace the line above with this table (inside <div align="center">):
+| Sync chunking<br/>`baseline_sync` | Async (naive)<br/>`baseline_async` | RTC<br/>`baseline_rtc` | B-spline async (this fork)<br/>`bsp_spline_async` |
+|:---:|:---:|:---:|:---:|
+| <img src="docs/media/demo_baseline_sync.gif" alt="baseline_sync" width="200"> | <img src="docs/media/demo_baseline_async.gif" alt="baseline_async" width="200"> | <img src="docs/media/demo_baseline_rtc.gif" alt="baseline_rtc" width="200"> | <img src="docs/media/demo_bsp_spline_async.gif" alt="bsp_spline_async" width="200"> |
+-->
 
-## Installation
+## 📊 Results
 
-When cloning this repo, make sure to update submodules:
+**Protocol in one line:** LIBERO (4 suites × 10 tasks × 50 trials = 2,000 episodes per mode), 10k-step LoRA checkpoints, 20 Hz control, and paired random latency drawn from Normal(300 ms, 60 ms) with seed 42, so every mode sees exactly the same delay for the same request.
 
-```bash
-git clone --recurse-submodules git@github.com:Physical-Intelligence/openpi.git
+> [!NOTE]
+> **Results coming soon.** The table will report, per mode (`baseline_async`, `baseline_rtc`, `bsp_spline_async`): success rate on each LIBERO suite and the macro average, seam jump (L2), underflow, and latency hiding ratio.
 
-# Or if you already cloned the repo:
-git submodule update --init --recursive
+<!-- TODO(Miles): fill from comparison_v5.json / report_v5.md; bold the best value per column; list the code SHA of each run (the BSP run is a post-phase-fix rerun). Do NOT use the 196/200 environment-calibration number here: it is the official pi05_libero checkpoint, not a BSP result. Table header to use:
+| Mode | libero_spatial SR | libero_object SR | libero_goal SR | libero_10 SR | Macro SR | Seam jump (L2) | Underflow | Latency hiding ratio |
+-->
+
+Because the simulator pauses during underflow, these numbers measure latency hiding, trajectory continuity and throughput. They are not a claim about real-robot dynamics.
+
+## 🧠 Method
+
+```mermaid
+flowchart LR
+  D["LIBERO v2.0 demos<br/>(10 Hz)"] --> F["Per-episode cubic B-spline fit<br/>FITPACK, max error 0.002"]
+  F --> C[("Sidecar cache<br/>[16, 8] targets + fingerprint")]
+  C --> T["π0.5 LoRA fine-tuning<br/>pi05_libero_bsp_lora_h16"]
+  T --> P["Policy server<br/>(WebSocket)"]
+  P -- "spline + latency" --> X["Async executor (20 Hz)<br/>phase skipping · stale replan"]
+  X -- "next request<br/>(≤ 400 ms of curve left)" --> P
 ```
 
-We use [uv](https://docs.astral.sh/uv/) to manage Python dependencies. See the [uv installation instructions](https://docs.astral.sh/uv/getting-started/installation/) to set it up. Once uv is installed, run the following to set up the environment:
+Each training target is a cubic B-spline (degree 3) fitted per episode and stored as a `[16, 8]` array: seven control channels plus a knot channel, decoding to 8 actions. Targets are built once into a fingerprinted sidecar cache, so training never refits on the fly. At inference time the client executes the curve at 20 indices/s (`origin_hz` 10 × `speedup` 2) and requests the next curve when 400 ms or less of the current one remains. When the response arrives, the new curve starts at `phase_offset = executed_prefix_steps × 10 × 2 / 20`, so the time the robot kept moving is skipped rather than replayed. A response whose phase offset exceeds the curve's `t_max` is discarded as stale, and the client immediately replans from the latest observation. The baselines share the same request timing: plain async skips the stale prefix of a raw chunk, and RTC adds continuity guidance and splicing.
+
+## 🔀 What changed vs upstream
+
+| Area | Files | Change |
+|---|---|---|
+| B-spline targets | `src/openpi/training/bsp.py`, `bsp_dataset.py` | New: FITPACK fitting (port of bspline-policy, MIT), sidecar cache, dataset adapter |
+| Training configs | `src/openpi/training/config.py` | Added `pi05_libero_{baseline,bsp}_h16` and `pi05_libero_{baseline,bsp}_lora_h16` |
+| Data prep | `scripts/prepare_libero_bsp.py` | New: `download` / `build` / `verify` modes for LIBERO v2.0 and the BSP cache |
+| Async clients | `packages/openpi-client/src/openpi_client/{bsp_spline,async_inference,rtc,latency_sampling}.py` | New: spline executor with phase skipping, async scheduler, RTC client, deterministic latency sampler |
+| Evaluation | `examples/libero/main_v5.py`, `openpi_client/libero_{control,eval,report,video_timing}_v5.py` | New: schema-v5 evaluator, 40 FPS video with wait overlay, reporters |
+| Comparison | `scripts/compare_libero_latency_v5.py`, `scripts/compare_libero_sync_v5.py` | New: three-mode async report and two-mode sync report |
+| Docs | `docs/pi05_libero_latency_experiment_v5.md`, `docs/pi05_libero_bsp_phase1_server.md`, `docs/pi05_libero_bsp_server_state.md` | New: protocol and runbooks (in Chinese) |
+
+## 🚀 Quick start
+
+Set up the environment as described in [`docs/UPSTREAM_README.md`](docs/UPSTREAM_README.md) (uv, Python 3.11) and [`examples/libero/README.md`](examples/libero/README.md). LIBERO runs in a separate Python 3.8 environment.
 
 ```bash
-GIT_LFS_SKIP_SMUDGE=1 uv sync
-GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+git clone --recurse-submodules https://github.com/Siyuan-Xue/openpi05-bsp.git
+cd openpi05-bsp
+
+# 1. Serve a fine-tuned checkpoint
+python scripts/serve_policy.py --env LIBERO policy:checkpoint \
+  --policy.config pi05_libero_bsp_lora_h16 --policy.dir <CHECKPOINT_DIR>/10000
+
+# 2. Evaluate one mode under paired random latency (LIBERO Python env)
+python examples/libero/main_v5.py \
+  --args.execution-mode bsp_spline_async \
+  --args.task-suite-name all --args.num-trials-per-task 50 \
+  --args.control-freq 20 --args.video-fps 40 --args.video-show-inference-waits \
+  --args.bsp-cache-hash <SIDECAR_SHA256> \
+  --args.bsp-cache-manifest-fingerprint <MANIFEST_FINGERPRINT>
 ```
 
-NOTE: `GIT_LFS_SKIP_SMUDGE=1` is needed to pull LeRobot as a dependency.
+`--args.execution-mode` takes `baseline_async`, `baseline_rtc` or `bsp_spline_async`. For baseline modes, serve `pi05_libero_baseline_lora_h16` and omit the two BSP arguments.
 
-**Docker**: As an alternative to uv installation, we provide instructions for installing openpi using Docker. If you encounter issues with your system setup, consider using Docker to simplify installation. See [Docker Setup](docs/docker.md) for more details.
+<!-- TODO(Miles): confirm these commands end to end; the runbooks set PYTHONPATH, PYTHONDONTWRITEBYTECODE=1 and PYTHONNOUSERSITE=1 explicitly. Fine-tuned checkpoints are not published; say so or link them if you are cleared to share. -->
 
+## 🔁 Reproducing results
 
+All runs use seed 42, effective batch 256 (micro-batch 64), no EMA, and 10,000 steps, with fixed checkpoints at 0k/1k/2k/5k/10k and no best-checkpoint picking.
 
+```bash
+# Build and verify the B-spline sidecar (LIBERO v2.0)
+python scripts/prepare_libero_bsp.py --mode build --dataset-root <LIBERO_DIR> \
+  --cache-path <BSP_CACHE>.npz --repo-id physical-intelligence/libero --revision v2.0 --action-key actions
+python scripts/prepare_libero_bsp.py --mode verify --dataset-root <LIBERO_DIR> \
+  --cache-path <BSP_CACHE>.npz --diagnostics-path <BSP_VERIFY>.json \
+  --repo-id physical-intelligence/libero --revision v2.0 --action-key actions
 
-## Model Checkpoints
+# Train the BSP arm (baseline: pi05_libero_baseline_lora_h16, same flags, no --data.bsp-cache-path)
+python scripts/train.py pi05_libero_bsp_lora_h16 --exp-name <EXP> --seed 42 \
+  --batch-size 256 --micro-batch-size 64 --num-train-steps 10000 --save-interval 1000 \
+  --ema-decay None --data.lerobot-root <LIBERO_DIR> --data.bsp-cache-path <BSP_CACHE>.npz
 
-### Base Models
-We provide multiple base VLA model checkpoints. These checkpoints have been pre-trained on 10k+ hours of robot data, and can be used for fine-tuning.
+# Compare the two synchronous runs
+python scripts/compare_libero_sync_v5.py <BASELINE_SYNC_RUN> <BSP_SPLINE_SYNC_RUN> --output-dir <NEW_EMPTY_DIR>
+```
 
-| Model        | Use Case    | Description                                                                                                 | Checkpoint Path                                |
-| ------------ | ----------- | ----------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
-| $\pi_0$      | Fine-Tuning | Base [π₀ model](https://www.physicalintelligence.company/blog/pi0) for fine-tuning                | `gs://openpi-assets/checkpoints/pi0_base`      |
-| $\pi_0$-FAST | Fine-Tuning | Base autoregressive [π₀-FAST model](https://www.physicalintelligence.company/research/fast) for fine-tuning | `gs://openpi-assets/checkpoints/pi0_fast_base` |
-| $\pi_{0.5}$    | Fine-Tuning | Base [π₀.₅ model](https://www.physicalintelligence.company/blog/pi05) for fine-tuning    | `gs://openpi-assets/checkpoints/pi05_base`      |
+Norm stats (`scripts/compute_norm_stats.py`), the three-mode async comparison (`scripts/compare_libero_latency_v5.py`) and every server gate are documented step by step in [`docs/pi05_libero_bsp_phase1_server.md`](docs/pi05_libero_bsp_phase1_server.md) and [`docs/pi05_libero_latency_experiment_v5.md`](docs/pi05_libero_latency_experiment_v5.md).
 
-### Fine-Tuned Models
-We also provide "expert" checkpoints for various robot platforms and tasks. These models are fine-tuned from the base models above and intended to run directly on the target robot. These may or may not work on your particular robot. Since these checkpoints were fine-tuned on relatively small datasets collected with more widely available robots, such as ALOHA and the DROID Franka setup, they might not generalize to your particular setup, though we found some of these, especially the DROID checkpoint, to generalize quite broadly in practice.
+## 📚 Citation
 
-| Model                    | Use Case    | Description                                                                                                                                                                                              | Checkpoint Path                                       |
-| ------------------------ | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| $\pi_0$-FAST-DROID       | Inference   | $\pi_0$-FAST model fine-tuned on the [DROID dataset](https://droid-dataset.github.io/): can perform a wide range of simple table-top manipulation tasks 0-shot in new scenes on the DROID robot platform | `gs://openpi-assets/checkpoints/pi0_fast_droid`       |
-| $\pi_0$-DROID            | Fine-Tuning | $\pi_0$ model fine-tuned on the [DROID dataset](https://droid-dataset.github.io/): faster inference than $\pi_0$-FAST-DROID, but may not follow language commands as well                                | `gs://openpi-assets/checkpoints/pi0_droid`            |
-| $\pi_0$-ALOHA-towel      | Inference   | $\pi_0$ model fine-tuned on internal [ALOHA](https://tonyzhaozh.github.io/aloha/) data: can fold diverse towels 0-shot on ALOHA robot platforms                                                          | `gs://openpi-assets/checkpoints/pi0_aloha_towel`      |
-| $\pi_0$-ALOHA-tupperware | Inference   | $\pi_0$ model fine-tuned on internal [ALOHA](https://tonyzhaozh.github.io/aloha/) data: can unpack food from a tupperware container                                                                                                             | `gs://openpi-assets/checkpoints/pi0_aloha_tupperware` |
-| $\pi_0$-ALOHA-pen-uncap  | Inference   | $\pi_0$ model fine-tuned on public [ALOHA](https://dit-policy.github.io/) data: can uncap a pen                                                                                                          | `gs://openpi-assets/checkpoints/pi0_aloha_pen_uncap`  |
-| $\pi_{0.5}$-LIBERO      | Inference   | $\pi_{0.5}$ model fine-tuned for the [LIBERO](https://libero-project.github.io/datasets) benchmark: gets state-of-the-art performance (see [LIBERO README](examples/libero/README.md)) | `gs://openpi-assets/checkpoints/pi05_libero`      |
-| $\pi_{0.5}$-DROID      | Inference / Fine-Tuning | $\pi_{0.5}$ model fine-tuned on the [DROID dataset](https://droid-dataset.github.io/) with [knowledge insulation](https://www.physicalintelligence.company/research/knowledge_insulation): fast inference and good language-following | `gs://openpi-assets/checkpoints/pi05_droid`      |
+<!-- TODO(Miles): add a BibTeX entry for this work if you write it up. -->
+If you use this fork, please cite the works it builds on:
 
-
-By default, checkpoints are automatically downloaded from `gs://openpi-assets` and are cached in `~/.cache/openpi` when needed. You can overwrite the download path by setting the `OPENPI_DATA_HOME` environment variable.
-
-
-
-
-## Running Inference for a Pre-Trained Model
-
-Our pre-trained model checkpoints can be run with a few lines of code (here our $\pi_0$-FAST-DROID model):
-```python
-from openpi.training import config as _config
-from openpi.policies import policy_config
-from openpi.shared import download
-
-config = _config.get_config("pi05_droid")
-checkpoint_dir = download.maybe_download("gs://openpi-assets/checkpoints/pi05_droid")
-
-# Create a trained policy.
-policy = policy_config.create_trained_policy(config, checkpoint_dir)
-
-# Run inference on a dummy example.
-example = {
-    "observation/exterior_image_1_left": ...,
-    "observation/wrist_image_left": ...,
-    ...
-    "prompt": "pick up the fork"
+```bibtex
+@article{han2026b,
+  title={B-spline Policy: Accelerating Manipulation Policies via B-spline Action Representations},
+  author={Han, Xiaoshen and Xiong, Haoyu and Chen, Haonan and Liu, Chaoqi and Torralba, Antonio and Zhu, Yuke and Du, Yilun},
+  journal={arXiv preprint arXiv:2607.09648},
+  year={2026}
 }
-action_chunk = policy.infer(example)["actions"]
-```
-You can also test this out in the [example notebook](examples/inference.ipynb).
 
-We provide detailed step-by-step examples for running inference of our pre-trained checkpoints on [DROID](examples/droid/README.md) and [ALOHA](examples/aloha_real/README.md) robots.
+@misc{black2025realtimeexecutionactionchunking,
+  title={Real-Time Execution of Action Chunking Flow Policies},
+  author={Kevin Black and Manuel Y. Galliker and Sergey Levine},
+  year={2025},
+  eprint={2506.07339},
+  archivePrefix={arXiv},
+  primaryClass={cs.RO},
+  url={https://arxiv.org/abs/2506.07339}
+}
 
-**Remote Inference**: We provide [examples and code](docs/remote_inference.md) for running inference of our models **remotely**: the model can run on a different server and stream actions to the robot via a websocket connection. This makes it easy to use more powerful GPUs off-robot and keep robot and policy environments separate.
-
-**Test inference without a robot**: We provide a [script](examples/simple_client/README.md) for testing inference without a robot. This script will generate a random observation and run inference with the model. See [here](examples/simple_client/README.md) for more details.
-
-
-
-
-
-## Fine-Tuning Base Models on Your Own Data
-
-We will fine-tune the $\pi_{0.5}$ model on the [LIBERO dataset](https://libero-project.github.io/datasets) as a running example for how to fine-tune a base model on your own data. We will explain three steps:
-1. Convert your data to a LeRobot dataset (which we use for training)
-2. Defining training configs and running training
-3. Spinning up a policy server and running inference
-
-### 1. Convert your data to a LeRobot dataset
-
-We provide a minimal example script for converting LIBERO data to a LeRobot dataset in [`examples/libero/convert_libero_data_to_lerobot.py`](examples/libero/convert_libero_data_to_lerobot.py). You can easily modify it to convert your own data! You can download the raw LIBERO dataset from [here](https://huggingface.co/datasets/openvla/modified_libero_rlds), and run the script with:
-
-```bash
-uv run examples/libero/convert_libero_data_to_lerobot.py --data_dir /path/to/your/libero/data
+@article{black2025pi05,
+  title={$\pi_{0.5}$: a Vision-Language-Action Model with Open-World Generalization},
+  author={Black, Kevin and Brown, Noah and Darpinian, James and Dhabalia, Karan and Driess, Danny and Esmail, Adnan and Equi, Michael and Finn, Chelsea and Fusai, Niccolo and Galliker, Manuel Y. and Ghosh, Dibya and Groom, Lachy and Hausman, Karol and Ichter, Brian and Jakubczak, Szymon and Jones, Tim and Ke, Liyiming and LeBlanc, Devin and Levine, Sergey and Li-Bell, Adrian and Mothukuri, Mohith and Nair, Suraj and Pertsch, Karl and Ren, Allen Z. and Shi, Lucy Xiaoyang and Smith, Laura and Springenberg, Jost Tobias and Stachowicz, Kyle and Tanner, James and Vuong, Quan and Walke, Homer and Walling, Anna and Wang, Haohuan and Yu, Lili and Zhilinsky, Ury},
+  journal={arXiv preprint arXiv:2504.16054},
+  year={2025}
+}
 ```
 
-**Note:** If you just want to fine-tune on LIBERO, you can skip this step, because our LIBERO fine-tuning configs point to a pre-converted LIBERO dataset. This step is merely an example that you can adapt to your own data.
+## 🙏 Acknowledgements
 
-### 2. Defining training configs and running training
+- [Physical Intelligence / openpi](https://github.com/Physical-Intelligence/openpi): π0.5 model, training and serving code (Apache-2.0).
+- [B-spline Policy](https://github.com/B-spline-policy/bspline-policy) by Han, Xiong et al.: the B-spline action representation. `src/openpi/training/bsp.py` is ported from revision `61ed5f42fced971d50a89b46417493790876ccd1` (MIT, © 2026 Haoyu Xiong).
+- Real-Time Chunking by Black, Galliker and Levine: the RTC baseline.
+- [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO): benchmark, pinned as the `third_party/libero` submodule.
 
-To fine-tune a base model on your own data, you need to define configs for data processing and training. We provide example configs with detailed comments for LIBERO below, which you can modify for your own dataset:
+## 📄 License
 
-- [`LiberoInputs` and `LiberoOutputs`](src/openpi/policies/libero_policy.py): Defines the data mapping from the LIBERO environment to the model and vice versa. Will be used for both, training and inference.
-- [`LeRobotLiberoDataConfig`](src/openpi/training/config.py): Defines how to process raw LIBERO data from LeRobot dataset for training.
-- [`TrainConfig`](src/openpi/training/config.py): Defines fine-tuning hyperparameters, data config, and weight loader.
-
-We provide example fine-tuning configs for [π₀](src/openpi/training/config.py), [π₀-FAST](src/openpi/training/config.py), and [π₀.₅](src/openpi/training/config.py) on LIBERO data.
-
-Before we can run training, we need to compute the normalization statistics for the training data. Run the script below with the name of your training config:
-
-```bash
-uv run scripts/compute_norm_stats.py --config-name pi05_libero
-```
-
-Now we can kick off training with the following command (the `--overwrite` flag is used to overwrite existing checkpoints if you rerun fine-tuning with the same config):
-
-```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_libero --exp-name=my_experiment --overwrite
-```
-
-The command will log training progress to the console and save checkpoints to the `checkpoints` directory. You can also monitor training progress on the Weights & Biases dashboard. For maximally using the GPU memory, set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` before running training -- this enables JAX to use up to 90% of the GPU memory (vs. the default of 75%).
-
-**Note:** We provide functionality for *reloading* normalization statistics for state / action normalization from pre-training. This can be beneficial if you are fine-tuning to a new task on a robot that was part of our pre-training mixture. For more details on how to reload normalization statistics, see the [norm_stats.md](docs/norm_stats.md) file.
-
-### 3. Spinning up a policy server and running inference
-
-Once training is complete, we can run inference by spinning up a policy server and then querying it from a LIBERO evaluation script. Launching a model server is easy (we use the checkpoint for iteration 20,000 for this example, modify as needed):
-
-```bash
-uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_libero --policy.dir=checkpoints/pi05_libero/my_experiment/20000
-```
-
-This will spin up a server that listens on port 8000 and waits for observations to be sent to it. We can then run an evaluation script (or robot runtime) that queries the server.
-
-For running the LIBERO eval in particular, we provide (and recommend using) a Dockerized workflow that handles both the policy server and the evaluation script together. See the [LIBERO README](examples/libero/README.md) for more details.
-
-If you want to embed a policy server call in your own robot runtime, we have a minimal example of how to do so in the [remote inference docs](docs/remote_inference.md).
-
-
-
-### More Examples
-
-We provide more examples for how to fine-tune and run inference with our models on the ALOHA platform in the following READMEs:
-- [ALOHA Simulator](examples/aloha_sim)
-- [ALOHA Real](examples/aloha_real)
-- [UR5](examples/ur5)
-
-## PyTorch Support
-
-openpi now provides PyTorch implementations of π₀ and π₀.₅ models alongside the original JAX versions! The PyTorch implementation has been validated on the LIBERO benchmark (both inference and finetuning). A few features are currently not supported (this may change in the future):
-
-- The π₀-FAST model
-- Mixed precision training
-- FSDP (fully-sharded data parallelism) training
-- LoRA (low-rank adaptation) training
-- EMA (exponential moving average) weights during training
-
-### Setup
-1. Make sure that you have the latest version of all dependencies installed: `uv sync`
-
-2. Double check that you have transformers 4.53.2 installed: `uv pip show transformers`
-
-3. Apply the transformers library patches:
-   ```bash
-   cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/
-   ```
-
-This overwrites several files in the transformers library with necessary model changes: 1) supporting AdaRMS, 2) correctly controlling the precision of activations, and 3) allowing the KV cache to be used without being updated.
-
-**WARNING**: With the default uv link mode (hardlink), this will permanently affect the transformers library in your uv cache, meaning the changes will survive reinstallations of transformers and could even propagate to other projects that use transformers. To fully undo this operation, you must run `uv cache clean transformers`.
-
-### Converting JAX Models to PyTorch
-
-To convert a JAX model checkpoint to PyTorch format:
-
-```bash
-uv run examples/convert_jax_model_to_pytorch.py \
-    --checkpoint_dir /path/to/jax/checkpoint \
-    --config_name <config name> \
-    --output_path /path/to/converted/pytorch/checkpoint
-```
-
-### Running Inference with PyTorch
-
-The PyTorch implementation uses the same API as the JAX version - you only need to change the checkpoint path to point to the converted PyTorch model:
-
-```python
-from openpi.training import config as _config
-from openpi.policies import policy_config
-from openpi.shared import download
-
-config = _config.get_config("pi05_droid")
-checkpoint_dir = "/path/to/converted/pytorch/checkpoint"
-
-# Create a trained policy (automatically detects PyTorch format)
-policy = policy_config.create_trained_policy(config, checkpoint_dir)
-
-# Run inference (same API as JAX)
-action_chunk = policy.infer(example)["actions"]
-```
-
-### Policy Server with PyTorch
-
-The policy server works identically with PyTorch models - just point to the converted checkpoint directory:
-
-```bash
-uv run scripts/serve_policy.py policy:checkpoint \
-    --policy.config=pi05_droid \
-    --policy.dir=/path/to/converted/pytorch/checkpoint
-```
-
-### Finetuning with PyTorch
-
-To finetune a model in PyTorch:
-
-1. Convert the JAX base model to PyTorch format:
-   ```bash
-   uv run examples/convert_jax_model_to_pytorch.py \
-       --config_name <config name> \
-       --checkpoint_dir /path/to/jax/base/model \
-       --output_path /path/to/pytorch/base/model
-   ```
-
-2. Specify the converted PyTorch model path in your config using `pytorch_weight_path`
-
-3. Launch training using one of these modes:
-
-```bash
-# Single GPU training:
-uv run scripts/train_pytorch.py <config_name> --exp_name <run_name> --save_interval <interval>
-
-# Example:
-uv run scripts/train_pytorch.py debug --exp_name pytorch_test
-uv run scripts/train_pytorch.py debug --exp_name pytorch_test --resume  # Resume from latest checkpoint
-
-# Multi-GPU training (single node):
-uv run torchrun --standalone --nnodes=1 --nproc_per_node=<num_gpus> scripts/train_pytorch.py <config_name> --exp_name <run_name>
-
-# Example:
-uv run torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_pytorch.py pi0_aloha_sim --exp_name pytorch_ddp_test
-uv run torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_pytorch.py pi0_aloha_sim --exp_name pytorch_ddp_test --resume
-
-# Multi-Node Training:
-uv run torchrun \
-    --nnodes=<num_nodes> \
-    --nproc_per_node=<gpus_per_node> \
-    --node_rank=<rank_of_node> \
-    --master_addr=<master_ip> \
-    --master_port=<port> \
-    scripts/train_pytorch.py <config_name> --exp_name=<run_name> --save_interval <interval>
-```
-
-### Precision Settings
-
-JAX and PyTorch implementations handle precision as follows:
-
-**JAX:**
-1. Inference: most weights and computations in bfloat16, with a few computations in float32 for stability
-2. Training: defaults to mixed precision: weights and gradients in float32, (most) activations and computations in bfloat16. You can change to full float32 training by setting `dtype` to float32 in the config.
-
-**PyTorch:**
-1. Inference: matches JAX -- most weights and computations in bfloat16, with a few weights converted to float32 for stability
-2. Training: supports either full bfloat16 (default) or full float32. You can change it by setting `pytorch_training_precision` in the config. bfloat16 uses less memory but exhibits higher losses compared to float32. Mixed precision is not yet supported.
-
-With torch.compile, inference speed is comparable between JAX and PyTorch.
-
-## Troubleshooting
-
-We will collect common issues and their solutions here. If you encounter an issue, please check here first. If you can't find a solution, please file an issue on the repo (see [here](CONTRIBUTING.md) for guidelines).
-
-| Issue                                     | Resolution                                                                                                                                                                                   |
-| ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `uv sync` fails with dependency conflicts | Try removing the virtual environment directory (`rm -rf .venv`) and running `uv sync` again. If issues persist, check that you have the latest version of `uv` installed (`uv self update`). |
-| Training runs out of GPU memory           | Make sure you set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` (or higher) before running training to allow JAX to use more GPU memory. You can also use `--fsdp-devices <n>` where `<n>` is your number of GPUs, to enable [fully-sharded data parallelism](https://engineering.fb.com/2021/07/15/open-source/fsdp/), which reduces memory usage in exchange for slower training (the amount of slowdown depends on your particular setup). If you are still running out of memory, you may want to consider disabling EMA.        |
-| Policy server connection errors           | Check that the server is running and listening on the expected port. Verify network connectivity and firewall settings between client and server.                                            |
-| Missing norm stats error when training    | Run `scripts/compute_norm_stats.py` with your config name before starting training.                                                                                                          |
-| Dataset download fails                    | Check your internet connection. For HuggingFace datasets, ensure you're logged in (`huggingface-cli login`).                                                                                 |
-| CUDA/GPU errors                           | Verify NVIDIA drivers are installed correctly. For Docker, ensure nvidia-container-toolkit is installed. Check GPU compatibility. You do NOT need CUDA libraries installed at a system level --- they will be installed via uv. You may even want to try *uninstalling* system CUDA libraries if you run into CUDA issues, since system libraries can sometimes cause conflicts. |
-| Import errors when running examples       | Make sure you've installed all dependencies with `uv sync`. Some examples may have additional requirements listed in their READMEs.                    |
-| Action dimensions mismatch                | Verify your data processing transforms match the expected input/output dimensions of your robot. Check the action space definitions in your policy classes.                                  |
-| Diverging training loss                            | Check the `q01`, `q99`, and `std` values in `norm_stats.json` for your dataset. Certain dimensions that are rarely used can end up with very small `q01`, `q99`, or `std` values, leading to huge states and actions after normalization. You can manually adjust the norm stats as a workaround. |
+Code is licensed under the **Apache License 2.0**, inherited from upstream openpi; see [`LICENSE`](LICENSE). Fork changes by Miles Xue (Siyuan Xue) are released under the same license. π0.5 builds on PaliGemma, so model weights and checkpoints derived from Gemma are additionally subject to the **Gemma Terms of Use** in [`LICENSE_GEMMA.txt`](LICENSE_GEMMA.txt). The ported B-spline fitting code (`src/openpi/training/bsp.py`) keeps its original MIT notice in the file header.
